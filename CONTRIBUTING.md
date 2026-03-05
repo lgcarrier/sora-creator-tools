@@ -51,7 +51,7 @@ rm -f release.zip && zip -r release.zip manifest.json *.js *.html *.css icons im
 
 - Keep changes scoped to the issue/request; avoid opportunistic refactors.
 - Do not broaden extension permissions, host matches, or injected network hooks unless explicitly required.
-- Preserve local-first behavior (no new external network calls unless clearly justified).
+- Preserve local-first behavior. Do not add new external network calls; keep network activity limited to the current Sora/OpenAI endpoints already used by the project.
 - Document any new setup/test steps in README if workflow changes.
 
 ## Pull request checklist
