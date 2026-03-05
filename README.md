@@ -70,6 +70,13 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 - Fast initial data burst plus ongoing refresh so the table stays current while browsing.
 - Works with gathered local history to provide richer top-feed insights over time.
 
+### Harvest Mode (API-first)
+
+- Manual **Harvest** mode runs on Top feed, Profile pages, and Drafts pages.
+- Harvest starts with API pagination and automatically falls back to bounded DOM scrolling when API template capture/paging is unavailable.
+- Top/Profile harvest keeps existing metrics collection active while also storing dedicated harvest records.
+- Drafts harvest captures draft metadata/prompt details into a dedicated on-device harvest dataset.
+
 ### Dashboard Mode (Extension Icon)
 
 - Opens `dashboard.html` in its own tab (reused/focused if already open).
@@ -108,6 +115,7 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 2. It normalizes and batches metrics, then posts them to `content.js`.
 3. `content.js` relays batches to `background.js`.
 4. `background.js` is the single writer for metrics state in `chrome.storage.local`.
+5. Harvest batches (`harvest_batch`) are sanitized and merged in `background.js`, then persisted to IndexedDB with metadata in `chrome.storage.local`.
 5. Dashboard requests metrics through content/background message bridges, and hydrates deeper history from cold snapshot shards when needed.
 
 Cross-context bridge notes:
@@ -122,6 +130,9 @@ Cross-context bridge notes:
   - Hot key: latest-per-post metrics in `metrics`
   - Cold keys: historical snapshots by user under `snapshots_<userKey>`
 - Includes migration logic (`metricsStorageVersion`) for older monolithic storage.
+- Harvest storage:
+  - Records persisted in IndexedDB (`SCT_HARVEST_DB_V1`).
+  - Metadata in `chrome.storage.local`: `harvestRecordsV1`, `harvestUpdatedAt`, `harvestStorageVersion`.
 
 ## Privacy
 

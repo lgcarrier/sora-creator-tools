@@ -50,6 +50,20 @@
   const NF_BULK_CREATE_RE = /\/backend\/nf\/bulk_create/i;
   const NF_PENDING_V2_RE = /\/backend\/nf\/pending\/v2/i;
   const POST_DETAIL_RE = /\/(backend\/project_[a-z]+\/)?posts?\/[^/]+(\/(tree|children|ancestors|remix_posts|remixes))?(\?|$)/i;
+  const HARVEST_TEMPLATE_WAIT_MS = 5000;
+  const HARVEST_PAGE_LIMIT = 400;
+  const HARVEST_DRAFTS_PAGE_SIZE = 100;
+  const HARVEST_FEED_PAGE_SIZE = 30;
+  const HARVEST_BATCH_CHUNK_MAX = 200;
+  const HARVEST_BATCH_FLUSH_MS = 2000;
+  const DETAIL_LOOKUPS_PER_PAGE = 10;
+  const DETAIL_LOOKUPS_TOTAL_MAX = 300;
+  const DETAIL_LOOKUP_DELAY_MS = 35;
+  const HARVEST_SCROLL_STEP_PX = 450;
+  const HARVEST_SCROLL_BASE_DELAY_MS = 1500;
+  const HARVEST_SCROLL_MAX_DELAY_MS = 3500;
+  const HARVEST_SCROLL_NO_PROGRESS_LIMIT = 8;
+  const HARVEST_SCROLL_MAX_TICKS = 120;
 
   // Includes <21h (1260 minutes) plus a final special filter
   const FILTER_STEPS_MIN = [null, 180, 360, 720, 900, 1080, 1260, 'no_remixes'];
@@ -584,6 +598,25 @@
   let gatherRefreshTimeoutId = null;
   let gatherCountdownIntervalId = null;
   let isGatheringActiveThisTab = false;
+  let harvestActive = false;
+  let harvestRunId = null;
+  let harvestCancelRequested = false;
+  let harvestStatusText = '';
+  const harvestTemplates = {
+    top: null,
+    profile: null,
+    drafts: null,
+  };
+  const harvestHeaderBank = {
+    authorization: null,
+    oaiDeviceId: null,
+    oaiLanguage: null,
+    updatedAt: 0,
+  };
+  let harvestDetailLookupsTotal = 0;
+  const harvestDomSeenKeys = new Set();
+  const harvestQueue = [];
+  let harvestFlushTimer = null;
 
   // Analyze (Top feed only)
   let analyzeActive = false;
@@ -833,6 +866,27 @@
   };
 
   const isDrafts = () => location.pathname.startsWith('/drafts');
+
+  function getHarvestContextFromRoute(pathname = location.pathname, search = location.search) {
+    const p = String(pathname || '');
+    const s = String(search || '');
+    if (p.startsWith('/drafts')) return 'drafts';
+    if (p.startsWith('/profile')) return 'profile';
+    if (p === '/explore') {
+      try {
+        const sp = new URLSearchParams(s.startsWith('?') ? s : `?${s}`);
+        if (sp.get('feed') === 'top') return 'top';
+      } catch {}
+    }
+    return null;
+  }
+
+  function pickHarvestTemplateForContext(context, templates = harvestTemplates) {
+    if (context === 'top') return templates.top || null;
+    if (context === 'drafts') return templates.drafts || null;
+    if (context === 'profile') return templates.profile || templates.top || null;
+    return null;
+  }
 
   function currentSIdFromURL() {
     const m = location.pathname.match(/^\/p\/(s_[A-Za-z0-9]+)/i);
@@ -4588,6 +4642,12 @@
     gatherBtn.style.display = 'none';
     buttonRow.appendChild(gatherBtn);
 
+    const harvestBtn = document.createElement('button');
+    makePill(harvestBtn, 'Harvest');
+    harvestBtn.classList.add('sora-uv-harvest-btn');
+    harvestBtn.style.display = 'none';
+    buttonRow.appendChild(harvestBtn);
+
     // Analyze (Top only; visibility handled later)
     analyzeBtn = document.createElement('button');
     makePill(analyzeBtn, 'Analyze');
@@ -4682,6 +4742,20 @@
     buttonRow.appendChild(bookmarksContainer);
 
     bar.appendChild(buttonRow);
+
+    const harvestStatusEl = document.createElement('div');
+    harvestStatusEl.className = 'sora-uv-harvest-status';
+    Object.assign(harvestStatusEl.style, {
+      display: 'none',
+      width: '100%',
+      textAlign: 'center',
+      fontSize: '11px',
+      color: 'rgba(255, 255, 255, 0.75)',
+      lineHeight: '1.2',
+      paddingTop: '2px',
+      background: 'transparent',
+    });
+    bar.appendChild(harvestStatusEl);
 
     // Drafts queue panel (only visible on /drafts).
     const draftsQueuePanel = document.createElement('div');
@@ -4987,6 +5061,13 @@
       toggleAnalyzeMode();
     };
 
+    harvestBtn.onclick = () => {
+      if (harvestBtn.disabled) return;
+      if (harvestActive) stopApiHarvestRun('cancelled');
+      else startApiHarvestRun();
+      syncHarvestControlState(bar);
+    };
+
     bookmarksBtn.onclick = (e) => {
       if (bookmarksBtn.disabled) return;
       e.stopPropagation();
@@ -5082,6 +5163,7 @@
     
     // Set initial position based on current scroll
     updateBarPosition();
+    syncHarvestControlState(bar);
 
     document.documentElement.appendChild(bar);
     controlBar = bar;
@@ -6987,6 +7069,631 @@ async function renderAnalyzeTable(force = false) {
   // If pending v2 is unavailable, we can still populate drafts metadata by calling the drafts endpoint directly.
   // Throttle to avoid spamming in case Sora repeatedly polls a broken endpoint.
   const DRAFTS_BACKUP_THROTTLE_MS = 15000;
+  function waitMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+  }
+
+  function getHeaderValue(headers, name) {
+    if (!headers || !name) return null;
+    const lower = String(name).toLowerCase();
+    try {
+      if (headers instanceof Headers) return headers.get(name) || headers.get(lower) || null;
+      if (Array.isArray(headers)) {
+        const row = headers.find((entry) => String(entry?.[0] || '').toLowerCase() === lower);
+        return row ? row[1] : null;
+      }
+      if (typeof headers === 'object') {
+        return headers[name] || headers[lower] || null;
+      }
+    } catch {}
+    return null;
+  }
+
+  function captureHarvestHeaders(headers) {
+    if (!headers) return;
+    const auth = getHeaderValue(headers, 'Authorization');
+    const device = getHeaderValue(headers, 'OAI-Device-Id');
+    const language = getHeaderValue(headers, 'OAI-Language');
+    if (typeof auth === 'string' && auth.trim()) {
+      const normalized = auth.trim();
+      harvestHeaderBank.authorization = normalized;
+      if (normalized.startsWith('Bearer ')) {
+        capturedAuthToken = normalized;
+        ensureUVDraftsPageModule()?.setCapturedAuthToken?.(capturedAuthToken);
+      }
+    }
+    if (typeof device === 'string' && device.trim()) harvestHeaderBank.oaiDeviceId = device.trim();
+    if (typeof language === 'string' && language.trim()) harvestHeaderBank.oaiLanguage = language.trim();
+    harvestHeaderBank.updatedAt = Date.now();
+  }
+
+  function captureHarvestTemplateFromRequest(input, init) {
+    try {
+      const reqUrl = typeof input === 'string' ? input : input?.url || '';
+      if (!reqUrl) return;
+      const parsed = new URL(reqUrl, location.origin);
+      if (parsed.origin !== location.origin) return;
+
+      const method = String(init?.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
+      if (method !== 'GET') return;
+
+      let context = null;
+      if (DRAFTS_RE.test(parsed.pathname)) {
+        context = 'drafts';
+      } else if (/\/backend\/project_[a-z]+\/profile_feed\//i.test(parsed.pathname)) {
+        context = 'profile';
+      } else if (/\/backend\/project_[a-z]+\/feed/i.test(parsed.pathname) && parsed.searchParams.get('feed') === 'top') {
+        context = 'top';
+      }
+      if (!context) return;
+
+      const sourceHeaders = init?.headers || (input instanceof Request ? input.headers : null);
+      captureHarvestHeaders(sourceHeaders);
+      const canonicalHeaders = {};
+      if (harvestHeaderBank.authorization) canonicalHeaders.Authorization = harvestHeaderBank.authorization;
+      if (harvestHeaderBank.oaiDeviceId) canonicalHeaders['OAI-Device-Id'] = harvestHeaderBank.oaiDeviceId;
+      if (harvestHeaderBank.oaiLanguage) canonicalHeaders['OAI-Language'] = harvestHeaderBank.oaiLanguage;
+
+      harvestTemplates[context] = {
+        context,
+        url: parsed.toString(),
+        method,
+        headers: canonicalHeaders,
+        capturedAt: Date.now(),
+      };
+    } catch {}
+  }
+
+  function setHarvestStatus(text) {
+    harvestStatusText = String(text || '').trim();
+    const bar = controlBar;
+    if (!bar || !document.contains(bar)) return;
+    const statusEl = bar.querySelector('.sora-uv-harvest-status');
+    if (!statusEl) return;
+    statusEl.textContent = harvestStatusText;
+    statusEl.style.display = harvestStatusText ? '' : 'none';
+  }
+
+  function flushHarvestQueue(forceAll = false) {
+    if (!harvestQueue.length) return;
+    const sendCount = forceAll ? harvestQueue.length : Math.min(HARVEST_BATCH_CHUNK_MAX, harvestQueue.length);
+    const items = harvestQueue.splice(0, sendCount);
+    if (!items.length) return;
+    try {
+      window.postMessage({ __sora_uv__: true, type: 'harvest_batch', items }, '*');
+    } catch {}
+  }
+
+  function scheduleHarvestFlush() {
+    if (harvestFlushTimer) return;
+    harvestFlushTimer = setTimeout(() => {
+      harvestFlushTimer = null;
+      flushHarvestQueue(false);
+      if (harvestQueue.length) scheduleHarvestFlush();
+    }, HARVEST_BATCH_FLUSH_MS);
+  }
+
+  function queueHarvestRecords(records) {
+    if (!harvestActive || !Array.isArray(records) || !records.length) return;
+    for (const rec of records) {
+      if (!rec || !rec.id || !rec.kind) continue;
+      harvestQueue.push(rec);
+      if (harvestQueue.length >= HARVEST_BATCH_CHUNK_MAX) flushHarvestQueue(false);
+    }
+    scheduleHarvestFlush();
+  }
+
+  function extractCursorFromPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const cursor = payload?.next_cursor ?? payload?.cursor ?? payload?.data?.next_cursor ?? payload?.data?.cursor ?? null;
+    return cursor == null || cursor === '' ? null : String(cursor);
+  }
+
+  function extractDurationAndDimensionsFromPost(post, id) {
+    const p = post && typeof post === 'object' ? post : {};
+    const dims = idToDimensions.get(id) || null;
+    let width = dims?.width ?? null;
+    let height = dims?.height ?? null;
+    let duration = idToDuration.get(id) ?? null;
+    try {
+      const attachment = Array.isArray(p.attachments) && p.attachments.length ? p.attachments[0] : null;
+      if (attachment?.width != null && width == null) width = Number(attachment.width);
+      if (attachment?.height != null && height == null) height = Number(attachment.height);
+      const nFrames = attachment?.n_frames ?? p?.creation_config?.n_frames ?? p?.n_frames ?? p?.video_metadata?.n_frames ?? null;
+      if (nFrames != null && duration == null) {
+        const fps = Number(p?.creation_config?.fps) || 30;
+        const nf = Number(nFrames);
+        if (Number.isFinite(nf) && nf > 0 && Number.isFinite(fps) && fps > 0) duration = nf / fps;
+      }
+    } catch {}
+    return {
+      duration_s: Number.isFinite(Number(duration)) ? Number(duration) : null,
+      width: Number.isFinite(Number(width)) ? Number(width) : null,
+      height: Number.isFinite(Number(height)) ? Number(height) : null,
+    };
+  }
+
+  function buildHarvestRecordFromFeedItem(item, context, source, runId) {
+    const id = getItemId(item);
+    if (!id) return null;
+    const p = item?.post || item || {};
+    const owner = getOwner(item);
+    const cameoNames = getCameoUsernames(item) || [];
+    const dims = extractDurationAndDimensionsFromPost(p, id);
+    const now = Date.now();
+    const createdAt =
+      p?.created_at ?? p?.uploaded_at ?? p?.createdAt ?? p?.created ?? p?.posted_at ?? p?.timestamp ?? null;
+    const prompt =
+      (typeof p?.caption === 'string' && p.caption.trim()) ||
+      (typeof p?.text === 'string' && p.text.trim()) ||
+      null;
+    return {
+      id: String(id),
+      kind: 'published',
+      context,
+      detail_url: `${location.origin}/backend/project_y/post/${id}`,
+      source,
+      prompt,
+      prompt_source: prompt ? 'inline' : null,
+      title: typeof p?.title === 'string' ? p.title : null,
+      generation_type: typeof p?.kind === 'string' ? p.kind : (typeof p?.generation_type === 'string' ? p.generation_type : null),
+      generation_id: p?.generation_id ? String(p.generation_id) : null,
+      width: dims.width,
+      height: dims.height,
+      duration_s: dims.duration_s,
+      created_at: createdAt,
+      posted_at: p?.posted_at ?? null,
+      updated_at: p?.updated_at ?? null,
+      view_count: getTotalViews(item),
+      unique_view_count: getUniqueViews(item),
+      like_count: getLikes(item),
+      dislike_count: p?.dislike_count ?? null,
+      reply_count: getComments(item),
+      recursive_reply_count: p?.recursive_reply_count ?? null,
+      remix_count: getRemixes(item),
+      post_permalink: `${location.origin}/p/${id}`,
+      post_visibility: typeof p?.visibility === 'string' ? p.visibility : null,
+      cast_count: cameoNames.length || null,
+      cast_names: cameoNames.length ? cameoNames : null,
+      cameos: cameoNames.length ? cameoNames : null,
+      first_seen_ts: now,
+      last_seen_ts: now,
+      last_harvest_run_id: runId,
+      user_handle: owner?.handle || null,
+      user_id: owner?.id || null,
+    };
+  }
+
+  function buildHarvestRecordFromDraftItem(item, source, runId) {
+    let draftId = item?.id || item?.generation_id || item?.draft_id;
+    if (!draftId) return null;
+    draftId = normalizeId(draftId);
+    if (!draftId) return null;
+
+    const cc = item?.creation_config && typeof item.creation_config === 'object' ? item.creation_config : {};
+    const nFrames = Number(cc?.n_frames);
+    const fps = Number(cc?.fps) || SORA_DEFAULT_FPS;
+    const duration = Number.isFinite(nFrames) && nFrames > 0 && Number.isFinite(fps) && fps > 0 ? (nFrames / fps) : (idToDuration.get(draftId) ?? null);
+    const width = cc?.width ?? idToDimensions.get(draftId)?.width ?? null;
+    const height = cc?.height ?? idToDimensions.get(draftId)?.height ?? null;
+    const prompt =
+      (typeof cc?.prompt === 'string' && cc.prompt.trim()) ||
+      (typeof item?.prompt === 'string' && item.prompt.trim()) ||
+      (idToPrompt.get(draftId) || null);
+    const cameoNames = Array.isArray(item?.cameos) ? item.cameos.filter(Boolean).map((v) => String(v)) : null;
+    const now = Date.now();
+    return {
+      id: String(draftId),
+      kind: 'draft',
+      context: 'drafts',
+      detail_url: `${location.origin}/backend/project_y/profile/drafts/v2/${draftId}`,
+      source,
+      prompt,
+      prompt_source: prompt ? 'creation_config' : null,
+      title: typeof item?.title === 'string' ? item.title : null,
+      generation_type: typeof item?.kind === 'string' ? item.kind : null,
+      generation_id: item?.generation_id ? String(item.generation_id) : null,
+      width: Number.isFinite(Number(width)) ? Number(width) : null,
+      height: Number.isFinite(Number(height)) ? Number(height) : null,
+      duration_s: Number.isFinite(Number(duration)) ? Number(duration) : null,
+      created_at: item?.created_at ?? null,
+      posted_at: item?.posted_at ?? null,
+      updated_at: item?.updated_at ?? null,
+      post_permalink: `${location.origin}/d/${draftId}`,
+      cast_count: cameoNames?.length || null,
+      cast_names: cameoNames?.length ? cameoNames : null,
+      cameos: cameoNames?.length ? cameoNames : null,
+      first_seen_ts: now,
+      last_seen_ts: now,
+      last_harvest_run_id: runId,
+    };
+  }
+
+  function buildHarvestRecordsFromFeedJson(json, context, source, runId) {
+    const items = json?.items || json?.data?.items || [];
+    if (!Array.isArray(items) || !items.length) return [];
+    const out = [];
+    for (const item of items) {
+      const rec = buildHarvestRecordFromFeedItem(item, context, source, runId);
+      if (rec) out.push(rec);
+    }
+    return out;
+  }
+
+  function buildHarvestRecordsFromDraftsJson(json, source, runId) {
+    const items = extractDraftItemsFromPayload(json);
+    if (!Array.isArray(items) || !items.length) return [];
+    const out = [];
+    for (const item of items) {
+      const rec = buildHarvestRecordFromDraftItem(item, source, runId);
+      if (rec) out.push(rec);
+    }
+    return out;
+  }
+
+  function buildHarvestHeaders(template) {
+    const headers = {
+      Accept: 'application/json',
+    };
+    if (template?.headers && typeof template.headers === 'object') {
+      Object.assign(headers, template.headers);
+    }
+    if (!headers.Authorization && capturedAuthToken) headers.Authorization = capturedAuthToken;
+    if (!headers.Authorization && harvestHeaderBank.authorization) headers.Authorization = harvestHeaderBank.authorization;
+    if (!headers['OAI-Device-Id'] && harvestHeaderBank.oaiDeviceId) headers['OAI-Device-Id'] = harvestHeaderBank.oaiDeviceId;
+    if (!headers['OAI-Language'] && harvestHeaderBank.oaiLanguage) headers['OAI-Language'] = harvestHeaderBank.oaiLanguage;
+    return headers;
+  }
+
+  async function harvestFetchJson(template, opts = {}) {
+    const baseUrl = opts.urlOverride || template?.url;
+    if (!baseUrl) throw new Error('missing_harvest_template_url');
+    const url = new URL(baseUrl, location.origin);
+    if (opts.limit != null && !Number.isNaN(Number(opts.limit))) url.searchParams.set('limit', String(opts.limit));
+    if (opts.cursor) url.searchParams.set('cursor', String(opts.cursor));
+    if (opts.context === 'top') url.searchParams.set('feed', 'top');
+
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      credentials: 'include',
+      headers: buildHarvestHeaders(template),
+    });
+    if (!response.ok) throw new Error(`harvest_http_${response.status}`);
+    return response.json();
+  }
+
+  async function enrichHarvestRecords(records, template) {
+    if (!Array.isArray(records) || !records.length) return;
+    if (harvestDetailLookupsTotal >= DETAIL_LOOKUPS_TOTAL_MAX) return;
+    const candidates = records.filter((rec) => !rec.prompt && rec?.id && rec?.kind).slice(0, DETAIL_LOOKUPS_PER_PAGE);
+    if (!candidates.length) return;
+    for (const rec of candidates) {
+      if (!harvestActive || harvestCancelRequested) return;
+      if (harvestDetailLookupsTotal >= DETAIL_LOOKUPS_TOTAL_MAX) return;
+      harvestDetailLookupsTotal += 1;
+      try {
+        const detailUrl = rec.kind === 'draft'
+          ? `${location.origin}/backend/project_y/profile/drafts/v2/${rec.id}`
+          : `${location.origin}/backend/project_y/post/${rec.id}`;
+        const detail = await harvestFetchJson(template, { urlOverride: detailUrl });
+        const prompt =
+          (typeof detail?.prompt === 'string' && detail.prompt.trim()) ||
+          (typeof detail?.post?.prompt === 'string' && detail.post.prompt.trim()) ||
+          (typeof detail?.creation_config?.prompt === 'string' && detail.creation_config.prompt.trim()) ||
+          (typeof detail?.draft?.creation_config?.prompt === 'string' && detail.draft.creation_config.prompt.trim()) ||
+          null;
+        if (prompt) {
+          rec.prompt = prompt;
+          rec.prompt_source = 'detail';
+        }
+      } catch {}
+      await waitMs(DETAIL_LOOKUP_DELAY_MS);
+    }
+  }
+
+  function collectDomHarvestRecordsFromMaps(runId, context) {
+    const out = [];
+    const now = Date.now();
+    if (context === 'drafts') {
+      for (const [id, prompt] of idToPrompt.entries()) {
+        const rec = {
+          id: String(id),
+          kind: 'draft',
+          context: 'drafts',
+          detail_url: `${location.origin}/backend/project_y/profile/drafts/v2/${id}`,
+          source: 'dom',
+          prompt: typeof prompt === 'string' ? prompt : null,
+          prompt_source: prompt ? 'dom_map' : null,
+          width: Number.isFinite(Number(idToDimensions.get(id)?.width)) ? Number(idToDimensions.get(id).width) : null,
+          height: Number.isFinite(Number(idToDimensions.get(id)?.height)) ? Number(idToDimensions.get(id).height) : null,
+          duration_s: Number.isFinite(Number(idToDuration.get(id))) ? Number(idToDuration.get(id)) : null,
+          post_permalink: `${location.origin}/d/${id}`,
+          first_seen_ts: now,
+          last_seen_ts: now,
+          last_harvest_run_id: runId,
+        };
+        const key = `${rec.kind}:${rec.id}`;
+        if (harvestDomSeenKeys.has(key)) continue;
+        harvestDomSeenKeys.add(key);
+        out.push(rec);
+      }
+      return out;
+    }
+
+    for (const [id, meta] of idToMeta.entries()) {
+      const cameos = idToCameos.get(id);
+      const rec = {
+        id: String(id),
+        kind: 'published',
+        context,
+        detail_url: `${location.origin}/backend/project_y/post/${id}`,
+        source: 'dom',
+        prompt: null,
+        prompt_source: null,
+        width: Number.isFinite(Number(idToDimensions.get(id)?.width)) ? Number(idToDimensions.get(id).width) : null,
+        height: Number.isFinite(Number(idToDimensions.get(id)?.height)) ? Number(idToDimensions.get(id).height) : null,
+        duration_s: Number.isFinite(Number(idToDuration.get(id))) ? Number(idToDuration.get(id)) : null,
+        unique_view_count: Number.isFinite(Number(idToUnique.get(id))) ? Number(idToUnique.get(id)) : null,
+        like_count: Number.isFinite(Number(idToLikes.get(id))) ? Number(idToLikes.get(id)) : null,
+        view_count: Number.isFinite(Number(idToViews.get(id))) ? Number(idToViews.get(id)) : null,
+        reply_count: Number.isFinite(Number(idToComments.get(id))) ? Number(idToComments.get(id)) : null,
+        remix_count: Number.isFinite(Number(idToRemixes.get(id))) ? Number(idToRemixes.get(id)) : null,
+        post_permalink: `${location.origin}/p/${id}`,
+        cast_count: Array.isArray(cameos) ? cameos.length : null,
+        cast_names: Array.isArray(cameos) && cameos.length ? cameos : null,
+        cameos: Array.isArray(cameos) && cameos.length ? cameos : null,
+        created_at: meta?.createdAtMs || null,
+        first_seen_ts: now,
+        last_seen_ts: now,
+        last_harvest_run_id: runId,
+      };
+      const key = `${rec.kind}:${rec.id}`;
+      if (harvestDomSeenKeys.has(key)) continue;
+      harvestDomSeenKeys.add(key);
+      out.push(rec);
+    }
+    return out;
+  }
+
+  async function waitForHarvestTemplate(runId, context, timeoutMs = HARVEST_TEMPLATE_WAIT_MS) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (!harvestActive || harvestCancelRequested || runId !== harvestRunId) return null;
+      const template = pickHarvestTemplateForContext(context);
+      if (template) return template;
+      await waitMs(120);
+    }
+    return pickHarvestTemplateForContext(context);
+  }
+
+  async function resolveProfileTemplate(baseTemplate) {
+    if (baseTemplate?.context === 'profile' || /\/profile_feed\//i.test(String(baseTemplate?.url || ''))) return baseTemplate;
+    const slug = currentProfileHandleFromURL();
+    if (!slug) return baseTemplate || null;
+    const profileLookupUrl = `${location.origin}/backend/project_y/profile/username/${encodeURIComponent(slug)}`;
+    const headers = buildHarvestHeaders(baseTemplate || {});
+    const response = await fetch(profileLookupUrl, { method: 'GET', credentials: 'include', headers });
+    if (!response.ok) return baseTemplate || null;
+    const json = await response.json();
+    const profileId = json?.id || json?.user_id || json?.profile?.id || json?.profile?.user_id || null;
+    if (!profileId) return baseTemplate || null;
+    return {
+      context: 'profile',
+      url: `${location.origin}/backend/project_y/profile_feed/${profileId}?limit=${HARVEST_FEED_PAGE_SIZE}`,
+      method: 'GET',
+      headers: {
+        Authorization: headers.Authorization || undefined,
+        'OAI-Device-Id': headers['OAI-Device-Id'] || undefined,
+        'OAI-Language': headers['OAI-Language'] || undefined,
+      },
+      capturedAt: Date.now(),
+    };
+  }
+
+  async function runTopApiHarvest(runId, template) {
+    let cursor = null;
+    let pages = 0;
+    let records = 0;
+    while (pages < HARVEST_PAGE_LIMIT && harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+      const json = await harvestFetchJson(template, { cursor, limit: HARVEST_FEED_PAGE_SIZE, context: 'top' });
+      processFeedJson(json);
+      const pageRecords = buildHarvestRecordsFromFeedJson(json, 'top', 'api', runId);
+      await enrichHarvestRecords(pageRecords, template);
+      queueHarvestRecords(pageRecords);
+      pages += 1;
+      records += pageRecords.length;
+      setHarvestStatus(`Harvesting Top (API): page ${pages}, records ${records}`);
+      const nextCursor = extractCursorFromPayload(json);
+      const hasItems = Array.isArray(json?.items || json?.data?.items) && (json?.items || json?.data?.items || []).length > 0;
+      if (!nextCursor || !hasItems || nextCursor === cursor) break;
+      cursor = nextCursor;
+    }
+    return records > 0;
+  }
+
+  async function runProfileApiHarvest(runId, template) {
+    const resolvedTemplate = await resolveProfileTemplate(template);
+    if (!resolvedTemplate) return false;
+    let cursor = null;
+    let pages = 0;
+    let records = 0;
+    while (pages < HARVEST_PAGE_LIMIT && harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+      const json = await harvestFetchJson(resolvedTemplate, { cursor, limit: HARVEST_FEED_PAGE_SIZE, context: 'profile' });
+      processFeedJson(json);
+      const pageRecords = buildHarvestRecordsFromFeedJson(json, 'profile', 'api', runId);
+      await enrichHarvestRecords(pageRecords, resolvedTemplate);
+      queueHarvestRecords(pageRecords);
+      pages += 1;
+      records += pageRecords.length;
+      setHarvestStatus(`Harvesting Profile (API): page ${pages}, records ${records}`);
+      const nextCursor = extractCursorFromPayload(json);
+      const hasItems = Array.isArray(json?.items || json?.data?.items) && (json?.items || json?.data?.items || []).length > 0;
+      if (!nextCursor || !hasItems || nextCursor === cursor) break;
+      cursor = nextCursor;
+    }
+    return records > 0;
+  }
+
+  async function runDraftsApiHarvest(runId, template) {
+    let cursor = null;
+    let pages = 0;
+    let records = 0;
+    while (pages < HARVEST_PAGE_LIMIT && harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+      const json = await harvestFetchJson(template, { cursor, limit: HARVEST_DRAFTS_PAGE_SIZE, context: 'drafts' });
+      processDraftsJson(json);
+      const pageRecords = buildHarvestRecordsFromDraftsJson(json, 'api', runId);
+      await enrichHarvestRecords(pageRecords, template);
+      queueHarvestRecords(pageRecords);
+      pages += 1;
+      records += pageRecords.length;
+      setHarvestStatus(`Harvesting Drafts (API): page ${pages}, records ${records}`);
+      const nextCursor = extractCursorFromPayload(json);
+      const pageItems = extractDraftItemsFromPayload(json);
+      const hasItems = Array.isArray(pageItems) && pageItems.length > 0;
+      if (!nextCursor || !hasItems || nextCursor === cursor) break;
+      cursor = nextCursor;
+    }
+    return records > 0;
+  }
+
+  async function runHarvestDomFallback(runId, context) {
+    let noProgressTicks = 0;
+    let tick = 0;
+    let total = 0;
+    setHarvestStatus(`Harvest fallback (DOM) started on ${context}...`);
+    while (tick < HARVEST_SCROLL_MAX_TICKS && noProgressTicks < HARVEST_SCROLL_NO_PROGRESS_LIMIT && harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+      tick += 1;
+      runRenderPass();
+      const records = collectDomHarvestRecordsFromMaps(runId, context);
+      if (records.length) {
+        total += records.length;
+        noProgressTicks = 0;
+        queueHarvestRecords(records);
+      } else {
+        noProgressTicks += 1;
+      }
+      setHarvestStatus(`Harvesting ${context} (DOM): tick ${tick}, records ${total}`);
+      window.scrollTo(0, window.scrollY + HARVEST_SCROLL_STEP_PX);
+      const waitFor = Math.min(HARVEST_SCROLL_MAX_DELAY_MS, HARVEST_SCROLL_BASE_DELAY_MS + Math.floor(Math.random() * 500));
+      await waitMs(waitFor);
+    }
+    return total > 0;
+  }
+
+  async function runApiHarvestPipeline(runId, context) {
+    const template = await waitForHarvestTemplate(runId, context, HARVEST_TEMPLATE_WAIT_MS);
+    if (!template) return false;
+    if (context === 'top') return runTopApiHarvest(runId, template);
+    if (context === 'profile') return runProfileApiHarvest(runId, template);
+    if (context === 'drafts') return runDraftsApiHarvest(runId, template);
+    return false;
+  }
+
+  function syncHarvestControlState(bar = controlBar) {
+    if (!bar || !document.contains(bar)) return;
+    const harvestBtn = bar.querySelector('.sora-uv-harvest-btn');
+    const statusEl = bar.querySelector('.sora-uv-harvest-status');
+    const filterBtn = bar.querySelector('[data-role="filter-btn"]');
+    const gatherBtn = bar.querySelector('.sora-uv-gather-btn');
+    const gatherControlsWrapper = bar.querySelector('.sora-uv-gather-controls-wrapper');
+    const analyze = bar.querySelector('.sora-uv-analyze-btn');
+    if (harvestBtn) {
+      harvestBtn.style.display = getHarvestContextFromRoute() ? 'flex' : 'none';
+      if (typeof harvestBtn.setLabel === 'function') harvestBtn.setLabel(harvestActive ? 'Harvesting...' : 'Harvest');
+      else harvestBtn.textContent = harvestActive ? 'Harvesting...' : 'Harvest';
+      harvestBtn.dataset.active = harvestActive ? 'true' : 'false';
+      harvestBtn.style.opacity = harvestActive ? '1' : '1';
+    }
+    if (statusEl) {
+      statusEl.textContent = harvestStatusText || '';
+      statusEl.style.display = harvestStatusText ? '' : 'none';
+    }
+    if (filterBtn) {
+      filterBtn.disabled = !!harvestActive;
+      filterBtn.style.opacity = harvestActive ? '0.5' : '';
+      filterBtn.style.pointerEvents = harvestActive ? 'none' : '';
+    }
+    if (gatherBtn) {
+      gatherBtn.disabled = !!harvestActive;
+      gatherBtn.style.opacity = harvestActive ? '0.5' : '';
+      gatherBtn.style.pointerEvents = harvestActive ? 'none' : '';
+    }
+    if (analyze) {
+      analyze.disabled = !!harvestActive;
+      analyze.style.opacity = harvestActive ? '0.5' : '';
+      analyze.style.pointerEvents = harvestActive ? 'none' : '';
+    }
+    if (harvestActive && gatherControlsWrapper) gatherControlsWrapper.style.display = 'none';
+  }
+
+  function stopApiHarvestRun(reason = 'stopped') {
+    harvestCancelRequested = true;
+    if (!harvestActive && !harvestRunId) return;
+    harvestActive = false;
+    harvestRunId = null;
+    if (harvestFlushTimer) {
+      clearTimeout(harvestFlushTimer);
+      harvestFlushTimer = null;
+    }
+    while (harvestQueue.length) flushHarvestQueue(true);
+    if (reason === 'completed') setHarvestStatus('Harvest complete');
+    else if (reason === 'cancelled') setHarvestStatus('Harvest stopped');
+    else if (reason === 'navigation') setHarvestStatus('Harvest stopped on navigation');
+    else if (reason) setHarvestStatus(`Harvest ${reason}`);
+    syncHarvestControlState(controlBar);
+  }
+
+  async function startApiHarvestRun() {
+    if (harvestActive) return;
+    const context = getHarvestContextFromRoute();
+    if (!context) {
+      setHarvestStatus('Harvest is available on Top, Profile, and Drafts pages.');
+      syncHarvestControlState(controlBar);
+      return;
+    }
+
+    if (isGatheringActiveThisTab) {
+      isGatheringActiveThisTab = false;
+      stopGathering(false);
+    }
+    if (analyzeActive) exitAnalyzeMode();
+
+    harvestActive = true;
+    harvestCancelRequested = false;
+    harvestRunId = `harvest_${Date.now()}`;
+    harvestDetailLookupsTotal = 0;
+    harvestDomSeenKeys.clear();
+    setHarvestStatus(`Preparing Harvest (${context})...`);
+    syncHarvestControlState(controlBar);
+
+    const runId = harvestRunId;
+    let apiWorked = false;
+    try {
+      apiWorked = await runApiHarvestPipeline(runId, context);
+      if (!apiWorked && harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+        setHarvestStatus(`API harvest unavailable on ${context}, switching to DOM fallback...`);
+        await runHarvestDomFallback(runId, context);
+      }
+      if (harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+        stopApiHarvestRun('completed');
+      }
+    } catch (err) {
+      try { console.warn('[SoraUV] harvest pipeline failed, using fallback', err); } catch {}
+      if (harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+        try {
+          await runHarvestDomFallback(runId, context);
+        } catch {}
+        if (harvestActive && !harvestCancelRequested && runId === harvestRunId) {
+          stopApiHarvestRun('completed');
+        }
+      }
+    }
+  }
+
+  function forceStopHarvestOnNavigation() {
+    if (harvestActive) stopApiHarvestRun('navigation');
+  }
+
   let draftsBackupInFlight = false;
   let draftsBackupLastAttemptMs = 0;
   function scheduleDraftsBackupFetch(reason) {
@@ -7038,6 +7745,7 @@ async function renderAnalyzeTable(force = false) {
             capturedAuthToken = authHeader;
             ensureUVDraftsPageModule()?.setCapturedAuthToken?.(capturedAuthToken);
           }
+          captureHarvestHeaders(headers);
         }
       } catch {}
 
@@ -7110,6 +7818,10 @@ async function renderAnalyzeTable(force = false) {
             } catch {}
           }
         }
+      } catch {}
+
+      try {
+        captureHarvestTemplateFromRequest(modifiedInput, modifiedInit || init);
       } catch {}
 
       let res;
@@ -7267,6 +7979,9 @@ async function renderAnalyzeTable(force = false) {
     };
     const origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url) {
+      try {
+        captureHarvestTemplateFromRequest(String(url || ''), { method: method || 'GET' });
+      } catch {}
       this.addEventListener('load', function () {
         try {
             if (typeof url === 'string') {
@@ -8874,6 +9589,7 @@ async function renderAnalyzeTable(force = false) {
     const filterBtn = bar.querySelector('[data-role="filter-btn"]');
     const filterContainer = filterBtn ? filterBtn.closest('.sora-uv-filter-container') : null;
     const gatherBtn = bar.querySelector('.sora-uv-gather-btn');
+    const harvestBtn = bar.querySelector('.sora-uv-harvest-btn');
     const gatherControlsWrapper = bar.querySelector('.sora-uv-gather-controls-wrapper');
     const sliderContainer = bar.querySelector('.sora-uv-slider-container');
     const filterDropdown = bar.querySelector('.sora-uv-filter-dropdown');
@@ -8884,6 +9600,7 @@ async function renderAnalyzeTable(force = false) {
     if (analyzeActive) {
       if (filterContainer) filterContainer.style.display = 'none';
       if (gatherBtn) gatherBtn.style.display = 'none';
+      if (harvestBtn) harvestBtn.style.display = 'none';
       if (gatherControlsWrapper) gatherControlsWrapper.style.display = 'none';
       if (typeof bar.updateFilterLabel === 'function') bar.updateFilterLabel();
 
@@ -8972,12 +9689,14 @@ async function renderAnalyzeTable(force = false) {
 
     // Analyze button on all feeds except Drafts
     if (analyzeBtn) analyzeBtn.style.display = isDrafts() ? 'none' : '';
+    if (harvestBtn) harvestBtn.style.display = getHarvestContextFromRoute() ? '' : 'none';
 
     // Bookmarks button only on Drafts page
     if (bookmarksBtn) bookmarksBtn.style.display = isDrafts() ? '' : 'none';
     if (typeof bar.updateDraftsQueueUi === 'function') bar.updateDraftsQueueUi();
 
     if (typeof bar.updateFilterLabel === 'function') bar.updateFilterLabel();
+    syncHarvestControlState(bar);
   }
 
   function onRouteChange() {
@@ -8999,6 +9718,7 @@ async function renderAnalyzeTable(force = false) {
       try {
         isGatheringActiveThisTab = false;
         stopGathering(false);
+        stopApiHarvestRun('navigation');
       } catch {}
 
       // Hide control bar on UV Drafts
@@ -9042,6 +9762,7 @@ async function renderAnalyzeTable(force = false) {
       try {
         isGatheringActiveThisTab = false;
         stopGathering(false);
+        stopApiHarvestRun('navigation');
         const s = getGatherState() || {};
         s.isGathering = false;
         delete s.refreshDeadline;
@@ -9074,6 +9795,7 @@ async function renderAnalyzeTable(force = false) {
     }
 
     if (navigated) {
+      forceStopHarvestOnNavigation();
       forceStopGatherOnNavigation();
       if (!shouldPreserveFilterAcrossNavigation(prev, rk)) resetFilterOnNavigation();
       // Reset bookmarks filter on navigation
