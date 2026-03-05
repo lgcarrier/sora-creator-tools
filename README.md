@@ -22,7 +22,7 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 - Adds post overlays on Explore/Profile/Post pages (views, unique viewers, interaction metrics, remix metrics, duration).
 - Adds feed controls including filtering, Gather mode, and Analyze mode on Top feed.
 - Captures metrics snapshots locally while you browse.
-- Provides a full dashboard (`dashboard.html`) with charts, compare mode, post filters, import/export, and data purge tools.
+- Provides a full dashboard (`dashboard.html`) with mode switching (`Metrics` / `Harvest`), charts, compare mode, Harvest table tooling, import/export, and data purge tools.
 - Adds a dedicated `/uv-drafts` page with:
   - Draft caching and progressive sync
   - Pending task polling
@@ -80,6 +80,9 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 ### Dashboard Mode (Extension Icon)
 
 - Opens `dashboard.html` in its own tab (reused/focused if already open).
+- Mode toggle:
+  - **Metrics**: classic profile analytics, charts, compare, and post filters.
+  - **Harvest**: unified Harvest dataset browser (Top/Profile/Drafts) with filters, pagination, row detail, and prompt inspection.
 - Type-ahead profile picker with quick post visibility controls (show/hide all, top/bottom slices, stale, date windows).
 - Per-profile metric cards for views, unique viewers, likes, replies, recursive remixes, engagements, cast-in, and followers.
 - Multi-chart analytics for:
@@ -90,7 +93,9 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
   - Compare-mode aggregate charts across selected creators
 - Linear + stacked chart modes with adjustable time windows.
 - Compare mode with multi-user pills and aggregate totals.
-- CSV import/export and data cleanup actions from the dashboard data menu.
+- Data menu exports:
+  - Metrics: CSV import/export and cleanup tools.
+  - Harvest: CSV and JSONL exports for **all records** or **current filtered view**.
 
 ### UV Drafts (`/uv-drafts`)
 
@@ -133,6 +138,7 @@ Cross-context bridge notes:
 - Harvest storage:
   - Records persisted in IndexedDB (`SCT_HARVEST_DB_V1`).
   - Metadata in `chrome.storage.local`: `harvestRecordsV1`, `harvestUpdatedAt`, `harvestStorageVersion`.
+  - Published harvest records preserve `user_handle` and `user_id` when captured, with dashboard fallback to metrics owner resolution for legacy rows.
 
 ## Privacy
 
