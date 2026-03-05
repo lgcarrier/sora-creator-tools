@@ -369,7 +369,7 @@
   const isProfile = () => location.pathname.startsWith('/profile');
   const isPost = () => /^\/p\/s_[A-Za-z0-9]+/i.test(location.pathname);
   const isDraftDetail = () => location.pathname === '/d' || location.pathname.startsWith('/d/');
-  const isUVDrafts = () => location.pathname === '/uv-drafts' || location.pathname.startsWith('/uv-drafts');
+  const isUVDrafts = () => location.pathname === '/creatortools' || location.pathname.startsWith('/creatortools');
 
   const isTopFeed = () => {
     try {
@@ -5168,7 +5168,7 @@ async function renderAnalyzeTable(force = false) {
       let modifiedInit = init;
       try {
         const url = typeof input === 'string' ? input : input?.url || '';
-        if (NF_CREATE_RE.test(url) && init?.body) {
+        if (NF_CREATE_RE.test(url) && init?.body && !init?.__sctDirect) {
           let body = init.body;
           if (typeof body === 'string') {
             try {
@@ -5203,7 +5203,7 @@ async function renderAnalyzeTable(force = false) {
         const url = typeof input === 'string' ? input : input?.url || '';
 
         // Intercept /backend/nf/create to capture task_id -> source draft mapping for draft remixes
-        if (NF_CREATE_RE.test(url)) {
+        if (NF_CREATE_RE.test(url) && !init?.__sctDirect) {
           // Only capture if we're on a draft remix page (/d/{genId}?remix=)
           const draftRemixMatch = location.pathname.match(/^\/d\/([A-Za-z0-9_-]+)/i);
           if (draftRemixMatch && location.search.includes('remix')) {
@@ -6964,7 +6964,7 @@ async function renderAnalyzeTable(force = false) {
 
       // Show UV Drafts page
       ensureUVDraftsPage();
-      // /uv-drafts is an extension virtual route; keep tab title from falling back to 404.
+      // /creatortools is an extension virtual route; keep tab title from falling back to 404.
       startUVDraftsTitleGuard();
       return;
     } else {
@@ -7331,7 +7331,7 @@ async function renderAnalyzeTable(force = false) {
     if (uvDraftsPrevDocTitle == null && typeof document.title === 'string' && document.title.trim()) {
       uvDraftsPrevDocTitle = document.title;
     }
-    history.pushState({}, '', '/uv-drafts');
+    history.pushState({}, '', '/creatortools');
     onRouteChange();
   }, true);
 

@@ -15,11 +15,28 @@
     const GENS_COUNT_MIN = 1;
     const GENS_COUNT_MAX_DEFAULT = 10;
     const GENS_COUNT_MAX_ULTRA = 40;
-    const COMPOSER_MODELS = [
-      { value: 'sora2', label: 'Sora 2' },
-      { value: 'sora2pro', label: 'Sora 2 Pro' },
+    // Mutable — updated from API via fetchComposerModels()
+    let composerModels = [
+      { value: 'sy_8', label: 'Sora 2' },
+      { value: 'sy_ore', label: 'Sora 2 Pro' },
     ];
-    const COMPOSER_MODEL_VALUES = new Set(COMPOSER_MODELS.map((item) => item.value));
+    let composerModelValues = new Set(composerModels.map((item) => item.value));
+
+    // Mutable — updated from API via fetchComposerStyles()
+    let composerStyles = [];
+
+    // Duration → n_frames mapping (30 fps)
+    const SECONDS_TO_FRAMES = { 5: 150, 10: 300, 15: 450, 25: 750 };
+    const VALID_DURATIONS = [5, 10, 15, 25];
+
+    // Cameo state for composer
+    let composerCameoIds = [];
+    let composerCameoReplacements = {};
+
+    // Sentinel SDK state
+    let sentinelInitialized = false;
+    let cachedSentinelToken = null;
+    let cachedSentinelExpiry = 0;
 
     function getBookmarks() {
       try {
@@ -126,16 +143,20 @@
       } catch {}
     }
 
+    function escapeHtml(str) {
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
     function normalizeComposerModel(value) {
       const normalized = typeof value === 'string' ? value.trim() : '';
-      return COMPOSER_MODEL_VALUES.has(normalized) ? normalized : '';
+      return composerModelValues.has(normalized) ? normalized : '';
     }
 
     function getDefaultComposerModel() {
       return (
         normalizeComposerModel(uvDraftsComposerState?.model) ||
         normalizeComposerModel(modelOverride) ||
-        COMPOSER_MODELS[0].value
+        composerModels[0]?.value || 'sy_8'
       );
     }
 
@@ -539,7 +560,7 @@
   }
 
   // Sync remaining drafts in background starting from cursor
-  async function syncRemainingDrafts(startCursor, onProgress, runId = uvDraftsInitRunId, startOrder = 0, syncedIds = null) {
+  async function syncRemainingDrafts(startCursor, onProgress, runId = uvDraftsInitRunId, startOrder = 0, syncedIds = null, maxPages = Infinity) {
     const isStaleRun = () => runId !== uvDraftsInitRunId;
     let cursor = startCursor;
     let pageNum = 1;
@@ -548,6 +569,7 @@
 
     while (cursor) {
       if (isStaleRun()) return false;
+      if (pageNum > maxPages) break;
       const url = new URL('https://sora.chatgpt.com/backend/project_y/profile/drafts');
       url.searchParams.set('limit', '500');
       url.searchParams.set('cursor', cursor);
@@ -787,7 +809,7 @@
       // Preserve extension-specific fields from existing data
       // Note: bookmarked is stored separately in localStorage via BOOKMARKS_KEY
       hidden: existingData.hidden ?? false,
-      workspace_id: existingData.workspace_id ?? null,
+      workspace_id: existingData.workspace_id ?? uvDraftsPendingWorkspaceTags.get(apiDraft.task_id) ?? null,
       is_unsynced: fromDraftsApi ? false : existingData?.is_unsynced === true,
       cached_at: Date.now(),
       last_fetched: Date.now()
@@ -922,7 +944,6 @@
   let uvDraftsLoadingEl = null;
   let uvDraftsSearchInput = null;
   let uvDraftsFilterState = 'all'; // 'all', 'bookmarked', 'hidden', 'violations', 'new', 'unsynced'
-  let uvDraftsSortState = 'newest'; // 'newest', 'oldest' (API order)
   let uvDraftsWorkspaceFilter = null; // workspace_id or null
   let uvDraftsSearchQuery = '';
   let uvDraftsData = []; // Current loaded drafts
@@ -933,6 +954,7 @@
   // Video playback state - once user clicks play, enable hover-to-play
   let uvDraftsVideoInteracted = false;
   let uvDraftsCurrentlyPlayingVideo = null;
+  let uvDraftsCurrentlyPlayingDraftId = null;
   let uvDraftsRenderedCount = 0;
   let uvDraftsFilteredCache = []; // Cache filtered results to avoid re-filtering on scroll
   let uvDraftsScrollHandler = null;
@@ -956,6 +978,10 @@
   let uvDraftsPendingIds = new Set();
   let uvDraftsPendingPollTimerId = null;
   let uvDraftsPendingFailures = 0;
+  let uvDraftsPendingMinPolls = 0; // minimum polls before auto-stop (for newly submitted tasks)
+  // Auto-tag: map task_id → workspace_id for drafts created from within a workspace
+  const uvDraftsPendingWorkspaceTags = new Map();
+  let uvDraftsSyncConfirmedIds = new Set(); // IDs confirmed by the API in this session
   let uvDraftsTopRefreshInFlight = null;
   const UV_DRAFTS_PENDING_ENDPOINT = 'https://sora.chatgpt.com/backend/nf/pending/v2';
   const UV_DRAFTS_PENDING_POLL_MS = 5000;
@@ -1223,13 +1249,12 @@
       total: uvDraftsData.length,
       bookmarked: uvDraftsData.filter((d) => bookmarks.has(d.id)).length,
       hidden: uvDraftsData.filter((d) => d.hidden).length,
-      newCount: uvDraftsData.filter((d) => isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id)).length,
+      newCount: uvDraftsData.filter((d) => d?.is_unsynced !== true && isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id)).length,
     };
   }
 
   const UV_DRAFTS_VIEW_STATE_KEY = 'SORA_UV_DRAFTS_VIEW_STATE_V1';
   const UV_DRAFTS_FILTER_VALUES = new Set(['all', 'bookmarked', 'hidden', 'violations', 'new', 'unsynced']);
-  const UV_DRAFTS_SORT_VALUES = new Set(['newest', 'oldest']);
   let uvDraftsViewStateLoaded = false;
 
   function normalizeUVDraftsViewState(raw) {
@@ -1238,23 +1263,12 @@
     }
     const out = {
       filterState: 'all',
-      sortState: 'newest',
       workspaceFilter: null,
       searchQuery: '',
     };
     if (!raw || typeof raw !== 'object') return out;
     if (typeof raw.filterState === 'string' && UV_DRAFTS_FILTER_VALUES.has(raw.filterState)) {
       out.filterState = raw.filterState;
-    }
-    if (typeof raw.sortState === 'string') {
-      const normalizedRawSortState = raw.sortState.trim().toLowerCase();
-      const legacyMappedSortState =
-        normalizedRawSortState === 'api' || normalizedRawSortState === 'duration'
-          ? 'newest'
-          : normalizedRawSortState;
-      if (UV_DRAFTS_SORT_VALUES.has(legacyMappedSortState)) {
-        out.sortState = legacyMappedSortState;
-      }
     }
     if (typeof raw.workspaceFilter === 'string' && raw.workspaceFilter.trim()) {
       out.workspaceFilter = raw.workspaceFilter.trim();
@@ -1272,7 +1286,6 @@
       const raw = JSON.parse(localStorage.getItem(UV_DRAFTS_VIEW_STATE_KEY) || '{}');
       const viewState = normalizeUVDraftsViewState(raw);
       uvDraftsFilterState = viewState.filterState;
-      uvDraftsSortState = viewState.sortState;
       uvDraftsWorkspaceFilter = viewState.workspaceFilter;
       uvDraftsSearchQuery = viewState.searchQuery;
     } catch {}
@@ -1284,7 +1297,6 @@
         UV_DRAFTS_VIEW_STATE_KEY,
         JSON.stringify({
           filterState: uvDraftsFilterState,
-          sortState: uvDraftsSortState,
           workspaceFilter: uvDraftsWorkspaceFilter,
           searchQuery: uvDraftsSearchQuery,
         })
@@ -1299,10 +1311,21 @@
       durationSeconds: 10,
       gensCount: loadStoredGensCount(),
       orientation: 'portrait',
-      resolution: 'standard',
-      style: '',
+      size: 'small',
+      style_id: '',
       seed: '',
     };
+  }
+
+  function snapToValidDuration(seconds) {
+    const s = Math.round(Number(seconds) || 10);
+    let best = VALID_DURATIONS[0];
+    let bestDist = Math.abs(s - best);
+    for (let i = 1; i < VALID_DURATIONS.length; i++) {
+      const dist = Math.abs(s - VALID_DURATIONS[i]);
+      if (dist < bestDist) { best = VALID_DURATIONS[i]; bestDist = dist; }
+    }
+    return best;
   }
 
   function normalizeUVDraftsComposerState(raw) {
@@ -1311,20 +1334,20 @@
     if (typeof raw.prompt === 'string') out.prompt = raw.prompt;
     if (typeof raw.model === 'string') out.model = normalizeComposerModel(raw.model) || out.model;
     if (typeof raw.durationSeconds === 'number' && Number.isFinite(raw.durationSeconds) && raw.durationSeconds > 0) {
-      out.durationSeconds = Math.min(30, Math.max(4, Math.round(raw.durationSeconds)));
+      out.durationSeconds = snapToValidDuration(raw.durationSeconds);
     }
     if (typeof raw.gensCount === 'number' && Number.isFinite(raw.gensCount)) {
       out.gensCount = clampGensCount(raw.gensCount);
     } else if (typeof raw.gensCount === 'string' && raw.gensCount.trim()) {
       out.gensCount = clampGensCount(raw.gensCount);
     }
-    if (raw.orientation === 'portrait' || raw.orientation === 'landscape' || raw.orientation === 'square') {
+    if (raw.orientation === 'portrait' || raw.orientation === 'landscape') {
       out.orientation = raw.orientation;
     }
-    if (raw.resolution === 'standard' || raw.resolution === 'high') {
-      out.resolution = raw.resolution;
+    if (raw.size === 'small' || raw.size === 'large') {
+      out.size = raw.size;
     }
-    if (typeof raw.style === 'string') out.style = raw.style;
+    if (typeof raw.style_id === 'string') out.style_id = raw.style_id;
     if (typeof raw.seed === 'string') out.seed = raw.seed.replace(/[^\d]/g, '').slice(0, 10);
     return out;
   }
@@ -1401,8 +1424,8 @@
     takeString('prompt');
     takeString('model');
     takeString('orientation');
-    takeString('resolution');
-    takeString('style');
+    takeString('size');
+    takeString('style_id');
     if (typeof overrides.seed === 'string') {
       const seed = overrides.seed.replace(/[^\d]/g, '').slice(0, 10);
       if (seed) normalized.seed = seed;
@@ -1447,20 +1470,20 @@
         }
       }
 
-      if (normalized.resolution) {
-        if (obj.resolution !== normalized.resolution) {
-          obj.resolution = normalized.resolution;
+      if (normalized.size) {
+        if (obj.size !== normalized.size) {
+          obj.size = normalized.size;
           changed = true;
         }
-        if (obj.creation_config.resolution !== normalized.resolution) {
-          obj.creation_config.resolution = normalized.resolution;
+        if (obj.creation_config.size !== normalized.size) {
+          obj.creation_config.size = normalized.size;
           changed = true;
         }
       }
 
-      if (normalized.style) {
-        if (obj.creation_config.style !== normalized.style) {
-          obj.creation_config.style = normalized.style;
+      if (normalized.style_id) {
+        if (obj.creation_config.style_id !== normalized.style_id) {
+          obj.creation_config.style_id = normalized.style_id;
           changed = true;
         }
       }
@@ -2155,6 +2178,8 @@
       }
       if (retries < 30) {
         setTimeout(() => attemptFill(retries + 1), 120);
+      } else {
+        sessionStorage.removeItem(UV_PENDING_COMPOSE_KEY);
       }
     };
     setTimeout(() => attemptFill(), 250);
@@ -2174,6 +2199,7 @@
       thumbnail_url: draft.thumbnail_url || '',
       orientation: draft.orientation || '',
       duration_seconds: draft.duration_seconds || 0,
+      cameo_profiles: draft.cameo_profiles || [],
       label: `${draft.title || draft.prompt || draft.id}`.slice(0, 90),
     };
   }
@@ -2181,7 +2207,7 @@
   function getComposerSourceHint(source) {
     if (!source || typeof source !== 'object') return '';
     if (source.type === 'url' && source.url) return `Source URL: ${source.url}`;
-    if (source.type === 'file' && source.fileName) return `Local file: ${source.fileName} (attach manually in composer)`;
+    if (source.type === 'file' && source.fileName) return `Local file: ${source.fileName}`;
     if (source.type === 'draft' && source.id) return `Source draft: ${source.id}`;
     if (source.url) return `Source: ${source.url}`;
     return '';
@@ -2213,6 +2239,7 @@
       object_url: String(source.object_url || '').trim(),
       orientation: String(source.orientation || '').trim(),
       duration_seconds: Number(source.duration_seconds) > 0 ? Number(source.duration_seconds) : 0,
+      cameo_profiles: Array.isArray(source.cameo_profiles) ? source.cameo_profiles : [],
       label: String(source.label || '').trim(),
     };
 
@@ -2222,7 +2249,12 @@
 
     let valid = false;
     if (normalized.type === 'draft') valid = hasDraftIdentity || hasPlayableMedia;
-    else if (normalized.type === 'url') valid = /^https?:\/\//i.test(normalized.url);
+    else if (normalized.type === 'url') {
+      try {
+        const parsed = new URL(normalized.url);
+        valid = parsed.protocol === 'http:' || parsed.protocol === 'https:';
+      } catch { valid = false; }
+    }
     else if (normalized.type === 'file') valid = hasFileIdentity;
     else valid = hasDraftIdentity || hasPlayableMedia || hasFileIdentity;
     if (!valid) return null;
@@ -2247,6 +2279,9 @@
       releaseComposerSource(uvDraftsComposerSource);
     }
     uvDraftsComposerSource = nextSource;
+
+    // Auto-populate cameos from source draft
+    populateCameosFromSource(source);
 
     if (uvDraftsComposerEl) {
       const sourcePanelEl = uvDraftsComposerEl.querySelector('[data-uvd-compose-source-panel="1"]');
@@ -2360,8 +2395,8 @@
   function persistComposerDurationOverride(seconds) {
     const s = Number(seconds);
     if (!Number.isFinite(s) || s <= 0) return;
-    const safeSeconds = Math.min(30, Math.max(4, Math.round(s)));
-    const frames = safeSeconds * SORA_DEFAULT_FPS;
+    const safeSeconds = snapToValidDuration(s);
+    const frames = SECONDS_TO_FRAMES[safeSeconds] || safeSeconds * SORA_DEFAULT_FPS;
     try {
       localStorage.setItem(
         'SCT_DURATION_OVERRIDE_V1',
@@ -2370,13 +2405,190 @@
     } catch {}
   }
 
-  function startComposerFlow(mode, statusEl) {
+  // ---- Sentinel SDK ----
+
+  let sentinelInitPromise = null;
+
+  async function ensureSentinelSDK() {
+    if (typeof globalScope.SentinelSDK !== 'undefined') return;
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://chatgpt.com/sentinel/20260219f9f6/sdk.js';
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Failed to load Sentinel SDK'));
+      document.head.appendChild(s);
+    });
+    const deadline = Date.now() + 10000;
+    while (typeof globalScope.SentinelSDK === 'undefined') {
+      if (Date.now() > deadline) throw new Error('SentinelSDK load timeout');
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  async function getSentinelToken() {
+    if (cachedSentinelToken && Date.now() < cachedSentinelExpiry) {
+      return cachedSentinelToken;
+    }
+    if (!sentinelInitPromise) {
+      sentinelInitPromise = (async () => {
+        await ensureSentinelSDK();
+        if (!sentinelInitialized) {
+          await globalScope.SentinelSDK.init('sora_init');
+          sentinelInitialized = true;
+        }
+      })().catch(err => {
+        sentinelInitPromise = null;
+        throw err;
+      });
+    }
+    await sentinelInitPromise;
+    const token = await globalScope.SentinelSDK.token('sora_2_create_task');
+    if (!token) throw new Error('Sentinel SDK returned null token');
+    cachedSentinelToken = token;
+    cachedSentinelExpiry = Date.now() + 8 * 60 * 1000; // 8 min TTL
+    return token;
+  }
+
+  // ---- API: Fetch models & styles ----
+
+  async function fetchComposerModels() {
+    if (!capturedAuthToken) return;
+    try {
+      const res = await fetch('https://sora.chatgpt.com/backend/models?nf2=true', {
+        headers: { 'Authorization': capturedAuthToken },
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      if (Array.isArray(json.data) && json.data.length) {
+        composerModels = json.data.map(m => ({ value: m.id, label: m.label || m.id }));
+        composerModelValues = new Set(composerModels.map(m => m.value));
+        refreshComposerModelSelect();
+      }
+    } catch {}
+  }
+
+  async function fetchComposerStyles() {
+    if (!capturedAuthToken) return;
+    try {
+      const res = await fetch('https://sora.chatgpt.com/backend/project_y/initialize_async', {
+        headers: { 'Authorization': capturedAuthToken },
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      if (Array.isArray(json.styles) && json.styles.length) {
+        composerStyles = json.styles.map(s => ({ value: s.id, label: s.display_name || s.id }));
+        refreshComposerStyleSelect();
+      }
+    } catch {}
+  }
+
+  function refreshComposerModelSelect() {
+    if (!uvDraftsComposerEl) return;
+    const sel = uvDraftsComposerEl.querySelector('[data-uvd-compose-model="1"]');
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = composerModels.map(m =>
+      `<option value="${escapeHtml(m.value)}">${escapeHtml(m.label)}</option>`
+    ).join('');
+    if (composerModelValues.has(current)) sel.value = current;
+    else sel.value = composerModels[0]?.value || '';
+  }
+
+  function refreshComposerStyleSelect() {
+    if (!uvDraftsComposerEl) return;
+    const sel = uvDraftsComposerEl.querySelector('[data-uvd-compose-style="1"]');
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = '<option value="">None</option>' + composerStyles.map(s =>
+      `<option value="${escapeHtml(s.value)}">${escapeHtml(s.label)}</option>`
+    ).join('');
+    if (current && composerStyles.some(s => s.value === current)) sel.value = current;
+    else sel.value = '';
+  }
+
+  // ---- File upload for first frame ----
+
+  async function uploadFirstFrame(file) {
+    if (!capturedAuthToken) throw new Error('Not authenticated');
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('https://sora.chatgpt.com/backend/project_y/file/upload', {
+      method: 'POST',
+      headers: { 'Authorization': capturedAuthToken },
+      body: formData,
+    });
+    if (!res.ok) throw new Error(`Upload failed: HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.user_error_message) throw new Error(json.user_error_message);
+    if (!json.file_id) throw new Error('Upload returned no file_id');
+    return json.file_id;
+  }
+
+  // ---- Cameo UI helpers ----
+
+  function renderCameoList() {
+    if (!uvDraftsComposerEl) return;
+    const listEl = uvDraftsComposerEl.querySelector('[data-uvd-cameo-list="1"]');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    composerCameoIds.forEach((userId, idx) => {
+      const chip = document.createElement('div');
+      chip.className = 'uvd-cameo-chip';
+      const replacement = composerCameoReplacements[userId];
+      const labelEl = document.createElement('span');
+      labelEl.className = 'uvd-cameo-label';
+      labelEl.textContent = replacement ? `${userId} → ${replacement}` : userId;
+      const swapBtn = document.createElement('button');
+      swapBtn.type = 'button';
+      swapBtn.className = 'uvd-cameo-swap';
+      swapBtn.title = 'Swap cameo';
+      swapBtn.textContent = '⇄';
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'uvd-cameo-remove';
+      removeBtn.title = 'Remove cameo';
+      removeBtn.textContent = '×';
+      chip.append(labelEl, swapBtn, removeBtn);
+      removeBtn.addEventListener('click', () => {
+        composerCameoIds.splice(idx, 1);
+        delete composerCameoReplacements[userId];
+        renderCameoList();
+      });
+      swapBtn.addEventListener('click', () => {
+        const newId = globalScope.prompt('Replace with user ID:', composerCameoReplacements[userId] || '');
+        if (newId && newId.trim()) {
+          composerCameoReplacements[userId] = newId.trim();
+        } else if (newId === '') {
+          delete composerCameoReplacements[userId];
+        }
+        renderCameoList();
+      });
+      listEl.appendChild(chip);
+    });
+  }
+
+  function populateCameosFromSource(source) {
+    composerCameoIds = [];
+    composerCameoReplacements = {};
+    if (source?.cameo_profiles && Array.isArray(source.cameo_profiles)) {
+      for (const cp of source.cameo_profiles) {
+        const userId = typeof cp === 'string' ? cp : cp?.user_id || cp?.id || '';
+        if (userId && !composerCameoIds.includes(userId)) {
+          composerCameoIds.push(userId);
+        }
+      }
+    }
+    renderCameoList();
+  }
+
+  // ---- Direct API: startComposerFlow ----
+
+  async function startComposerFlow(mode, statusEl) {
     const state = normalizeUVDraftsComposerState(uvDraftsComposerState || defaultUVDraftsComposerState());
     uvDraftsComposerState = state;
     persistUVDraftsComposerState();
 
     const prompt = state.prompt.trim();
-    const style = state.style.trim();
     const seed = state.seed.trim();
     const source = uvDraftsComposerSource;
 
@@ -2386,6 +2598,11 @@
       statusEl.dataset.tone = tone;
     };
 
+    if (!capturedAuthToken) {
+      setStatus('Not authenticated. Browse Sora first to capture auth token.', 'error');
+      return;
+    }
+
     const requiresSource = uvDraftsLogic?.modeRequiresComposerSource
       ? uvDraftsLogic.modeRequiresComposerSource(mode)
       : mode === 'remix' || mode === 'extend';
@@ -2394,95 +2611,132 @@
       return;
     }
 
-    const createOverrides = {
-      prompt: prompt || null,
-      model: normalizeComposerModel(state.model) || null,
-      orientation: state.orientation || null,
-      resolution: state.resolution || null,
-      style: style || null,
-      seed: seed || null,
-      mode,
-      firstFrameImage: uvDraftsComposerFirstFrame?.object_url || null,
-    };
-    savePendingCreateOverrides(createOverrides);
+    if (!prompt && mode === 'compose') {
+      setStatus('Enter a prompt.', 'error');
+      return;
+    }
+
+    // Update model override for api.js compatibility
     if (state.model) modelOverride = normalizeComposerModel(state.model) || modelOverride;
     persistComposerDurationOverride(state.durationSeconds);
     persistComposerGensCount(state.gensCount);
 
-    const sourceHint = getComposerSourceHint(source);
-    const makePromptWithSource = (basePrompt, includeSource = false) => {
-      const trimmed = (basePrompt || '').trim();
-      if (includeSource && sourceHint) {
-        return trimmed ? `${trimmed}\n\n${sourceHint}` : sourceHint;
-      }
-      return trimmed;
+    // Build the /nf/create request body
+    const nFrames = SECONDS_TO_FRAMES[state.durationSeconds] || 300;
+    const body = {
+      kind: 'video',
+      prompt: prompt || source?.prompt || source?.title || '',
+      model: normalizeComposerModel(state.model) || composerModels[0]?.value || 'sy_8',
+      orientation: state.orientation || 'portrait',
+      size: state.size || 'small',
+      n_frames: nFrames,
     };
 
-    let promptForRemix = prompt || source?.prompt || source?.title || '';
-    if (mode === 'extend') {
-      promptForRemix = promptForRemix
-        ? `Extend this video seamlessly. ${promptForRemix}`
-        : 'Extend this video seamlessly with matching style, motion, and framing.';
+    // Style
+    if (state.style_id) body.style_id = state.style_id;
+
+    // Seed
+    if (seed) body.seed = Number(seed);
+
+    // Cameos
+    if (composerCameoIds.length) body.cameo_ids = [...composerCameoIds];
+    if (Object.keys(composerCameoReplacements).length) {
+      body.cameo_replacements = { ...composerCameoReplacements };
     }
 
-    if (mode === 'compose') {
-      const composePrompt = makePromptWithSource(prompt || source?.prompt || source?.title || '', !!source && source.type !== 'draft');
-      if (composePrompt) {
-        sessionStorage.setItem(
-          UV_PENDING_COMPOSE_KEY,
-          JSON.stringify({ prompt: composePrompt, createdAt: Date.now() })
-        );
-      }
-      setStatus('Opening native composer…', 'ok');
-      window.location.href = 'https://sora.chatgpt.com/drafts';
-      return;
+    // Remix
+    if (mode === 'remix' && source?.id) {
+      body.remix_target_id = source.id;
     }
 
-    if (mode === 'remix') {
-      if (source?.id) {
-        if (promptForRemix) {
-          sessionStorage.setItem('SORA_UV_REDO_PROMPT', promptForRemix);
-        }
-        setStatus('Opening remix…', 'ok');
-        window.location.href = `https://sora.chatgpt.com/d/${source.id}?remix=`;
-        return;
-      }
-      const manualRemixPrompt = makePromptWithSource(
-        promptForRemix || 'Remix this source video with high fidelity to motion and style.',
-        true
-      );
-      if (manualRemixPrompt) {
-        sessionStorage.setItem(
-          UV_PENDING_COMPOSE_KEY,
-          JSON.stringify({ prompt: manualRemixPrompt, createdAt: Date.now() })
-        );
-      }
-      setStatus('Opening composer for manual remix with dropped source…', 'ok');
-      window.location.href = 'https://sora.chatgpt.com/drafts';
-      return;
-    }
-
+    // Extend (storyboard)
     if (mode === 'extend') {
       if (source?.storyboard_id) {
-        setStatus('Opening storyboard for extension…', 'ok');
-        window.location.href = `https://sora.chatgpt.com/storyboard/${source.storyboard_id}`;
+        body.storyboard_id = source.storyboard_id;
       } else if (source?.id) {
-        if (promptForRemix) {
-          sessionStorage.setItem('SORA_UV_REDO_PROMPT', promptForRemix);
+        // Fallback: use remix with extend-style prompt
+        body.remix_target_id = source.id;
+        if (!prompt) {
+          body.prompt = 'Extend this video seamlessly with matching style, motion, and framing.';
         }
-        setStatus('Opening remix as fallback extend flow…', 'ok');
-        window.location.href = `https://sora.chatgpt.com/d/${source.id}?remix=`;
-      } else {
-        const manualExtendPrompt = makePromptWithSource(promptForRemix, true);
-        if (manualExtendPrompt) {
-          sessionStorage.setItem(
-            UV_PENDING_COMPOSE_KEY,
-            JSON.stringify({ prompt: manualExtendPrompt, createdAt: Date.now() })
-          );
-        }
-        setStatus('Opening composer for manual extend with dropped source…', 'ok');
-        window.location.href = 'https://sora.chatgpt.com/drafts';
       }
+    }
+
+    setStatus('Preparing generation…', 'ok');
+
+    try {
+      // Upload first frame if present
+      let firstFrameFileId = null;
+      if (uvDraftsComposerFirstFrame) {
+        const file = uvDraftsComposerFirstFrame._file;
+        if (file) {
+          setStatus('Uploading first frame…', 'ok');
+          firstFrameFileId = await uploadFirstFrame(file);
+        }
+      }
+      if (firstFrameFileId) {
+        body.inpaint_items = [{ kind: 'file', file_id: firstFrameFileId }];
+      }
+
+      // Get sentinel token
+      setStatus('Generating sentinel token…', 'ok');
+      const sentinel = await getSentinelToken();
+
+      const headers = {
+        'Authorization': capturedAuthToken,
+        'Content-Type': 'application/json',
+        'openai-sentinel-token': sentinel,
+      };
+
+      // Send N parallel generation requests
+      const gensCount = clampGensCount(state.gensCount || 1);
+      setStatus(`Starting ${gensCount} generation(s)…`, 'ok');
+
+      const tasks = [];
+      for (let i = 0; i < gensCount; i++) {
+        tasks.push(
+          fetch('https://sora.chatgpt.com/backend/nf/create', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+            __sctDirect: true,
+          }).then(r => r.json())
+        );
+      }
+      const results = await Promise.allSettled(tasks);
+
+      // Extract task IDs and feed into pending draft polling
+      const taskIds = [];
+      const errors = [];
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value?.id) {
+          taskIds.push(r.value.id);
+        } else {
+          const errMsg = r.status === 'rejected'
+            ? r.reason?.message || 'Request failed'
+            : r.value?.error || r.value?.detail || 'Unknown error';
+          errors.push(errMsg);
+        }
+      }
+
+      if (taskIds.length) {
+        // Auto-tag: remember workspace for these tasks so completed drafts inherit it
+        if (uvDraftsWorkspaceFilter) {
+          for (const taskId of taskIds) {
+            uvDraftsPendingWorkspaceTags.set(taskId, uvDraftsWorkspaceFilter);
+          }
+        }
+        // Start continuous polling for the new tasks. The v2 endpoint may not
+        // list them immediately, so set a minimum poll count to prevent the
+        // poller from stopping before the backend registers the tasks.
+        uvDraftsPendingMinPolls = 3;
+        continuePendingDraftsPolling();
+        setStatus(`Started ${taskIds.length} generation(s).` + (errors.length ? ` ${errors.length} failed.` : ''), 'ok');
+      } else {
+        setStatus('All generations failed: ' + (errors[0] || 'Unknown error'), 'error');
+      }
+    } catch (err) {
+      setStatus('Error: ' + (err.message || 'Generation failed'), 'error');
     }
   }
 
@@ -2492,8 +2746,11 @@
       uvDraftsComposerFirstFrame = null;
     }
     loadUVDraftsComposerState();
-    const modelOptionsHtml = COMPOSER_MODELS
-      .map((model) => `<option value="${model.value}">${model.label}</option>`)
+    const modelOptionsHtml = composerModels
+      .map((model) => `<option value="${escapeHtml(model.value)}">${escapeHtml(model.label)}</option>`)
+      .join('');
+    const styleOptionsHtml = '<option value="">None</option>' + composerStyles
+      .map((s) => `<option value="${escapeHtml(s.value)}">${escapeHtml(s.label)}</option>`)
       .join('');
     const composer = document.createElement('aside');
     composer.className = 'uvd-composer';
@@ -2546,7 +2803,6 @@
             <option value="5">5s</option>
             <option value="10">10s</option>
             <option value="15">15s</option>
-            <option value="20">20s</option>
             <option value="25">25s</option>
           </select>
         </label>
@@ -2561,26 +2817,35 @@
           <select data-uvd-compose-orientation="1">
             <option value="portrait">Portrait</option>
             <option value="landscape">Landscape</option>
-            <option value="square">Square</option>
           </select>
         </label>
         <label class="uvd-field">
-          <span>Resolution</span>
-          <select data-uvd-compose-resolution="1">
-            <option value="standard">Standard</option>
-            <option value="high">High</option>
+          <span>Size</span>
+          <select data-uvd-compose-size="1">
+            <option value="small">Standard</option>
+            <option value="large">High</option>
           </select>
         </label>
       </div>
       <div class="uvd-field-grid">
         <label class="uvd-field">
           <span>Style</span>
-          <input type="text" data-uvd-compose-style="1" placeholder="cinematic, anime, gritty..." />
+          <select data-uvd-compose-style="1">
+            ${styleOptionsHtml}
+          </select>
         </label>
         <label class="uvd-field">
           <span>Seed</span>
           <input type="text" data-uvd-compose-seed="1" placeholder="optional seed" inputmode="numeric" />
         </label>
+      </div>
+      <div class="uvd-cameo-section" data-uvd-cameo-section="1">
+        <span class="uvd-field-label">Cameos</span>
+        <div class="uvd-cameo-list" data-uvd-cameo-list="1"></div>
+        <div class="uvd-cameo-add-row">
+          <input type="text" data-uvd-cameo-input="1" placeholder="user-xxx or @username" class="uvd-cameo-input" />
+          <button type="button" data-uvd-cameo-add="1" class="uvd-cameo-add-btn">Add</button>
+        </div>
       </div>
       <div class="uvd-compose-actions">
         <button type="button" data-uvd-compose-create="1">Create</button>
@@ -2596,7 +2861,7 @@
     const durationEl = composer.querySelector('[data-uvd-compose-duration="1"]');
     const gensEl = composer.querySelector('[data-uvd-compose-gens="1"]');
     const orientationEl = composer.querySelector('[data-uvd-compose-orientation="1"]');
-    const resolutionEl = composer.querySelector('[data-uvd-compose-resolution="1"]');
+    const sizeEl = composer.querySelector('[data-uvd-compose-size="1"]');
     const styleEl = composer.querySelector('[data-uvd-compose-style="1"]');
     const seedEl = composer.querySelector('[data-uvd-compose-seed="1"]');
     const dropzone = composer.querySelector('[data-uvd-dropzone="1"]');
@@ -2616,8 +2881,8 @@
         durationSeconds: Number(durationEl.value),
         gensCount: clampGensCount(gensEl?.value),
         orientation: orientationEl.value,
-        resolution: resolutionEl.value,
-        style: styleEl.value,
+        size: sizeEl.value,
+        style_id: styleEl.value,
         seed: seedEl.value,
       });
       persistUVDraftsComposerState();
@@ -2627,20 +2892,20 @@
 
     promptEl.value = uvDraftsComposerState.prompt;
     modelEl.value = normalizeComposerModel(uvDraftsComposerState.model) || getDefaultComposerModel();
-    if (!modelEl.value) modelEl.value = COMPOSER_MODELS[0].value;
+    if (!modelEl.value) modelEl.value = composerModels[0]?.value || 'sy_8';
     uvDraftsComposerState.model = modelEl.value;
     modelOverride = modelEl.value;
     durationEl.value = String(uvDraftsComposerState.durationSeconds);
     if (gensEl) gensEl.value = String(clampGensCount(uvDraftsComposerState.gensCount));
     orientationEl.value = uvDraftsComposerState.orientation;
-    resolutionEl.value = uvDraftsComposerState.resolution;
-    styleEl.value = uvDraftsComposerState.style;
+    sizeEl.value = uvDraftsComposerState.size;
+    styleEl.value = uvDraftsComposerState.style_id;
     seedEl.value = uvDraftsComposerState.seed;
     syncGensFieldLimits();
     persistUVDraftsComposerState();
     persistComposerGensCount(uvDraftsComposerState.gensCount);
 
-    [promptEl, modelEl, durationEl, gensEl, orientationEl, resolutionEl, styleEl, seedEl].filter(Boolean).forEach((el) => {
+    [promptEl, modelEl, durationEl, gensEl, orientationEl, sizeEl, styleEl, seedEl].filter(Boolean).forEach((el) => {
       el.addEventListener('input', syncStateFromFields);
       el.addEventListener('change', syncStateFromFields);
     });
@@ -2653,6 +2918,22 @@
     composer.querySelector('[data-uvd-compose-remix="1"]')?.addEventListener('click', () => startComposerFlow('remix', statusEl));
     composer.querySelector('[data-uvd-compose-extend="1"]')?.addEventListener('click', () => startComposerFlow('extend', statusEl));
     clearSourceBtn?.addEventListener('click', () => setComposerSource(null, statusEl));
+
+    // Cameo add button
+    const cameoInput = composer.querySelector('[data-uvd-cameo-input="1"]');
+    const cameoAddBtn = composer.querySelector('[data-uvd-cameo-add="1"]');
+    const addCameoFromInput = () => {
+      const val = (cameoInput?.value || '').trim().replace(/^@/, '');
+      if (val && !composerCameoIds.includes(val)) {
+        composerCameoIds.push(val);
+        renderCameoList();
+      }
+      if (cameoInput) cameoInput.value = '';
+    };
+    cameoAddBtn?.addEventListener('click', addCameoFromInput);
+    cameoInput?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); addCameoFromInput(); }
+    });
 
     const setDropVisual = (active) => {
       dropzone.classList.toggle('is-active', !!active);
@@ -2682,15 +2963,21 @@
             url: parsed.download_url || parsed.preview_url || '',
             preview_url: parsed.preview_url || '',
             thumbnail_url: parsed.thumbnail_url || '',
+            cameo_profiles: parsed.cameo_profiles || [],
             label: `${parsed.title || parsed.prompt || parsed.id}`.slice(0, 90),
           });
         }
       } catch {}
 
       if (!source) {
-        const uri = e.dataTransfer?.getData('text/uri-list') || e.dataTransfer?.getData('text/plain') || '';
-        if (uri && /^https?:\/\//i.test(uri)) {
-          source = normalizeComposerSource({ type: 'url', url: uri.trim(), label: uri.trim().slice(0, 90) });
+        const uri = (e.dataTransfer?.getData('text/uri-list') || e.dataTransfer?.getData('text/plain') || '').trim();
+        if (uri) {
+          try {
+            const parsed = new URL(uri);
+            if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+              source = normalizeComposerSource({ type: 'url', url: uri, label: uri.slice(0, 90) });
+            }
+          } catch {}
         }
       }
 
@@ -2733,7 +3020,7 @@
         return;
       }
       const objectUrl = URL.createObjectURL(file);
-      uvDraftsComposerFirstFrame = { object_url: objectUrl, fileName: file.name };
+      uvDraftsComposerFirstFrame = { object_url: objectUrl, fileName: file.name, _file: file };
       if (firstFrameImg) firstFrameImg.src = objectUrl;
       if (firstFrameName) firstFrameName.textContent = file.name;
       if (firstFramePreview) firstFramePreview.classList.add('is-visible');
@@ -2818,7 +3105,10 @@
     if (!(idSet instanceof Set) || !Array.isArray(drafts)) return;
     for (const draft of drafts) {
       const id = String(draft?.id || '').trim();
-      if (id) idSet.add(id);
+      if (id) {
+        idSet.add(id);
+        uvDraftsSyncConfirmedIds.add(id);
+      }
     }
   }
 
@@ -2892,6 +3182,11 @@
       transformed.is_pending = true;
       transformed.pending_status = String(item.pending_status || item.status || 'pending').toLowerCase();
       transformed.pending_task_status = String(item.pending_task_status || '').toLowerCase();
+      // v2 API may provide progress as 0-1 fraction or 0-100 percentage
+      const rawPct = item.progress_pct ?? item.progress ?? null;
+      transformed.progress_pct = rawPct != null && Number.isFinite(Number(rawPct))
+        ? (Number(rawPct) <= 1 && Number(rawPct) > 0 ? Number(rawPct) * 100 : Number(rawPct))
+        : null;
       transformed.is_read = true;
       const createdAt = Number(transformed.created_at);
       if (!Number.isFinite(createdAt) || createdAt <= 0) {
@@ -2932,6 +3227,12 @@
         transformDraftForStorage(draft, existingMap.get(draft.id) || {}, { apiOrder: idx, fromDraftsApi: true })
       );
       addDraftIdsToSet(transformed, fullSyncIds);
+      // Clean up consumed workspace tags
+      for (const draft of transformed) {
+        if (draft.task_id && uvDraftsPendingWorkspaceTags.has(draft.task_id)) {
+          uvDraftsPendingWorkspaceTags.delete(draft.task_id);
+        }
+      }
       await uvDBPutAll(UV_DRAFTS_STORES.drafts, transformed);
       if (isStaleRun()) return;
       uvDraftsData = mergeDraftListById(transformed, uvDraftsData);
@@ -2940,11 +3241,9 @@
         updateUVDraftsStats();
       }
       if (firstBatch.cursor) {
-        const syncSucceeded = await syncRemainingDrafts(firstBatch.cursor, null, runId, firstBatch.items.length, fullSyncIds);
+        const syncSucceeded = await syncRemainingDrafts(firstBatch.cursor, null, runId, firstBatch.items.length, fullSyncIds, 3);
         if (!syncSucceeded || isStaleRun()) return;
       }
-      await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
-      if (isStaleRun()) return;
     })()
       .catch((err) => {
         console.error('[UV Drafts] Top refresh failed after pending change:', reason, err);
@@ -2969,12 +3268,30 @@
       ? uvDraftsLogic.getDroppedIds(uvDraftsPendingIds, nextIds)
       : [...uvDraftsPendingIds].filter((id) => !nextIds.has(id));
 
+    // Re-render if IDs changed OR if progress/status data updated
+    const idsChanged = nextIds.size !== uvDraftsPendingIds.size ||
+      [...nextIds].some(id => !uvDraftsPendingIds.has(id));
+    const dataChanged = !idsChanged && pendingDrafts.some((d, i) => {
+      const prev = uvDraftsPendingData[i];
+      if (!prev) return true;
+      return d.progress_pct !== prev.progress_pct ||
+        d.pending_status !== prev.pending_status ||
+        d.pending_task_status !== prev.pending_task_status;
+    });
+    const pendingChanged = idsChanged || dataChanged;
+
     uvDraftsPendingIds = nextIds;
     uvDraftsPendingData = pendingDrafts;
     uvDraftsPendingFailures = 0;
 
-    if (isUVDraftsPageVisible()) {
-      renderUVDraftsGrid();
+    if (pendingChanged && isUVDraftsPageVisible()) {
+      if (idsChanged) {
+        // IDs added/removed — full rebuild needed
+        renderUVDraftsGrid(true);
+      } else {
+        // Only progress/status changed — update pending cards in-place
+        updatePendingCardsInPlace(pendingDrafts);
+      }
     }
 
     if (droppedIds.length > 0) {
@@ -2985,12 +3302,27 @@
   function startPendingDraftsPolling() {
     if (uvDraftsPendingPollTimerId || !capturedAuthToken) return;
     uvDraftsPendingFailures = 0;
-    pollPendingDraftsOnce().catch((err) => {
+    // Poll once immediately — only start the interval if there are pending items
+    pollPendingDraftsOnce().then(() => {
+      if (uvDraftsPendingIds.size > 0 && !uvDraftsPendingPollTimerId) {
+        continuePendingDraftsPolling();
+      }
+    }).catch((err) => {
       uvDraftsPendingFailures += 1;
       console.error('[UV Drafts] Initial pending poll failed:', err);
     });
+  }
+
+  function continuePendingDraftsPolling() {
+    if (uvDraftsPendingPollTimerId || !capturedAuthToken) return;
     uvDraftsPendingPollTimerId = setInterval(() => {
-      pollPendingDraftsOnce().catch((err) => {
+      pollPendingDraftsOnce().then(() => {
+        if (uvDraftsPendingMinPolls > 0) uvDraftsPendingMinPolls--;
+        // Stop polling once all pending items are gone and min polls exhausted
+        if (uvDraftsPendingIds.size === 0 && uvDraftsPendingMinPolls <= 0) {
+          stopPendingDraftsPolling(false);
+        }
+      }).catch((err) => {
         uvDraftsPendingFailures += 1;
         console.error('[UV Drafts] Pending poll failed:', err);
         if (uvDraftsPendingFailures >= UV_DRAFTS_PENDING_MAX_FAILURES) {
@@ -3006,6 +3338,7 @@
       clearInterval(uvDraftsPendingPollTimerId);
       uvDraftsPendingPollTimerId = null;
     }
+    uvDraftsPendingMinPolls = 0;
     if (clearState) {
       uvDraftsPendingData = [];
       uvDraftsPendingIds = new Set();
@@ -3013,44 +3346,12 @@
     }
   }
 
-  function getRenderableUVDrafts() {
-    const mainDrafts = filterAndSortUVDrafts(uvDraftsData);
-    if (!Array.isArray(uvDraftsPendingData) || uvDraftsPendingData.length === 0) return mainDrafts;
-    const filteredPending = filterAndSortUVDrafts(uvDraftsPendingData, { skipSort: true });
-    if (filteredPending.length === 0) return mainDrafts;
-    return mergeDraftListById(filteredPending, mainDrafts);
-  }
+  // ---- Filtering (no sorting) ----
 
-  function filterAndSortUVDrafts(drafts, options = {}) {
+  function applyDraftFilters(drafts) {
     let filtered = [...drafts];
     const bookmarks = getBookmarks();
-    const skipSort = !!options?.skipSort;
 
-    // DEBUG: bookmark diagnostics
-    const _bmIds = [...bookmarks];
-    const _draftIds = new Set(filtered.map(d => d?.id).filter(Boolean));
-    const _bmInData = _bmIds.filter(id => _draftIds.has(id));
-    const _bmMissing = _bmIds.filter(id => !_draftIds.has(id));
-    const _bmUnsynced = _bmIds.filter(id => {
-      const d = filtered.find(x => x?.id === id);
-      return d?.is_unsynced === true;
-    });
-    console.log('[UV Drafts DEBUG] filterState:', uvDraftsFilterState,
-      '| bookmarks in storage:', _bmIds.length,
-      '| drafts in data:', filtered.length,
-      '| found in data:', _bmInData.length,
-      '| missing from data:', _bmMissing.length,
-      '| unsynced:', _bmUnsynced.length);
-    if (_bmIds.length > 0) {
-      console.log('[UV Drafts DEBUG] bookmark IDs:', _bmIds);
-    }
-    if (_bmMissing.length > 0) {
-      console.log('[UV Drafts DEBUG] missing IDs:', _bmMissing);
-    }
-    // Also log raw localStorage value for format check
-    console.log('[UV Drafts DEBUG] raw localStorage:', localStorage.getItem(BOOKMARKS_KEY));
-
-    // Apply search filter
     if (uvDraftsSearchQuery) {
       const parsed = parseSearchTerms(uvDraftsSearchQuery);
       if (uvDraftsLogic && typeof uvDraftsLogic.draftMatchesSearchQuery === 'function') {
@@ -3070,22 +3371,16 @@
       }
     }
 
-    // Apply workspace filter
     if (uvDraftsWorkspaceFilter) {
       filtered = filtered.filter(d => d.workspace_id === uvDraftsWorkspaceFilter);
     }
 
-    // Unsynced cards are archived by default and only shown in the dedicated filter.
-    // Exception: bookmarked items survive when viewing the bookmarked filter.
     if (uvDraftsFilterState === 'unsynced') {
       filtered = filtered.filter((d) => d?.is_unsynced === true);
-    } else if (uvDraftsFilterState === 'bookmarked') {
-      filtered = filtered.filter((d) => d?.is_unsynced !== true || bookmarks.has(d.id));
     } else {
       filtered = filtered.filter((d) => d?.is_unsynced !== true);
     }
 
-    // Apply state filter (but always include "new" drafts when filtering by bookmarked)
     if (uvDraftsFilterState === 'bookmarked') {
       filtered = filtered.filter(d => {
         const isNew = d?.is_unsynced !== true && isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id);
@@ -3097,35 +3392,43 @@
     } else if (uvDraftsFilterState === 'violations') {
       filtered = filtered.filter(d => d?.is_unsynced !== true && (isContentViolationDraft(d) || isContextViolationDraft(d)));
     } else if (uvDraftsFilterState === 'new') {
-      filtered = filtered.filter(d => d?.is_unsynced !== true && isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id));
-    } else if (uvDraftsFilterState === 'unsynced') {
-      // Already handled above.
-    }
-    // 'all' shows everything
-
-    // Apply sort — purely by api_order (position in paginated API results).
-    // "Newest" = API order (ascending api_order), "Oldest" = reverse.
-    if (!skipSort) {
-      const withOrder = filtered.map((draft, order) => ({ draft, order }));
-      withOrder.sort((a, b) => {
-        const aOrd = Number(a.draft?.api_order);
-        const bOrd = Number(b.draft?.api_order);
-        const aHas = Number.isFinite(aOrd) && aOrd >= 0;
-        const bHas = Number.isFinite(bOrd) && bOrd >= 0;
-
-        if (!aHas && !bHas) return a.order - b.order;
-        if (!aHas) return 1;
-        if (!bHas) return -1;
-
-        if (uvDraftsSortState === 'oldest') {
-          return (bOrd - aOrd) || (b.order - a.order);
-        }
-        return (aOrd - bOrd) || (a.order - b.order);
-      });
-      filtered = withOrder.map((entry) => entry.draft);
+      // Only show drafts confirmed by the API this session to avoid ghost drafts from stale cache
+      const requireConfirmed = uvDraftsSyncConfirmedIds.size > 0;
+      filtered = filtered.filter(d =>
+        d?.is_unsynced !== true &&
+        isDraftUnreadState(d) &&
+        !uvDraftsJustSeenIds.has(d.id) &&
+        (!requireConfirmed || uvDraftsSyncConfirmedIds.has(d.id))
+      );
     }
 
     return filtered;
+  }
+
+  // Build the final ordered list: pending first, then API-ordered, then cached without api_order.
+  function getRenderableUVDrafts() {
+    const mainFiltered = applyDraftFilters(uvDraftsData);
+
+    // Separate API-ordered drafts from cached ones without an order
+    const apiOrdered = [];
+    const noOrder = [];
+    for (const d of mainFiltered) {
+      const ord = Number(d?.api_order);
+      if (Number.isFinite(ord) && ord >= 0) apiOrdered.push(d);
+      else noOrder.push(d);
+    }
+    // Sort API-ordered drafts by their api_order value (page 1 = 0..N, page 2 = N+1..M, etc)
+    apiOrdered.sort((a, b) => a.api_order - b.api_order);
+    const ordered = apiOrdered.concat(noOrder);
+
+    // Prepend pending drafts
+    if (Array.isArray(uvDraftsPendingData) && uvDraftsPendingData.length > 0) {
+      const filteredPending = applyDraftFilters(uvDraftsPendingData);
+      if (filteredPending.length > 0) {
+        return mergeDraftListById(filteredPending, ordered);
+      }
+    }
+    return ordered;
   }
 
   function createUVDraftCard(draft) {
@@ -3144,7 +3447,8 @@
     if (isContentViolation || isContextViolation) card.classList.add('is-violation');
     if (isProcessingError) card.classList.add('is-processing-error');
     card.dataset.draftId = draft.id;
-    card.draggable = true;
+    if (isPendingDraft) card.style.cursor = 'default';
+    card.draggable = !isPendingDraft;
     let suppressCardNavUntil = 0;
     const blockCardNavigation = (ms = 180) => {
       suppressCardNavUntil = Date.now() + ms;
@@ -3168,6 +3472,7 @@
           thumbnail_url: draft.thumbnail_url || '',
           orientation: draft.orientation || '',
           duration_seconds: draft.duration_seconds || 0,
+          cameo_profiles: draft.cameo_profiles || [],
         };
         e.dataTransfer?.setData('application/x-sora-uv-draft', JSON.stringify(payload));
         const uri = draft.download_url || draft.preview_url || '';
@@ -3191,6 +3496,7 @@
       background: isPendingDraft
         ? '#182435'
         : (isContentViolation || isContextViolation ? '#2a1515' : (isProcessingError ? '#1b2235' : '#1a1a1a')),
+      cursor: 'pointer',
     });
 
     // For violations/processing errors, show a placeholder instead of blank/broken media.
@@ -3214,11 +3520,17 @@
       violationPlaceholder.appendChild(warningIcon);
 
       const violationLabel = document.createElement('div');
-      violationLabel.textContent = isPendingDraft
-        ? 'Generating...'
-        : (isProcessingError
-        ? 'Processing Error'
-        : (isContextViolation ? 'Context Violation' : 'Content Violation'));
+      if (isPendingDraft) {
+        violationLabel.dataset.pendingStatus = '1';
+        const status = String(draft.pending_status || draft.pending_task_status || 'generating').replace(/_/g, ' ');
+        const pct = Number(draft.progress_pct);
+        const pctStr = Number.isFinite(pct) && pct > 0 ? ` · ${Math.round(pct)}%` : '';
+        violationLabel.textContent = status.charAt(0).toUpperCase() + status.slice(1) + pctStr;
+      } else {
+        violationLabel.textContent = isProcessingError
+          ? 'Processing Error'
+          : (isContextViolation ? 'Context Violation' : 'Content Violation');
+      }
       Object.assign(violationLabel.style, {
         color: isPendingDraft ? '#89b6ff' : (isProcessingError ? '#ffb86b' : '#ff6b6b'),
         fontSize: '14px',
@@ -3319,7 +3631,7 @@
       video.dataset.src = draft.preview_url || ''; // Store for lazy loading
       video.playsInline = true;
       video.preload = 'none';
-      video.controls = true; // Show controls for volume/seeking
+      video.controls = false; // Enabled once playing — prevents native controls from stealing clicks
       video.draggable = false; // Prevent drag interfering with scrubber
       Object.assign(video.style, {
         position: 'absolute',
@@ -3355,28 +3667,34 @@
       playBtn.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24" fill="white">
         <path d="M8 5v14l11-7z"/>
       </svg>`;
-      playBtn.addEventListener('mouseenter', () => {
-        playBtn.style.transform = 'translate(-50%, -50%) scale(1.1)';
-        playBtn.style.background = 'rgba(0,0,0,0.9)';
+      // Hover anywhere on the thumbnail triggers play button hover state
+      thumbContainer.addEventListener('mouseenter', () => {
+        if (playBtn.style.display !== 'none') {
+          playBtn.style.transform = 'translate(-50%, -50%) scale(1.1)';
+          playBtn.style.background = 'rgba(0,0,0,0.9)';
+        }
       });
-      playBtn.addEventListener('mouseleave', () => {
+      thumbContainer.addEventListener('mouseleave', () => {
         playBtn.style.transform = 'translate(-50%, -50%)';
         playBtn.style.background = 'rgba(0,0,0,0.7)';
       });
-      playBtn.addEventListener('click', (e) => {
+      thumbContainer.appendChild(playBtn);
+
+      // Unified click handler — whole thumbnail area acts as play button
+      thumbContainer.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        // Mark that user has interacted - enable hover-to-play
         uvDraftsVideoInteracted = true;
         // Pause any other playing video
         if (uvDraftsCurrentlyPlayingVideo && uvDraftsCurrentlyPlayingVideo !== video) {
           uvDraftsCurrentlyPlayingVideo.pause();
           uvDraftsCurrentlyPlayingVideo.currentTime = 0;
           uvDraftsCurrentlyPlayingVideo.style.opacity = '0';
+          uvDraftsCurrentlyPlayingVideo.controls = false;
           const otherPlayBtn = uvDraftsCurrentlyPlayingVideo.parentElement?.querySelector('.uv-play-btn');
           if (otherPlayBtn) otherPlayBtn.style.display = 'flex';
         }
-        // Mark as seen when clicking play
+        // Mark as seen
         if (!uvDraftsJustSeenIds.has(draft.id) && isDraftUnreadState(draft)) {
           uvDraftsJustSeenIds.add(draft.id);
           draft.is_read = true;
@@ -3385,37 +3703,18 @@
           if (badge) badge.style.display = 'none';
           updateUVDraftsStats();
         }
-        // Lazy load video src
-        if (!video.src && video.dataset.src) {
-          video.src = video.dataset.src;
-        }
-        video.style.opacity = '1';
+        // Play
         playBtn.style.display = 'none';
         uvDraftsCurrentlyPlayingVideo = video;
-        video.play().catch((err) => {
-          console.log('[UV Drafts] Play button click failed:', err);
-        });
-      });
-      thumbContainer.appendChild(playBtn);
-
-      // Click on video to toggle play/pause
-      video.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (video.paused) {
-          uvDraftsVideoInteracted = true; // Re-enable hover-to-play
-          uvDraftsCurrentlyPlayingVideo = video;
-          playBtn.style.display = 'none';
-          video.style.opacity = '1';
-          video.play();
+        uvDraftsCurrentlyPlayingDraftId = draft.id;
+        if (!video.src && video.dataset.src) {
+          video.addEventListener('loadeddata', () => { video.style.opacity = '1'; video.controls = true; }, { once: true });
+          video.src = video.dataset.src;
         } else {
-          uvDraftsVideoInteracted = false; // Disable hover-to-play when paused
-          uvDraftsCurrentlyPlayingVideo = null;
-          video.pause();
-          video.style.opacity = '0';
-          video.currentTime = 0;
-          playBtn.style.display = 'flex';
+          video.style.opacity = '1';
+          video.controls = true;
         }
+        video.play().catch(() => {});
       });
 
       // Duration badge
@@ -3484,9 +3783,13 @@
     // Wrap thumbnail in anchor for right-click "open in new tab" support
     const thumbLink = document.createElement('a');
     thumbLink.className = 'uvd-thumb-link';
-    thumbLink.href = draftUrl;
+    thumbLink.href = isPendingDraft ? '#' : draftUrl;
     thumbLink.draggable = false; // Prevent drag interfering with video scrubber
     thumbLink.addEventListener('dragstart', (e) => e.preventDefault());
+    if (isPendingDraft) {
+      thumbLink.addEventListener('click', (e) => e.preventDefault());
+      thumbLink.style.cursor = 'default';
+    }
     thumbLink.appendChild(thumbContainer);
     card.appendChild(thumbLink);
 
@@ -3522,9 +3825,6 @@
       metaParts.push('Processing failed');
     } else if (isContentViolation || isContextViolation) {
       metaParts.push('Policy blocked');
-    }
-    if (Number(draft.duration_seconds) > 0) {
-      metaParts.push(formatDurationShort(Number(draft.duration_seconds)));
     }
     timeEl.textContent = metaParts.filter(Boolean).join(' • ');
     info.appendChild(timeEl);
@@ -3596,6 +3896,7 @@
         renderUVDraftsGrid();
       }
     });
+    bookmarkBtn.disabled = isPendingDraft;
     if (isBookmarkedNow) bookmarkBtn.style.color = '#fbbf24';
     actionsRow.appendChild(bookmarkBtn);
 
@@ -3673,15 +3974,18 @@
       renderUVDraftsGrid();
       updateUVDraftsStats();
     });
+    hideBtn.disabled = isPendingDraft;
     actionsRow.appendChild(hideBtn);
 
     // Workspace button
-    actionsRow.appendChild(createActionBtn(icons.folder, 'Workspace', () => {
+    const workspaceBtn = createActionBtn(icons.folder, 'Workspace', () => {
       showDraftWorkspacePicker(draft);
-    }));
+    });
+    workspaceBtn.disabled = isPendingDraft;
+    actionsRow.appendChild(workspaceBtn);
 
     // Delete button
-    actionsRow.appendChild(createActionBtn(icons.trash, 'Delete', async () => {
+    const deleteBtn = createActionBtn(icons.trash, 'Delete', async () => {
       if (!confirm(`Delete this draft?\n\n"${(draft.prompt || 'Untitled').slice(0, 50)}..."\n\nThis cannot be undone.`)) return;
       try {
         // Call API to delete
@@ -3712,7 +4016,9 @@
         console.error('[UV Drafts] Delete error:', err);
         alert('Failed to delete draft');
       }
-    }));
+    });
+    deleteBtn.disabled = isPendingDraft;
+    actionsRow.appendChild(deleteBtn);
 
     card.appendChild(actionsRow);
 
@@ -3849,6 +4155,7 @@
     card.appendChild(actionsRow2);
 
     card.addEventListener('click', (e) => {
+      if (isPendingDraft) return;
       if (e.defaultPrevented) return;
       if (Date.now() < suppressCardNavUntil) return;
       if (shouldIgnoreCardNavigationTarget(e.target)) return;
@@ -3864,6 +4171,7 @@
     });
 
     card.addEventListener('auxclick', (e) => {
+      if (isPendingDraft) return;
       if (e.defaultPrevented) return;
       if (Date.now() < suppressCardNavUntil) return;
       if (shouldIgnoreCardNavigationTarget(e.target)) return;
@@ -3899,13 +4207,17 @@
           if (badge) badge.style.display = 'none';
           updateUVDraftsStats();
         }
-        // Lazy load and play this video
-        if (!video.src && video.dataset.src) {
-          video.src = video.dataset.src;
-        }
-        video.style.opacity = '1';
+        // Lazy load and play this video — defer opacity until first frame to avoid grey flash
         if (playBtn) playBtn.style.display = 'none';
         uvDraftsCurrentlyPlayingVideo = video;
+        uvDraftsCurrentlyPlayingDraftId = draft.id;
+        if (!video.src && video.dataset.src) {
+          video.addEventListener('loadeddata', () => { video.style.opacity = '1'; video.controls = true; }, { once: true });
+          video.src = video.dataset.src;
+        } else {
+          video.style.opacity = '1';
+          video.controls = true;
+        }
         video.play().catch(() => {});
       }
     });
@@ -3917,8 +4229,10 @@
         video.pause();
         video.currentTime = 0;
         video.style.opacity = '0';
+        video.controls = false;
         if (uvDraftsCurrentlyPlayingVideo === video) {
           uvDraftsCurrentlyPlayingVideo = null;
+          uvDraftsCurrentlyPlayingDraftId = null;
         }
       }
       if (playBtn) {
@@ -3943,19 +4257,58 @@
     return card;
   }
 
-  // Lightweight render for background sync — updates cache and appends new cards
-  // without destroying existing DOM elements (no flicker).
+  // ---- Grid rendering ----
+  // Three render paths, each purpose-built:
+  //   renderUVDraftsGrid()     — full rebuild (initial load, filter/search change)
+  //   renderUVDraftsSyncUpdate() — append-only (background sync pages, never touches existing cards)
+  //   renderMoreUVDrafts()     — append-only (infinite scroll)
+
+  // Append cards from uvDraftsFilteredCache[start..end) to the grid.
+  // Never touches existing DOM — just creates and appends new cards.
+  function appendCardsToGrid(start, end) {
+    if (!uvDraftsGridEl || start >= end) return;
+    const loadMore = uvDraftsGridEl.querySelector('.uv-drafts-load-more');
+    if (loadMore) loadMore.remove();
+    const fragment = document.createDocumentFragment();
+    for (let i = start; i < end; i++) {
+      fragment.appendChild(createUVDraftCard(uvDraftsFilteredCache[i]));
+    }
+    uvDraftsGridEl.appendChild(fragment);
+    uvDraftsRenderedCount = end;
+    updateLoadMoreIndicator();
+  }
+
+  // Background sync: new page arrived. Recalculate cache, append up to one batch of new cards.
   function renderUVDraftsSyncUpdate() {
     if (!uvDraftsGridEl) return;
     uvDraftsFilteredCache = getRenderableUVDrafts();
-    if (uvDraftsFilteredCache.length === 0) return;
-    renderMoreUVDrafts();
+    if (uvDraftsFilteredCache.length <= uvDraftsRenderedCount) return;
+    // Only append one batch beyond what's rendered — infinite scroll handles the rest
+    const end = Math.min(uvDraftsRenderedCount + UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length);
+    appendCardsToGrid(uvDraftsRenderedCount, end);
   }
 
+  // Update only the status/progress text on pending cards without rebuilding the grid.
+  function updatePendingCardsInPlace(pendingDrafts) {
+    if (!uvDraftsGridEl) return;
+    for (const draft of pendingDrafts) {
+      if (!draft?.id) continue;
+      const card = uvDraftsGridEl.querySelector(`[data-draft-id="${CSS.escape(String(draft.id))}"]`);
+      if (!card) continue;
+      const label = card.querySelector('[data-pending-status]');
+      if (!label) continue;
+      const status = String(draft.pending_status || draft.pending_task_status || 'generating').replace(/_/g, ' ');
+      const pct = Number(draft.progress_pct);
+      const pctStr = Number.isFinite(pct) && pct > 0 ? ` · ${Math.round(pct)}%` : '';
+      label.textContent = status.charAt(0).toUpperCase() + status.slice(1) + pctStr;
+    }
+  }
+
+  // Full grid rebuild — clears everything and renders from scratch.
+  // Used on initial load, filter change, search change.
   function renderUVDraftsGrid(resetScroll = true) {
     if (!uvDraftsGridEl) return;
 
-    // Filter and cache results
     uvDraftsFilteredCache = getRenderableUVDrafts();
 
     if (resetScroll) {
@@ -3965,6 +4318,7 @@
 
     if (uvDraftsFilteredCache.length === 0) {
       uvDraftsGridEl.innerHTML = '';
+      uvDraftsRenderedCount = 0;
       const empty = document.createElement('div');
       empty.className = 'uvd-empty-state';
       empty.textContent = uvDraftsSearchQuery ? 'No drafts match your search' : 'No drafts found';
@@ -3972,28 +4326,39 @@
       return;
     }
 
-    // Render initial batch
-    renderMoreUVDrafts();
-
-    // Setup infinite scroll
+    const end = resetScroll
+      ? Math.min(UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length)
+      : Math.min(Math.max(uvDraftsRenderedCount, UV_DRAFTS_BATCH_SIZE), uvDraftsFilteredCache.length);
+    appendCardsToGrid(uvDraftsRenderedCount, end);
     setupUVDraftsInfiniteScroll();
+
+    // Restore video playback if a video was playing before the re-render
+    if (uvDraftsCurrentlyPlayingDraftId) {
+      const card = uvDraftsGridEl.querySelector(`[data-draft-id="${CSS.escape(uvDraftsCurrentlyPlayingDraftId)}"]`);
+      if (card) {
+        const video = card.querySelector('video');
+        const playBtn = card.querySelector('.uv-play-btn');
+        if (video) {
+          if (playBtn) playBtn.style.display = 'none';
+          uvDraftsCurrentlyPlayingVideo = video;
+          if (!video.src && video.dataset.src) {
+            video.addEventListener('loadeddata', () => { video.style.opacity = '1'; video.controls = true; }, { once: true });
+            video.src = video.dataset.src;
+          } else {
+            video.style.opacity = '1';
+            video.controls = true;
+          }
+          video.play().catch(() => {});
+        }
+      }
+    }
   }
 
+  // Infinite scroll: append next batch.
   function renderMoreUVDrafts() {
     if (!uvDraftsGridEl || uvDraftsRenderedCount >= uvDraftsFilteredCache.length) return;
-
-    const endIndex = Math.min(uvDraftsRenderedCount + UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length);
-    const fragment = document.createDocumentFragment();
-
-    for (let i = uvDraftsRenderedCount; i < endIndex; i++) {
-      fragment.appendChild(createUVDraftCard(uvDraftsFilteredCache[i]));
-    }
-
-    uvDraftsGridEl.appendChild(fragment);
-    uvDraftsRenderedCount = endIndex;
-
-    // Update load more indicator
-    updateLoadMoreIndicator();
+    const end = Math.min(uvDraftsRenderedCount + UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length);
+    appendCardsToGrid(uvDraftsRenderedCount, end);
   }
 
   function updateLoadMoreIndicator() {
@@ -4070,12 +4435,12 @@
     uvDraftsSyncButtonEl.disabled = false;
   }
 
-  async function initUVDraftsPage() {
+  async function initUVDraftsPage(fullSync = false) {
     const runId = ++uvDraftsInitRunId;
     const isStaleRun = () => runId !== uvDraftsInitRunId;
 
-    // Show loading
-    if (uvDraftsLoadingEl) {
+    // Only show loading indicator if there's no cached data already rendered
+    if (uvDraftsLoadingEl && (!uvDraftsGridEl || uvDraftsGridEl.children.length === 0)) {
       uvDraftsLoadingEl.style.display = 'flex';
       uvDraftsLoadingEl.textContent = 'Loading drafts from cache...';
     }
@@ -4092,7 +4457,10 @@
     resumePersistedMarkAllProgress({ queue: false });
 
     if (uvDraftsData.length > 0) {
-      renderUVDraftsGrid();
+      // Skip redundant full rebuild if the grid already has cards (e.g. re-init after token arrives)
+      if (!uvDraftsGridEl || uvDraftsGridEl.children.length === 0) {
+        renderUVDraftsGrid();
+      }
       updateUVDraftsStats();
       if (uvDraftsLoadingEl) {
         uvDraftsLoadingEl.style.display = 'none';
@@ -4145,8 +4513,11 @@
     // Quick first fetch - get 8 drafts instantly for immediate render
     try {
       const fullSyncIds = new Set();
+      uvDraftsSyncConfirmedIds = new Set(); // Reset for new sync session
       const firstBatch = await fetchFirstUVDrafts(8);
       if (isStaleRun()) return;
+
+      const hadCachedData = uvDraftsData.length > 0;
 
       if (firstBatch.items.length > 0) {
         // Get existing data for merging
@@ -4168,8 +4539,12 @@
         uvDraftsData = mergeDraftListById(transformed, uvDraftsData);
         setUVDraftsSyncUiState({ processed: uvDraftsData.length, page: 1 });
 
-        // Render immediately
-        renderUVDraftsGrid();
+        // Render — use incremental update if grid already has cards to avoid flash
+        if (hadCachedData && uvDraftsGridEl && uvDraftsGridEl.children.length > 0) {
+          renderUVDraftsSyncUpdate();
+        } else {
+          renderUVDraftsGrid();
+        }
         updateUVDraftsStats();
       }
 
@@ -4183,16 +4558,23 @@
       }
 
       // Continue fetching rest in background (if there's more)
+      // Full sync: first-ever population (no cache before) or user pressed sync button.
+      // Otherwise quick sync: only 3 pages.
+      const isFirstPopulation = !hadCachedData;
+      const doFullSync = fullSync || isFirstPopulation;
+      const syncMaxPages = doFullSync ? Infinity : 3;
       if (firstBatch.cursor) {
         // Don't await - let it run in background
         syncRemainingDrafts(firstBatch.cursor, (count, page) => {
-          // Optionally show background sync progress in a subtle way
           console.log(`[UV Drafts] Background sync: ${count} drafts (page ${page})`);
           setUVDraftsSyncUiState({ syncing: true, processed: count, page });
-        }, runId, firstBatch.items.length, fullSyncIds)
+        }, runId, firstBatch.items.length, fullSyncIds, syncMaxPages)
           .then(async (syncSucceeded) => {
             if (!syncSucceeded || isStaleRun()) return;
-            await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
+            // Only archive unsynced drafts after a full sync
+            if (doFullSync) {
+              await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
+            }
           })
           .catch((syncErr) => {
             console.error('[UV Drafts] Background sync failed:', syncErr);
@@ -4202,8 +4584,10 @@
           setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
         });
       } else {
-        await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
-        if (isStaleRun()) return;
+        if (doFullSync) {
+          await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
+          if (isStaleRun()) return;
+        }
         setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
       }
     } catch (err) {
@@ -4370,13 +4754,13 @@
       .uvd-shell { width: 100%; box-sizing: border-box; max-width: 1880px; margin: 0 auto; padding: 20px 22px 28px 455px; }
       .uvd-layout { display: block; }
       .uvd-main { min-width: 0; max-width: 1800px; margin: 0 auto; }
-      .uvd-header { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:18px; flex-wrap:wrap; }
-      .uvd-header-controls { display:flex; gap:10px; align-items:center; justify-content:flex-end; flex-wrap: wrap; margin-left: auto; }
+      .uvd-header { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:18px; flex-wrap:nowrap; }
+      .uvd-header-controls { display:flex; gap:10px; align-items:center; justify-content:flex-end; flex-shrink: 0; margin-left: auto; }
       .uvd-title-wrap h1 { font-size: 60px; margin: 8px 0 10px; letter-spacing: -0.035em; line-height: .96; color: var(--uvd-text); font-weight: 700; }
       .uvd-title-wrap .uv-drafts-stats { color: var(--uvd-subtext); font-size: 18px; }
       .uvd-back-btn { background:none; border:none; color: var(--uvd-subtext); cursor:pointer; font-size: 16px; font-weight: 600; padding: 4px 0; margin-bottom: 6px; }
       .uvd-header-actions { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
-      .uvd-cta { border:1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); border-radius: 14px; padding: 12px 16px; font-size: 16px; font-weight: 600; cursor:pointer; transition: background .16s ease, border-color .16s ease; }
+      .uvd-cta { border:1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); border-radius: 14px; padding: 12px 16px; font-size: 16px; font-weight: 600; cursor:pointer; transition: background .16s ease, border-color .16s ease; white-space: nowrap; }
       .uvd-cta:hover { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
       .uvd-sync-status { font-size: 13px; color: var(--uvd-subtext); min-height: 18px; }
       .uvd-sync-status[data-tone="syncing"] { color: #70b2ff; }
@@ -4434,6 +4818,17 @@
       .uvd-compose-actions .uvd-requires-source { display: none; }
       .uvd-composer.is-source-ready .uvd-compose-actions .uvd-requires-source { display: inline-flex; align-items: center; justify-content: center; }
       .uvd-composer.is-source-ready [data-uvd-compose-create="1"] { display: none; }
+      .uvd-cameo-section { margin-top: 10px; }
+      .uvd-cameo-section .uvd-field-label { font-size: 13px; font-weight: 600; color: var(--uvd-subtext); display: block; margin-bottom: 6px; }
+      .uvd-cameo-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+      .uvd-cameo-chip { display: inline-flex; align-items: center; gap: 4px; background: var(--uvd-surface); border: 1px solid var(--uvd-border); border-radius: 8px; padding: 3px 6px 3px 8px; font-size: 12px; color: var(--uvd-text); }
+      .uvd-cameo-label { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .uvd-cameo-swap, .uvd-cameo-remove { background: none; border: none; color: var(--uvd-subtext); cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
+      .uvd-cameo-swap:hover, .uvd-cameo-remove:hover { color: var(--uvd-text); }
+      .uvd-cameo-add-row { display: flex; gap: 6px; }
+      .uvd-cameo-input { flex: 1; background: var(--uvd-surface); border: 1px solid var(--uvd-border); border-radius: 8px; color: var(--uvd-text); padding: 4px 8px; font-size: 12px; }
+      .uvd-cameo-add-btn { background: var(--uvd-surface); border: 1px solid var(--uvd-border); border-radius: 8px; color: var(--uvd-text); padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+      .uvd-cameo-add-btn:hover { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
       .uvd-compose-status { min-height: 18px; margin-top: 8px; font-size: 13px; color: var(--uvd-subtext); }
       .uvd-compose-status[data-tone="ok"] { color: var(--uvd-ok); }
       .uvd-compose-status[data-tone="error"] { color: var(--uvd-error); }
@@ -4554,7 +4949,7 @@
       uvDraftsJustSeenIds.clear();
       const statusEl = uvDraftsComposerEl?.querySelector('[data-uvd-compose-status="1"]');
       setComposerSource(null, statusEl);
-      initUVDraftsPage();
+      initUVDraftsPage(true);
     });
     uvDraftsSyncButtonEl = refreshBtn;
     setUVDraftsSyncUiState({ processed: uvDraftsData.length });
@@ -4689,27 +5084,6 @@
     // Load workspaces async
     loadWorkspaces().then(() => updateWorkspaceSelect());
 
-    // Sort dropdown
-    const sortSelect = document.createElement('select');
-    sortSelect.className = 'uvd-select';
-    sortSelect.innerHTML = `
-      <option value="newest">Newest First</option>
-      <option value="oldest">Oldest First</option>
-    `;
-    if (Array.from(sortSelect.options).some((opt) => opt.value === uvDraftsSortState)) {
-      sortSelect.value = uvDraftsSortState;
-    } else {
-      uvDraftsSortState = 'newest';
-      sortSelect.value = uvDraftsSortState;
-      persistUVDraftsViewState();
-    }
-    sortSelect.addEventListener('change', () => {
-      uvDraftsSortState = sortSelect.value;
-      persistUVDraftsViewState();
-      renderUVDraftsGrid();
-    });
-    filterBar.appendChild(sortSelect);
-
     // "Remove All Unsynced" button — only visible when unsynced filter is active
     const removeUnsyncedBtn = document.createElement('button');
     removeUnsyncedBtn.className = 'uvd-cta';
@@ -4811,9 +5185,13 @@
       if (uvDraftsMarkAllState?.active) {
         resumePersistedMarkAllProgress({ queue: true });
       }
-      if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none' && uvDraftsSyncUiState.syncing) {
+      if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') {
         initUVDraftsPage();
       }
+
+      // Fetch models and styles for composer once authenticated
+      fetchComposerModels();
+      fetchComposerStyles();
     }
 
     function setModelOverride(value) {

@@ -94,8 +94,8 @@ test('integration: advanced search + composer override payload work together', (
     prompt: 'new neon prompt',
     model: 'sora2',
     orientation: 'portrait',
-    resolution: 'high',
-    style: 'music video',
+    size: 'high',
+    style_id: 'music video',
     seed: '77',
   });
   const parsedPayload = JSON.parse(overridden);
@@ -103,7 +103,7 @@ test('integration: advanced search + composer override payload work together', (
 
   assert.equal(parsedPayload.model, 'sora2');
   assert.equal(parsedPayload.creation_config.orientation, 'portrait');
-  assert.equal(parsedBody.creation_config.style, 'music video');
+  assert.equal(parsedBody.creation_config.style_id, 'music video');
   assert.equal(parsedBody.creation_config.seed, '77');
 });
 
