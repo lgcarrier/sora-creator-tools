@@ -235,6 +235,11 @@ function sanitizeHarvestRecord(raw) {
   const source = normalizeHarvestSource(raw.source);
   if (source) rec.source = source;
 
+  const userHandle = sanitizeString(raw.user_handle, 80);
+  if (userHandle) rec.user_handle = userHandle;
+  const userId = sanitizeUserId(raw.user_id);
+  if (userId != null) rec.user_id = userId;
+
   const detailUrl = sanitizeString(raw.detail_url, 2048);
   if (detailUrl) rec.detail_url = detailUrl;
 
@@ -384,6 +389,8 @@ function mergeHarvestRecord(existing, incoming) {
   preferIncomingIfExistingEmpty('post_visibility');
   preferIncomingIfExistingEmpty('cast_names');
   preferIncomingIfExistingEmpty('cameos');
+  preferIncomingIfExistingEmpty('user_handle');
+  preferIncomingIfExistingEmpty('user_id');
 
   out.context = next.context || prev.context;
   out.source = next.source || prev.source;

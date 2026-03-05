@@ -69,6 +69,8 @@ test('content and background harvest sanitizers accept valid record shape', () =
     kind: 'published',
     context: 'top',
     source: 'api',
+    user_handle: 'alice',
+    user_id: 123456,
     detail_url: 'https://sora.chatgpt.com/backend/project_y/post/s_123',
     prompt: 'A cinematic slow motion scene',
     title: 'Test title',
@@ -86,6 +88,10 @@ test('content and background harvest sanitizers accept valid record shape', () =
   assert.equal(backgroundOut.id, 's_123');
   assert.equal(contentOut.kind, 'published');
   assert.equal(backgroundOut.kind, 'published');
+  assert.equal(contentOut.user_handle, 'alice');
+  assert.equal(backgroundOut.user_handle, 'alice');
+  assert.equal(contentOut.user_id, 123456);
+  assert.equal(backgroundOut.user_id, 123456);
 });
 
 test('content and background harvest sanitizers reject invalid ids and kinds', () => {
