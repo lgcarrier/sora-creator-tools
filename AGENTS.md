@@ -28,7 +28,7 @@
 - Read this file before making edits.
 - Keep changes scoped to the user request; avoid opportunistic refactors.
 - Do not change extension permissions, host matches, or injected network hooks unless requested.
-- Preserve local-first behavior: no new external network calls unless explicitly required.
+- Preserve local-first behavior: do not add new external network calls. Existing network activity must remain limited to the current Sora/OpenAI endpoints already used by the project.
 - Ask before destructive actions (mass deletes, history rewrites, resets).
 - Run relevant verification commands before finalizing changes.
 
