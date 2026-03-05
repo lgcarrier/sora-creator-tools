@@ -383,6 +383,8 @@ function trimPostForResponse(post, snapshotMode) {
     userHandle: post.userHandle ?? null,
     userKey: post.userKey ?? null,
     post_time: postTime || null,
+    parent_post_id: post.parent_post_id ?? null,
+    root_post_id: post.root_post_id ?? null,
     duration: post.duration ?? null,
     width: post.width ?? null,
     height: post.height ?? null,

@@ -19,6 +19,7 @@ const {
   modeRequiresComposerSource,
   isDraftPubliclyPosted,
   getDraftPostUrl,
+  getDraftRemixSource,
   canTrimDraft,
   getDraftTrimUrl,
   clampGensCount,
@@ -225,6 +226,40 @@ test('integration: draft metadata helpers align card behavior for post links, tr
 
   assert.equal(clampGensCount(25, false), 10);
   assert.equal(clampGensCount(25, true), 25);
+});
+
+test('integration: remix source metadata stays normalized for UI card rendering', () => {
+  const remixPost = getDraftRemixSource({
+    remix_target_post_id: 's_parent_1',
+    creation_config: {
+      remix_target_draft: { id: 'draft_ignored' },
+    },
+  });
+  assert.equal(remixPost.isRemix, true);
+  assert.equal(remixPost.sourceType, 'post');
+  assert.equal(remixPost.sourcePostId, 's_parent_1');
+  assert.equal(remixPost.sourceDraftId, '');
+
+  const remixDraft = getDraftRemixSource({
+    creation_config: {
+      source_draft_id: 'd_source_5',
+    },
+  });
+  assert.equal(remixDraft.isRemix, true);
+  assert.equal(remixDraft.sourceType, 'draft');
+  assert.equal(remixDraft.sourceDraftId, 'd_source_5');
+  assert.equal(remixDraft.sourcePostId, '');
+});
+
+test('integration: non-remix drafts produce no remix source links', () => {
+  const plain = getDraftRemixSource({
+    id: 'd_plain',
+    creation_config: { mode: 'compose' },
+  });
+  assert.equal(plain.isRemix, false);
+  assert.equal(plain.sourceId, '');
+  assert.equal(plain.sourcePostId, '');
+  assert.equal(plain.sourceDraftId, '');
 });
 
 test('integration: new:true filter excludes violation and processing kinds', () => {
