@@ -59,6 +59,11 @@
   const MIN_PER_D = 1440;
   const MIN_PER_Y = 525600;
   const HOT_FLAME_MAX_AGE_MIN = 24 * MIN_PER_H; // 4/5 flames only apply within first 24h
+  const REMIX_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 20 20" style="pointer-events:none;">
+    <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.556"></circle>
+    <path stroke="currentColor" stroke-linecap="round" stroke-width="1.556" d="M11.945 10c0-4.667-9.723-5.833-8.75 1.556"></path>
+    <path stroke="currentColor" stroke-linecap="round" stroke-width="1.556" d="M8.055 10c0 4.667 9.723 5.833 8.75-1.556"></path>
+  </svg>`;
 
   // Debug toggle for characters
   DEBUG.characters = false;
@@ -69,6 +74,8 @@
   const idToViews = new Map();
   const idToComments = new Map();
   const idToRemixes = new Map();
+  const idToIsRemix = new Map();
+  const idToRemixSourcePostId = new Map();
   const idToCameos = new Map(); // Array of cameo usernames
   const idToMeta = new Map(); // { ageMin, userHandle, createdAtMs }
   const idToDuration = new Map(); // Draft duration in seconds
@@ -76,6 +83,7 @@
   const idToPrompt = new Map(); // Draft prompt text
   const idToDownloadUrl = new Map(); // Draft downloadable URL
   const idToViolation = new Map(); // Draft content violation status
+  const idToDraftIsRemix = new Map(); // Draft remix marker even when source id is unavailable
   const idToRemixTarget = new Map(); // Draft remix target post ID (if it's a remix of a post)
   const idToRemixTargetDraft = new Map(); // Draft remix target draft ID (if it's a remix of a draft)
   const taskToSourceDraft = new Map(); // task_id -> source draft gen ID (for draft remix tracking)
@@ -564,6 +572,7 @@
   let gatherTimerEl = null;
   let detailBadgeEl = null;
   let detailBadgeRetryInterval = null;
+  let draftDetailBadgeTimerId = null;
   let characterSortBtn = null;
   let characterSortMode = 'date'; // 'date', 'likes', 'cameos', 'likesPerDay'
   let charAutoLoadLastAttemptMs = 0;
@@ -699,6 +708,10 @@
     manualBackoffUntilMs: 0,
     source: '',
   };
+  const DRAFT_DETAIL_BADGE_POLL_MS = 750;
+  const DRAFT_DETAIL_FETCH_RETRY_MS = 10000;
+  const pendingDraftDetailFetchIds = new Set();
+  const draftDetailLastFetchAt = new Map();
   let pendingBatchSlotRefreshInFlight = false;
   let pendingBatchSlotRefreshLastAt = 0;
   const pendingBatchGenerationFirstSeen = new Map(); // id -> { firstSeenAt, lastSeenAt, profileKey }
@@ -825,9 +838,108 @@
     const m = location.pathname.match(/^\/p\/(s_[A-Za-z0-9]+)/i);
     return m ? m[1] : null;
   }
+  function currentDraftIdFromURL() {
+    const m = location.pathname.match(/^\/d\/([A-Za-z0-9_-]+)/i);
+    return m ? normalizeId(m[1]) : null;
+  }
   function currentProfileHandleFromURL() {
     const m = location.pathname.match(/^\/profile\/(?:username\/)?([^\/?#]+)/i);
     return m ? m[1] : null;
+  }
+
+  function normalizeSoraPostId(value) {
+    if (value == null) return '';
+    const raw = normalizeId(String(value).trim());
+    if (!raw) return '';
+    if (/^s_[A-Za-z0-9_-]+$/i.test(raw)) return raw;
+    try {
+      const parsed = new URL(raw, location.origin);
+      const match = parsed.pathname.match(/\/p\/(s_[A-Za-z0-9_-]+)/i);
+      return match ? normalizeId(match[1]) : '';
+    } catch {
+      const match = raw.match(/\/p\/(s_[A-Za-z0-9_-]+)/i);
+      return match ? normalizeId(match[1]) : '';
+    }
+  }
+
+  function normalizeSoraDraftId(value) {
+    if (value == null) return '';
+    const raw = normalizeId(String(value).trim());
+    if (!raw) return '';
+    try {
+      const parsed = new URL(raw, location.origin);
+      const match = parsed.pathname.match(/\/d\/([A-Za-z0-9_-]+)/i);
+      if (match) return normalizeId(match[1]);
+    } catch {
+      const match = raw.match(/\/d\/([A-Za-z0-9_-]+)/i);
+      if (match) return normalizeId(match[1]);
+    }
+    return /^[A-Za-z0-9_-]+$/i.test(raw) ? raw : '';
+  }
+
+  function firstValidPostId(values) {
+    const list = Array.isArray(values) ? values : [];
+    for (const value of list) {
+      const id = normalizeSoraPostId(value);
+      if (id) return id;
+    }
+    return '';
+  }
+
+  function firstValidDraftId(values) {
+    const list = Array.isArray(values) ? values : [];
+    for (const value of list) {
+      const id = normalizeSoraDraftId(value);
+      if (id) return id;
+    }
+    return '';
+  }
+
+  function derivePostRemixSourceId(postLike, currentPostId, fallbackParentPostId) {
+    const post = postLike?.post || postLike || {};
+    const currentId = normalizeSoraPostId(currentPostId);
+    const parentId = firstValidPostId([post?.parent_post_id, fallbackParentPostId]);
+    const rootId = normalizeSoraPostId(post?.root_post_id);
+    const sourceCandidates = [
+      post?.source_post_id,
+      post?.remix_target_post_id,
+      post?.creation_config?.remix_target_post?.id,
+      post?.creation_config?.remix_target_post?.post?.id,
+      parentId,
+      rootId,
+    ];
+    for (const candidate of sourceCandidates) {
+      const normalized = normalizeSoraPostId(candidate);
+      if (!normalized) continue;
+      if (currentId && normalized === currentId) continue;
+      return normalized;
+    }
+    return '';
+  }
+
+  function setPostRemixState(postId, postLike, fallbackParentPostId) {
+    const normalizedPostId = normalizeSoraPostId(postId);
+    if (!normalizedPostId) return;
+    const post = postLike?.post || postLike || {};
+    const sourcePostId = derivePostRemixSourceId(post, normalizedPostId, fallbackParentPostId);
+    const explicitSignals = [
+      post?.source_post_id,
+      post?.remix_target_post_id,
+      post?.creation_config?.remix_target_post?.id,
+      post?.creation_config?.remix_target_post?.post?.id,
+      post?.parent_post_id,
+      post?.root_post_id,
+      fallbackParentPostId,
+    ];
+    const hasSignalId = explicitSignals.some((value) => {
+      const normalized = normalizeSoraPostId(value);
+      return !!(normalized && normalized !== normalizedPostId);
+    });
+    const hasBooleanSignal = post?.is_remix === true || post?.isRemix === true || post?.remix === true;
+    const isRemix = !!sourcePostId || hasSignalId || hasBooleanSignal;
+    idToIsRemix.set(normalizedPostId, isRemix);
+    if (sourcePostId) idToRemixSourcePostId.set(normalizedPostId, sourcePostId);
+    else idToRemixSourcePostId.delete(normalizedPostId);
   }
 
   // == Data extraction ==
@@ -1832,11 +1944,7 @@
       });
 
       // Remix icon SVG (Sora's official remix icon)
-      remixBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 20 20" style="pointer-events: none;">
-        <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.556"></circle>
-        <path stroke="currentColor" stroke-linecap="round" stroke-width="1.556" d="M11.945 10c0-4.667-9.723-5.833-8.75 1.556"></path>
-        <path stroke="currentColor" stroke-linecap="round" stroke-width="1.556" d="M8.055 10c0 4.667 9.723 5.833 8.75-1.556"></path>
-      </svg>`;
+      remixBtn.innerHTML = REMIX_ICON_SVG;
 
       remixBtn.addEventListener('mouseenter', () => {
         remixBtn.style.background = 'rgba(0,0,0,0.9)';
@@ -2832,6 +2940,50 @@
     return pill;
   }
 
+  function createRemixIndicatorPill(parent, options = {}) {
+    if (!parent) return null;
+    const href = typeof options.href === 'string' ? options.href.trim() : '';
+    const tooltipText = typeof options.tooltipText === 'string' ? options.tooltipText : '';
+    const useLink = !!href;
+    const el = document.createElement(useLink ? 'a' : 'span');
+    el.className = 'sora-uv-pill sora-uv-pill-remix';
+    Object.assign(el.style, {
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      minWidth: '24px',
+      height: '24px',
+      borderRadius: '999px',
+      background: 'rgba(37,37,37,0.7)',
+      color: '#fff',
+      lineHeight: '1',
+      userSelect: 'none',
+      backdropFilter: 'blur(8px)',
+      WebkitBackdropFilter: 'blur(8px)',
+      boxShadow:
+        'inset 0 0 1px rgba(0,0,0,0.10), inset 0 0 1px rgba(255,255,255,0.50), 0 2px 20px rgba(0,0,0,0.25)',
+      textDecoration: 'none',
+      cursor: useLink ? 'pointer' : 'not-allowed',
+    });
+    el.innerHTML = REMIX_ICON_SVG;
+    if (useLink) {
+      el.href = href;
+      el.addEventListener('click', (event) => {
+        event.stopPropagation();
+      });
+    } else {
+      el.style.opacity = '0.72';
+      el.setAttribute('aria-disabled', 'true');
+      el.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+    }
+    parent.appendChild(el);
+    attachTooltip(el, tooltipText, !!tooltipText);
+    return el;
+  }
+
   function badgeStateFor(likes, ageMin) {
     return {
       isSuperHot: isSuperHotByRate(likes, ageMin),
@@ -2910,9 +3062,11 @@
 
 
   function addBadge(card, views, meta) {
-    if (views == null && !meta) return;
-    const badge = ensureBadge(card);
     const id = extractIdFromCard(card);
+    if (!id) return;
+    const hasRemixIndicator = idToIsRemix.get(id) === true;
+    if (views == null && !meta && !hasRemixIndicator) return;
+    const badge = ensureBadge(card);
     const likes = idToLikes.get(id) ?? 0;
     const ageMin = meta?.ageMin;
     const isSuperHot = isSuperHotByRate(likes, ageMin);
@@ -2945,12 +3099,16 @@
     const ageStr = Number.isFinite(ageMin) ? fmtAgeMinPill(ageMin) : null;
     const emojiStr = badgeEmojiFor(id, meta);
     const timeEmojiStr = (ageStr || emojiStr) ? [ageStr || '', emojiStr || ''].filter(Boolean).join(' ') : null;
+    const isRemix = idToIsRemix.get(id) === true;
+    const remixSourcePostId = normalizeSoraPostId(idToRemixSourcePostId.get(id));
+    const remixHref = remixSourcePostId ? `${location.origin}/p/${encodeURIComponent(remixSourcePostId)}` : '';
+    const remixStateKey = isRemix ? (remixSourcePostId ? `src:${remixSourcePostId}` : 'src:missing') : 'none';
 
     const bg = badgeBgFor(id, meta);
     badge.style.background = 'transparent';
     const pillBg = bg || 'rgba(37,37,37,0.7)';
 
-    const newKey = JSON.stringify([durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, pillBg]);
+    const newKey = JSON.stringify([remixStateKey, durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, pillBg]);
     if (badge.dataset.key === newKey) {
       badge.style.boxShadow = 'none';
       return;
@@ -2958,6 +3116,13 @@
     badge.dataset.key = newKey;
 
     badge.innerHTML = '';
+    if (isRemix) {
+      const remixEl = createRemixIndicatorPill(badge, {
+        href: remixHref,
+        tooltipText: remixHref ? 'Watch parent/seed video' : 'Parent/seed video unavailable',
+      });
+      if (remixEl) remixEl.style.background = pillBg;
+    }
     if (viewsStr) {
       let tooltip = `${fmtInt(uv)} Unique Views`;
       if (impactStr) {
@@ -3119,6 +3284,73 @@
     return badge;
   }
 
+  function ensureDraftRemixIndicator(draftCard, draftId) {
+    if (!draftId) return null;
+    const isRemix = idToDraftIsRemix.get(draftId) === true || idToRemixTarget.has(draftId) || idToRemixTargetDraft.has(draftId);
+    let indicator = draftCard.querySelector('.sora-uv-draft-remix-indicator');
+
+    if (!isRemix) {
+      if (indicator) indicator.remove();
+      return null;
+    }
+
+    if (getComputedStyle(draftCard).position === 'static') draftCard.style.position = 'relative';
+
+    const sourcePostId = normalizeSoraPostId(idToRemixTarget.get(draftId));
+    const sourceDraftId = normalizeSoraDraftId(idToRemixTargetDraft.get(draftId));
+    const sourceHref = sourcePostId
+      ? `https://sora.chatgpt.com/p/${encodeURIComponent(sourcePostId)}`
+      : sourceDraftId
+        ? `https://sora.chatgpt.com/d/${encodeURIComponent(sourceDraftId)}`
+        : '';
+    const title = sourcePostId
+      ? 'Watch parent video'
+      : sourceDraftId
+        ? 'Watch seed video'
+        : 'Parent/seed video unavailable';
+
+    if (indicator) indicator.remove();
+    indicator = document.createElement(sourceHref ? 'a' : 'span');
+    indicator.className = 'sora-uv-draft-remix-indicator';
+    Object.assign(indicator.style, {
+      position: 'absolute',
+      top: `${DRAFT_BUTTON_MARGIN}px`,
+      left: `${DRAFT_BUTTON_MARGIN}px`,
+      width: `${DRAFT_BUTTON_SIZE}px`,
+      height: `${DRAFT_BUTTON_SIZE}px`,
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: '999px',
+      background: 'rgba(0,0,0,0.75)',
+      color: '#fff',
+      zIndex: 9999,
+      backdropFilter: 'blur(4px)',
+      WebkitBackdropFilter: 'blur(4px)',
+      textDecoration: 'none',
+      boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+      cursor: sourceHref ? 'pointer' : 'not-allowed',
+      opacity: sourceHref ? '1' : '0.72',
+    });
+    indicator.innerHTML = REMIX_ICON_SVG;
+    indicator.setAttribute('aria-label', title);
+    attachTooltip(indicator, title, true);
+    if (sourceHref) {
+      indicator.href = sourceHref;
+      indicator.addEventListener('click', (event) => {
+        event.stopPropagation();
+      });
+    } else {
+      indicator.setAttribute('aria-disabled', 'true');
+      indicator.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+    }
+    draftCard.appendChild(indicator);
+    return indicator;
+  }
+
 
   function renderDraftButtons() {
     if (!isDrafts()) return;
@@ -3137,6 +3369,7 @@
       const draftId = extractDraftIdFromCard(draftCard);
       if (!draftId) continue;
 
+      ensureDraftRemixIndicator(draftCard, draftId);
       ensureDurationBadge(draftCard, draftId);
       ensureCopyPromptButton(draftCard, draftId);
       ensureDownloadButton(draftCard, draftId);
@@ -3147,7 +3380,7 @@
     }
   }
 
-  // == Detail badge (post page only) ==
+  // == Detail badge (post + draft detail pages) ==
   
   function teardownDetailBadge() {
     if (detailBadgeRetryInterval) {
@@ -3160,6 +3393,24 @@
       } catch {}
     }
     detailBadgeEl = null;
+  }
+
+  function stopDraftDetailBadgeLoop() {
+    if (!draftDetailBadgeTimerId) return;
+    clearInterval(draftDetailBadgeTimerId);
+    draftDetailBadgeTimerId = null;
+  }
+
+  function startDraftDetailBadgeLoop() {
+    if (draftDetailBadgeTimerId) return;
+    renderDraftDetailBadge();
+    draftDetailBadgeTimerId = setInterval(() => {
+      if (!isDraftDetail()) {
+        stopDraftDetailBadgeLoop();
+        return;
+      }
+      renderDraftDetailBadge();
+    }, DRAFT_DETAIL_BADGE_POLL_MS);
   }
 
   // This function targets the visible video container
@@ -3306,7 +3557,8 @@
       const metrics = await responsePromise;
       if (metrics?.users) {
         // Helper function to load post data from a post object
-        const loadPostData = (post, postId) => {
+        const loadPostData = (post, postId, fallbackParentPostId = null) => {
+          setPostRemixState(postId, post, fallbackParentPostId);
           const latest = __sorauv_latestSnapshot(post.snapshots);
           if (latest) {
             // Only set values if they're not null/undefined
@@ -3398,7 +3650,7 @@
                   const remixId = remixPost.id || remixPost.post_id;
                   if (remixId === sid) {
                     // Pass the actual post object, not the wrapper
-                    loadPostData(remixPost, sid);
+                    loadPostData(remixPost, sid, parentId);
                     return; // Found and loaded remix
                   }
                 }
@@ -3509,6 +3761,127 @@
       }
     } finally {
       pendingPostDetailIds.delete(sid);
+    }
+  }
+
+  function draftDetailBadgeDataReady(draftId) {
+    const normalizedDraftId = normalizeSoraDraftId(draftId);
+    if (!normalizedDraftId) return false;
+    if (idToDuration.has(normalizedDraftId)) return true;
+    if (idToDraftIsRemix.has(normalizedDraftId)) return true;
+    if (idToRemixTarget.has(normalizedDraftId)) return true;
+    if (idToRemixTargetDraft.has(normalizedDraftId)) return true;
+    return false;
+  }
+
+  async function fetchDraftDetailDataIfNeeded(opts = {}) {
+    const draftId = normalizeSoraDraftId(opts?.draftId || currentDraftIdFromURL());
+    if (!draftId) return;
+    if (!opts?.force && draftDetailBadgeDataReady(draftId)) return;
+    if (pendingDraftDetailFetchIds.has(draftId)) return;
+    const now = Date.now();
+    const lastFetchAt = Number(draftDetailLastFetchAt.get(draftId) || 0);
+    if (!opts?.force && now - lastFetchAt < DRAFT_DETAIL_FETCH_RETRY_MS) return;
+    draftDetailLastFetchAt.set(draftId, now);
+    pendingDraftDetailFetchIds.add(draftId);
+    try {
+      const urls = [
+        `${location.origin}/backend/project_y/profile/drafts?limit=50`,
+        `${location.origin}/backend/profile/drafts?limit=50`,
+        `${location.origin}/backend/project_y/profile/drafts/${encodeURIComponent(draftId)}`,
+        `${location.origin}/backend/profile/drafts/${encodeURIComponent(draftId)}`,
+      ];
+      for (const url of urls) {
+        try {
+          const response = await fetch(url, {
+            method: 'GET',
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' },
+          });
+          if (!response.ok) continue;
+          const json = await response.json();
+          processDraftsJson(json);
+          if (draftDetailBadgeDataReady(draftId)) break;
+        } catch {}
+      }
+    } finally {
+      pendingDraftDetailFetchIds.delete(draftId);
+    }
+  }
+
+  function renderDraftDetailBadge() {
+    if (!isDraftDetail()) {
+      teardownDetailBadge();
+      return;
+    }
+
+    const el = ensureDetailBadgeContainer();
+    if (!el) return;
+
+    const draftId = currentDraftIdFromURL();
+    if (!draftId) {
+      el.innerHTML = '';
+      return;
+    }
+
+    if (!draftDetailBadgeDataReady(draftId)) {
+      fetchDraftDetailDataIfNeeded({ draftId }).catch(() => {});
+      if (pendingDraftDetailFetchIds.has(draftId)) renderDetailLoading(el);
+      else {
+        el.innerHTML = '';
+        el.dataset.key = '';
+      }
+      return;
+    }
+
+    const sourcePostId = normalizeSoraPostId(idToRemixTarget.get(draftId));
+    const sourceDraftId = normalizeSoraDraftId(idToRemixTargetDraft.get(draftId));
+    const isRemix = idToDraftIsRemix.get(draftId) === true || !!sourcePostId || !!sourceDraftId;
+    const remixHref = sourcePostId
+      ? `${location.origin}/p/${encodeURIComponent(sourcePostId)}`
+      : sourceDraftId
+        ? `${location.origin}/d/${encodeURIComponent(sourceDraftId)}`
+        : '';
+    const remixTooltip = sourcePostId
+      ? 'Watch parent video'
+      : sourceDraftId
+        ? 'Watch seed video'
+        : 'Parent/seed video unavailable';
+    const duration = idToDuration.get(draftId);
+    const durationStr = duration ? formatDuration(duration) : null;
+
+    if (!isRemix && !durationStr) {
+      el.innerHTML = '';
+      el.dataset.key = '';
+      return;
+    }
+
+    const remixStateKey = isRemix
+      ? (sourcePostId ? `p:${sourcePostId}` : sourceDraftId ? `d:${sourceDraftId}` : 'missing')
+      : 'none';
+    const newKey = JSON.stringify(['draft-detail', remixStateKey, durationStr || '']);
+    const hasPills = el.querySelectorAll('.sora-uv-pill').length > 0;
+    if (el.dataset.key === newKey && hasPills) return;
+    el.dataset.key = newKey;
+
+    el.innerHTML = '';
+    const pillBg = 'rgba(37,37,37,0.7)';
+    if (isRemix) {
+      const remixEl = createRemixIndicatorPill(el, {
+        href: remixHref,
+        tooltipText: remixTooltip,
+      });
+      if (remixEl) {
+        remixEl.style.background = pillBg;
+        remixEl.style.pointerEvents = 'auto';
+      }
+    }
+    if (durationStr) {
+      const durationEl = createPill(el, durationStr, `${durationStr} video`, true);
+      if (durationEl) {
+        durationEl.style.background = pillBg;
+        durationEl.style.pointerEvents = 'auto';
+      }
     }
   }
 
@@ -3630,6 +4003,10 @@
     const ageStr = Number.isFinite(ageMin) ? fmtAgeMinPill(ageMin) : null;
     const emojiStr = badgeEmojiFor(sid, meta);
     const timeEmojiStr = (ageStr || emojiStr) ? [ageStr || '', emojiStr || ''].filter(Boolean).join(' ') : null;
+    const isRemix = idToIsRemix.get(sid) === true;
+    const remixSourcePostId = normalizeSoraPostId(idToRemixSourcePostId.get(sid));
+    const remixHref = remixSourcePostId ? `${location.origin}/p/${encodeURIComponent(remixSourcePostId)}` : '';
+    const remixStateKey = isRemix ? (remixSourcePostId ? `src:${remixSourcePostId}` : 'src:missing') : 'none';
 
     // Get duration if available
     let duration = idToDuration.get(sid);
@@ -3657,7 +4034,7 @@
     const durationStr = duration ? formatDuration(duration) : null;
 
     // Determine if we have any data to display
-    if (viewsStr == null && irStr == null && rrStr == null && impactStr == null && timeEmojiStr == null && durationStr == null) {
+    if (viewsStr == null && irStr == null && rrStr == null && impactStr == null && timeEmojiStr == null && durationStr == null && !isRemix) {
       el.innerHTML = '';
       return;
     }
@@ -3665,14 +4042,24 @@
     // Use a key to prevent unnecessary DOM updates - match feed badge key format
     const bg = badgeBgFor(sid, meta);
     const pillBg = bg || 'rgba(37,37,37,0.7)';
-    const newKey = JSON.stringify([durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, pillBg]);
+    const newKey = JSON.stringify([remixStateKey, durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, pillBg]);
     const hasPills = el.querySelectorAll('.sora-uv-pill').length > 0;
     if (el.dataset.key === newKey && hasPills) return;
     el.dataset.key = newKey;
     
     el.innerHTML = ''; 
+
+    // 1. Remix Pill - match feed badge exactly
+    if (isRemix) {
+      const remixEl = createRemixIndicatorPill(el, {
+        href: remixHref,
+        tooltipText: remixHref ? 'Watch parent/seed video' : 'Parent/seed video unavailable',
+      });
+      remixEl.style.background = pillBg;
+      remixEl.style.pointerEvents = 'auto';
+    }
     
-    // 1. Views Pill - match feed badge exactly
+    // 2. Views Pill - match feed badge exactly
     if (viewsStr) {
       let tooltip = `${fmtInt(uv)} Unique Views`;
       if (impactStr) {
@@ -3683,21 +4070,21 @@
       metEl.style.pointerEvents = 'auto';
     }
     
-    // 2. IR Pill - match feed badge exactly
+    // 3. IR Pill - match feed badge exactly
     if (irStr) {
       const metEl = createPill(el, irStr, 'Likes + Comments relative to Unique Views', true);
       metEl.style.background = pillBg;
       metEl.style.pointerEvents = 'auto';
     }
     
-    // 3. RR Pill - match feed badge exactly
+    // 4. RR Pill - match feed badge exactly
     if (rrStr) {
       const metEl = createPill(el, rrStr, 'Total Remixes relative to Likes', true);
       metEl.style.background = pillBg;
       metEl.style.pointerEvents = 'auto';
     }
     
-    // 4. Time/Age Pill - match feed badge exactly
+    // 5. Time/Age Pill - match feed badge exactly
     if (timeEmojiStr) {
       const tip = Number.isFinite(ageMin) ? expireEtaTooltip(ageMin, meta) : null;
       const nearDay = isNearWholeDay(ageMin);
@@ -3714,7 +4101,7 @@
       }
     }
 
-    // 5. Duration Pill - moved to end
+    // 6. Duration Pill - moved to end
     if (durationStr) {
       const dims = idToDimensions.get(sid);
       let modelName = '';
@@ -6791,7 +7178,12 @@ async function renderAnalyzeTable(force = false) {
           }
         }
 
-        if (isDraftDetail()) return res;
+        const skipDraftDetailProcessing =
+          isDraftDetail() &&
+          !DRAFTS_RE.test(url) &&
+          !NF_PENDING_V2_RE.test(url) &&
+          !NF_CREATE_RE.test(url);
+        if (skipDraftDetailProcessing) return res;
 
         // Intercept /backend/nf/create to capture task_id -> source draft mapping for draft remixes
         if (NF_CREATE_RE.test(url) && !init?.__sctDirect) {
@@ -6877,8 +7269,13 @@ async function renderAnalyzeTable(force = false) {
     XMLHttpRequest.prototype.open = function (method, url) {
       this.addEventListener('load', function () {
         try {
-          if (isDraftDetail()) return;
             if (typeof url === 'string') {
+              const skipDraftDetailProcessing =
+                isDraftDetail() &&
+                !DRAFTS_RE.test(url) &&
+                !NF_PENDING_V2_RE.test(url) &&
+                !NF_CREATE_RE.test(url);
+              if (skipDraftDetailProcessing) return;
               // Intercept /backend/nf/create for draft remix tracking
               if (NF_CREATE_RE.test(url)) {
                 const draftRemixMatch = location.pathname.match(/^\/d\/([A-Za-z0-9_-]+)/i);
@@ -7093,6 +7490,7 @@ async function renderAnalyzeTable(force = false) {
         }
       }
       const p = it?.post || it || {};
+      setPostRemixState(id, p, null);
       const created_at =
         p?.created_at ?? p?.uploaded_at ?? p?.createdAt ?? p?.created ?? p?.posted_at ?? p?.timestamp ?? null;
       const caption =
@@ -7288,6 +7686,7 @@ async function renderAnalyzeTable(force = false) {
           const remixCameoUsernames = getCameoUsernames(remixItem);
           
           const remixP = remixItem?.post || remixItem || {};
+          setPostRemixState(remixId, remixP, id);
           const remixCreatedAt = remixP?.created_at ?? remixP?.uploaded_at ?? remixP?.createdAt ?? remixP?.created ?? remixP?.posted_at ?? remixP?.timestamp ?? null;
           const remixCaption = (typeof remixP?.caption === 'string' && remixP.caption) ? remixP.caption : (typeof remixP?.text === 'string' && remixP.text ? remixP.text : null);
           const remixAgeMin = minutesSince(remixCreatedAt);
@@ -7615,21 +8014,57 @@ async function renderAnalyzeTable(force = false) {
           idToViolation.set(draftId, false);
         }
 
-        // Extract remix target post ID if this is a remix of a post
-        const remixTargetPostId = item?.creation_config?.remix_target_post?.post?.id;
-        if (remixTargetPostId && typeof remixTargetPostId === 'string') {
+        // Recompute remix mapping each pass to avoid stale source links.
+        idToRemixTarget.delete(draftId);
+        idToRemixTargetDraft.delete(draftId);
+        idToDraftIsRemix.delete(draftId);
+        const creationConfig = item?.creation_config && typeof item.creation_config === 'object'
+          ? item.creation_config
+          : {};
+
+        const remixTargetPostId = firstValidPostId([
+          item?.remix_target_post_id,
+          creationConfig?.remix_target_post?.id,
+          creationConfig?.remix_target_post?.post?.id,
+          item?.source_post_id,
+          creationConfig?.source_post_id,
+        ]);
+        if (remixTargetPostId) {
           idToRemixTarget.set(draftId, remixTargetPostId);
         }
 
-        // Check if this draft is a remix of another draft (only if not already mapped)
+        const parsedSourceDraftId = firstValidDraftId([
+          item?.remix_target_draft_id,
+          creationConfig?.remix_target_draft?.id,
+          creationConfig?.remix_target_draft?.draft?.id,
+          creationConfig?.source_draft_id,
+          item?.source_draft_id,
+        ]);
+        if (parsedSourceDraftId) {
+          idToRemixTargetDraft.set(draftId, parsedSourceDraftId);
+        }
+
+        // Fallback via task->source mapping for draft remix flows.
         if (!idToRemixTargetDraft.has(draftId)) {
           const taskId = item?.task_id;
           if (taskId && taskToSourceDraft.has(taskId)) {
-            const sourceDraftId = taskToSourceDraft.get(taskId);
-            idToRemixTargetDraft.set(draftId, sourceDraftId);
-            dlog('drafts', `Mapped draft ${draftId} -> source draft ${sourceDraftId}`);
+            const sourceDraftId = normalizeSoraDraftId(taskToSourceDraft.get(taskId));
+            if (sourceDraftId) {
+              idToRemixTargetDraft.set(draftId, sourceDraftId);
+              dlog('drafts', `Mapped draft ${draftId} -> source draft ${sourceDraftId}`);
+            }
           }
         }
+
+        const mode = String(creationConfig?.mode || '').trim().toLowerCase();
+        const isDraftRemix = (
+          !!remixTargetPostId ||
+          idToRemixTargetDraft.has(draftId) ||
+          item?.is_remix === true ||
+          creationConfig?.is_remix === true ||
+          mode === 'remix'
+        );
+        idToDraftIsRemix.set(draftId, isDraftRemix);
       } catch (e) {
         console.error('[SoraUV] Error processing draft item:', e);
       }
@@ -8276,7 +8711,11 @@ async function renderAnalyzeTable(force = false) {
   // == Observers & Lifecycle ==
   function runRenderPass() {
     if (renderPassInFlight) return;
-    if (isDraftDetail()) return;
+    if (isDraftDetail()) {
+      renderDraftDetailBadge();
+      scheduleInjectDashboardButton();
+      return;
+    }
     const onExplore = isExplore();
     const onProfile = isProfile();
     const onPost = isPost();
@@ -8549,6 +8988,8 @@ async function renderAnalyzeTable(force = false) {
 
     // Handle UV Drafts page
     if (isUVDrafts()) {
+      stopDraftDetailBadgeLoop();
+      teardownDetailBadge();
       // Hide other overlays
       try {
         if (analyzeOverlayEl) analyzeOverlayEl.style.display = 'none';
@@ -8588,7 +9029,7 @@ async function renderAnalyzeTable(force = false) {
     }
 
     if (isDraftDetail()) {
-      // /d/... draft detail pages are extremely sensitive; avoid all injected work here.
+      // /d/... draft detail pages are sensitive; keep only dashboard + lightweight detail badge.
       try {
         stopRapidAnalyzeGather();
         stopAnalyzeAutoRefresh();
@@ -8610,6 +9051,8 @@ async function renderAnalyzeTable(force = false) {
       teardownDetailBadge();
       teardownControlBar();
       stopObservers();
+      startDraftDetailBadgeLoop();
+      fetchDraftDetailDataIfNeeded().catch(() => {});
 
       try {
         if (dashboardInjectRafId) cancelAnimationFrame(dashboardInjectRafId);
@@ -8621,7 +9064,11 @@ async function renderAnalyzeTable(force = false) {
       dashboardInjectRetryId = null;
       scheduleInjectDashboardButton();
       return;
-    } else if (!observersActive) {
+    } else {
+      stopDraftDetailBadgeLoop();
+      teardownDetailBadge();
+    }
+    if (!observersActive) {
       // If we previously disabled for /d/... and navigated back, resume observers.
       startObservers();
     }
@@ -8992,8 +9439,13 @@ async function renderAnalyzeTable(force = false) {
     dlog('feed', 'init');
     ensureToastStyles();
     if (isDraftDetail()) {
-      dlog('feed', 'draft detail route detected; injecting dashboard only');
-      scheduleInjectDashboardButton();
+      dlog('feed', 'draft detail route detected; enabling draft-detail overlay mode');
+      loadTaskToSourceDraft();
+      installFetchSniffer();
+      startMenuObserver();
+      window.addEventListener('storage', handleStorageChange);
+      startScheduledPostsTimer();
+      onRouteChange();
       return;
     }
     // Allow auto-starting Gather on Top feed or Profile via URL param.
@@ -9061,6 +9513,9 @@ async function renderAnalyzeTable(force = false) {
       idToPrompt,
       idToDownloadUrl,
       idToViolation,
+      idToIsRemix,
+      idToRemixSourcePostId,
+      idToDraftIsRemix,
       idToRemixTarget,
       idToRemixTargetDraft,
       taskToSourceDraft,

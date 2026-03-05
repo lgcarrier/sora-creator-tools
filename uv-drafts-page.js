@@ -47,6 +47,11 @@
     let sentinelInitialized = false;
     let cachedSentinelToken = null;
     let cachedSentinelExpiry = 0;
+    const REMIX_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 20 20" style="pointer-events:none;">
+      <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.556"></circle>
+      <path stroke="currentColor" stroke-linecap="round" stroke-width="1.556" d="M11.945 10c0-4.667-9.723-5.833-8.75 1.556"></path>
+      <path stroke="currentColor" stroke-linecap="round" stroke-width="1.556" d="M8.055 10c0 4.667 9.723 5.833 8.75-1.556"></path>
+    </svg>`;
 
     function debugLog(...args) {
       if (!UV_DRAFTS_DEBUG_ENABLED) return;
@@ -210,6 +215,86 @@
       if (!draft?.id) return '';
       if (draft.storyboard_id) return `https://sora.chatgpt.com/storyboard/${encodeURIComponent(draft.storyboard_id)}`;
       return `https://sora.chatgpt.com/d/${encodeURIComponent(draft.id)}`;
+    }
+
+    function normalizePostId(value) {
+      if (value == null) return '';
+      const raw = String(value).trim();
+      if (!raw) return '';
+      if (/^s_[A-Za-z0-9_-]+$/i.test(raw)) return raw;
+      try {
+        const parsed = new URL(raw, 'https://sora.chatgpt.com');
+        const match = parsed.pathname.match(/\/p\/(s_[A-Za-z0-9_-]+)/i);
+        return match ? match[1] : '';
+      } catch {
+        const match = raw.match(/\/p\/(s_[A-Za-z0-9_-]+)/i);
+        return match ? match[1] : '';
+      }
+    }
+
+    function normalizeDraftId(value) {
+      if (value == null) return '';
+      const raw = String(value).trim();
+      if (!raw) return '';
+      try {
+        const parsed = new URL(raw, 'https://sora.chatgpt.com');
+        const match = parsed.pathname.match(/\/d\/([A-Za-z0-9_-]+)/i);
+        if (match) return match[1];
+      } catch {
+        const match = raw.match(/\/d\/([A-Za-z0-9_-]+)/i);
+        if (match) return match[1];
+      }
+      return /^[A-Za-z0-9_-]+$/i.test(raw) ? raw : '';
+    }
+
+    function getDraftRemixSource(draft) {
+      if (uvDraftsLogic && typeof uvDraftsLogic.getDraftRemixSource === 'function') {
+        return uvDraftsLogic.getDraftRemixSource(draft);
+      }
+      const data = draft && typeof draft === 'object' ? draft : {};
+      const creationConfig = data.creation_config && typeof data.creation_config === 'object'
+        ? data.creation_config
+        : {};
+      const sourcePostId = normalizePostId(
+        data.remix_target_post_id ||
+        creationConfig?.remix_target_post?.id ||
+        creationConfig?.remix_target_post?.post?.id ||
+        data.source_post_id ||
+        creationConfig?.source_post_id
+      );
+      if (sourcePostId) {
+        return {
+          isRemix: true,
+          sourceType: 'post',
+          sourceId: sourcePostId,
+          sourcePostId,
+          sourceDraftId: '',
+        };
+      }
+      const sourceDraftId = normalizeDraftId(
+        data.remix_target_draft_id ||
+        creationConfig?.remix_target_draft?.id ||
+        creationConfig?.remix_target_draft?.draft?.id ||
+        creationConfig?.source_draft_id ||
+        data.source_draft_id
+      );
+      if (sourceDraftId) {
+        return {
+          isRemix: true,
+          sourceType: 'draft',
+          sourceId: sourceDraftId,
+          sourcePostId: '',
+          sourceDraftId,
+        };
+      }
+      const isRemix = data.is_remix === true || creationConfig?.is_remix === true || String(creationConfig?.mode || '').toLowerCase() === 'remix';
+      return {
+        isRemix,
+        sourceType: '',
+        sourceId: '',
+        sourcePostId: '',
+        sourceDraftId: '',
+      };
     }
 
     function getDraftKindKey(draft) {
@@ -745,6 +830,7 @@
     const resolvedCreatedAt = Number.isFinite(apiCreatedAt) && apiCreatedAt > 0
       ? apiCreatedAt
       : (Number.isFinite(existingCreatedAt) && existingCreatedAt > 0 ? existingCreatedAt : null);
+    const remixSource = getDraftRemixSource({ ...existingData, ...apiDraft });
 
     // Determine is_read: use API value if present, otherwise existing, otherwise default to true
     let isRead = true; // Default: assume read (not new)
@@ -787,7 +873,9 @@
       can_remix: apiDraft.can_remix ?? true,
       can_storyboard: apiDraft.can_storyboard ?? true,
       storyboard_id: apiDraft.storyboard_id || apiDraft.creation_config?.storyboard_id || '',
-      remix_target_post_id: apiDraft.creation_config?.remix_target_post?.id || null,
+      remix_target_post_id: remixSource.sourcePostId || null,
+      remix_target_draft_id: remixSource.sourceDraftId || null,
+      is_remix: remixSource.isRemix === true,
       post_visibility: apiDraft.post_visibility || null,
       post_id: post?.id || existingData.post_id || null,
       post_permalink: post?.permalink || existingData.post_permalink || null,
@@ -4217,6 +4305,7 @@
     const isSpecialError = isContentViolation || isContextViolation || isProcessingError;
     const usePlaceholderThumb = isSpecialError || isPendingDraft;
     const isNew = isDraftUnreadState(draft) && !uvDraftsJustSeenIds.has(draft.id);
+    const remixSource = getDraftRemixSource(draft);
     const draftUrl = `https://sora.chatgpt.com/d/${encodeURIComponent(draft.id)}`;
 
     const card = document.createElement('div');
@@ -4275,6 +4364,19 @@
         : (isContentViolation || isContextViolation ? '#2a1515' : (isProcessingError ? '#1b2235' : '#1a1a1a')),
       cursor: 'pointer',
     });
+    const topBadgeRail = document.createElement('div');
+    topBadgeRail.className = 'uv-top-badge-rail';
+    Object.assign(topBadgeRail.style, {
+      position: 'absolute',
+      top: '8px',
+      left: '8px',
+      display: 'flex',
+      gap: '6px',
+      alignItems: 'center',
+      zIndex: '4',
+      pointerEvents: 'auto',
+    });
+    thumbContainer.appendChild(topBadgeRail);
 
     // For violations/processing errors, show a placeholder instead of blank/broken media.
     if (usePlaceholderThumb) {
@@ -4534,15 +4636,58 @@
       }
     }
 
+    // Remix indicator
+    if (remixSource.isRemix) {
+      const remixHref = remixSource.sourceType === 'post' && remixSource.sourcePostId
+        ? `https://sora.chatgpt.com/p/${encodeURIComponent(remixSource.sourcePostId)}`
+        : remixSource.sourceType === 'draft' && remixSource.sourceDraftId
+          ? `https://sora.chatgpt.com/d/${encodeURIComponent(remixSource.sourceDraftId)}`
+          : '';
+      const remixBadge = document.createElement(remixHref ? 'a' : 'span');
+      remixBadge.className = 'uv-remix-badge';
+      remixBadge.innerHTML = REMIX_ICON_SVG;
+      Object.assign(remixBadge.style, {
+        minWidth: '24px',
+        height: '24px',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        borderRadius: '999px',
+        background: 'rgba(0,0,0,0.75)',
+        color: '#fff',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+        backdropFilter: 'blur(4px)',
+        WebkitBackdropFilter: 'blur(4px)',
+        textDecoration: 'none',
+        border: 'none',
+      });
+      if (remixHref) {
+        remixBadge.href = remixHref;
+        remixBadge.title = remixSource.sourceType === 'post'
+          ? 'Watch parent video'
+          : 'Watch seed video';
+        remixBadge.addEventListener('click', (e) => {
+          e.stopPropagation();
+        });
+      } else {
+        remixBadge.title = 'Parent/seed video unavailable';
+        remixBadge.setAttribute('aria-disabled', 'true');
+        remixBadge.style.opacity = '0.7';
+        remixBadge.style.cursor = 'not-allowed';
+        remixBadge.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+      }
+      topBadgeRail.appendChild(remixBadge);
+    }
+
     // NEW badge
     if (isNew) {
       const newBadge = document.createElement('div');
       newBadge.className = 'uv-new-badge';
       newBadge.textContent = 'NEW';
       Object.assign(newBadge.style, {
-        position: 'absolute',
-        top: '8px',
-        left: '8px',
         background: 'linear-gradient(135deg, #3b82f6, #8b5cf6)',
         color: '#fff',
         fontSize: '10px',
@@ -4553,7 +4698,11 @@
         letterSpacing: '0.5px',
         boxShadow: '0 2px 8px rgba(59,130,246,0.5)',
       });
-      thumbContainer.appendChild(newBadge);
+      topBadgeRail.appendChild(newBadge);
+    }
+
+    if (topBadgeRail.childElementCount === 0) {
+      topBadgeRail.style.display = 'none';
     }
 
     let bookmarkIndicator = null;

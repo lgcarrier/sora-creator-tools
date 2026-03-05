@@ -41,6 +41,22 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 - **Best Posting Time Cue**: Marks cards posted near recurring high-performing windows based on gathered history.
 - **Quick Feed Filters**: One-click age filters (`<3h` ... `<21h`) plus a **No Remixes** filter.
 
+### Video Overlay
+
+- Adds remix awareness directly in overlays on Explore cards, profile cards, and post/draft detail pages.
+- For remix items, overlays show an icon-only **remix indicator pill** as the first badge.
+- Remix pill click behavior:
+  - Source post: `/p/<id>` via "Watch parent/seed video" tooltip.
+  - Source draft: `/d/<id>` via "Watch seed video" tooltip.
+  - Missing/unknown source: pill is shown disabled with "Parent/seed video unavailable".
+- All overlay pills (where available) are:
+  - `👀 X` unique views (with "Total Views" and "Views Per Person" in tooltip)
+  - `X% IR` interaction ratio (likes + comments relative to unique views)
+  - `X% RR` remixes relative to likes
+  - Age/heat token (`⏳` style age or hotness emoji + age string)
+  - Duration (eg `10s`) with inferred model tooltip (`10s Sora 2 video` / `10s Sora 2 Pro video`)
+  - Loading placeholder (`Loading...`) while post-detail metrics are being gathered
+
 ### Gather Mode
 
 - Available on Top feed and profile pages.

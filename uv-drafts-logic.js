@@ -467,6 +467,113 @@
     return `${base}/p/${encodeURIComponent(postId)}`;
   }
 
+  function normalizeDraftRemixPostId(value) {
+    if (value == null) return '';
+    const raw = String(value).trim();
+    if (!raw) return '';
+    if (/^s_[A-Za-z0-9_-]+$/i.test(raw)) return raw;
+    try {
+      const parsed = new URL(raw, 'https://sora.chatgpt.com');
+      const m = parsed.pathname.match(/\/p\/(s_[A-Za-z0-9_-]+)/i);
+      return m ? m[1] : '';
+    } catch {
+      const m = raw.match(/\/p\/(s_[A-Za-z0-9_-]+)/i);
+      return m ? m[1] : '';
+    }
+  }
+
+  function normalizeDraftRemixDraftId(value) {
+    if (value == null) return '';
+    const raw = String(value).trim();
+    if (!raw) return '';
+    try {
+      const parsed = new URL(raw, 'https://sora.chatgpt.com');
+      const m = parsed.pathname.match(/\/d\/([A-Za-z0-9_-]+)/i);
+      if (m) return m[1];
+    } catch {
+      const m = raw.match(/\/d\/([A-Za-z0-9_-]+)/i);
+      if (m) return m[1];
+    }
+    if (/^[A-Za-z0-9_-]+$/i.test(raw)) return raw;
+    return '';
+  }
+
+  function getDraftRemixSource(draft) {
+    const data = draft && typeof draft === 'object' ? draft : {};
+    const creationConfig = data.creation_config && typeof data.creation_config === 'object'
+      ? data.creation_config
+      : {};
+
+    const postSourceCandidates = [
+      data.remix_target_post_id,
+      creationConfig?.remix_target_post?.id,
+      creationConfig?.remix_target_post?.post?.id,
+      data.source_post_id,
+      creationConfig?.source_post_id,
+    ];
+    for (const candidate of postSourceCandidates) {
+      const sourcePostId = normalizeDraftRemixPostId(candidate);
+      if (!sourcePostId) continue;
+      return {
+        isRemix: true,
+        sourceType: 'post',
+        sourceId: sourcePostId,
+        sourcePostId,
+        sourceDraftId: '',
+      };
+    }
+
+    const draftSourceCandidates = [
+      data.remix_target_draft_id,
+      creationConfig?.remix_target_draft?.id,
+      creationConfig?.remix_target_draft?.draft?.id,
+      creationConfig?.source_draft_id,
+      data.source_draft_id,
+    ];
+    for (const candidate of draftSourceCandidates) {
+      const sourceDraftId = normalizeDraftRemixDraftId(candidate);
+      if (!sourceDraftId) continue;
+      return {
+        isRemix: true,
+        sourceType: 'draft',
+        sourceId: sourceDraftId,
+        sourcePostId: '',
+        sourceDraftId,
+      };
+    }
+
+    const remixSignalCandidates = [
+      data.is_remix,
+      creationConfig?.is_remix,
+      creationConfig?.mode,
+      data.remix_target_post_id,
+      data.remix_target_draft_id,
+      data.source_post_id,
+      data.source_draft_id,
+      creationConfig?.remix_target_post,
+      creationConfig?.remix_target_draft,
+      creationConfig?.source_post_id,
+      creationConfig?.source_draft_id,
+    ];
+    const isRemix = remixSignalCandidates.some((value) => {
+      if (value === true) return true;
+      if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        return normalized === 'remix' || normalized === 'true';
+      }
+      if (value && typeof value === 'object') return true;
+      return false;
+    });
+
+    return {
+      isRemix,
+      sourceType: '',
+      sourceId: '',
+      sourcePostId: '',
+      sourceDraftId: '',
+    };
+  }
+
   function canTrimDraft(draft) {
     const data = draft || {};
     if (!data.id) return false;
@@ -1001,6 +1108,7 @@
     clampGensCount,
     isDraftAlwaysOld,
     isDraftUnread,
+    getDraftRemixSource,
     looksLikePendingV2Task,
     flattenPendingV2Payload,
     getDroppedIds,
