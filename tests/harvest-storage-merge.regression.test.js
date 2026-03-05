@@ -124,3 +124,23 @@ test('mergeHarvestRecord keeps existing non-empty metadata when incoming is empt
   assert.equal(merged.title, 'existing title');
   assert.deepEqual(Array.from(merged.cast_names), ['alice']);
 });
+
+test('mergeHarvestRecord carries owner identity fields when incoming fills missing values', () => {
+  const mergeHarvestRecord = buildMergeHarness();
+  const merged = mergeHarvestRecord(
+    {
+      id: 's_1',
+      kind: 'published',
+      user_handle: '',
+      user_id: null,
+    },
+    {
+      id: 's_1',
+      kind: 'published',
+      user_handle: 'alice',
+      user_id: 42,
+    }
+  );
+  assert.equal(merged.user_handle, 'alice');
+  assert.equal(merged.user_id, 42);
+});

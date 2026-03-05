@@ -193,6 +193,11 @@
     const source = normalizeHarvestSource(raw.source);
     if (source) item.source = source;
 
+    const userHandle = sanitizeString(raw.user_handle, MAX_HANDLE_LEN);
+    if (userHandle) item.user_handle = userHandle;
+    const userId = sanitizeUserId(raw.user_id);
+    if (userId != null) item.user_id = userId;
+
     const detailUrl = sanitizeString(raw.detail_url, MAX_URL_LEN);
     if (detailUrl) item.detail_url = detailUrl;
 
