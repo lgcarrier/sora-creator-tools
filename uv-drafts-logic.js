@@ -5,7 +5,6 @@
   'use strict';
 
   const VIEW_FILTER_VALUES = new Set(['all', 'bookmarked', 'hidden', 'violations', 'new', 'unsynced']);
-  const VIEW_SORT_VALUES = new Set(['newest', 'oldest']);
   const COMPOSER_SOURCE_REQUIRED_MODES = new Set(['remix', 'extend']);
   const GENS_COUNT_MIN = 1;
   const GENS_COUNT_MAX_DEFAULT = 10;
@@ -18,6 +17,7 @@
     'enqueued',
     'running',
     'processing',
+    'preprocessing',
     'in_progress',
     'in-progress',
     'starting',
@@ -48,7 +48,6 @@
   ]);
   const DEFAULT_VIEW_STATE = Object.freeze({
     filterState: 'all',
-    sortState: 'newest',
     workspaceFilter: null,
     searchQuery: '',
   });
@@ -310,6 +309,24 @@
         const taskPrompt = typeof task.prompt === 'string' ? task.prompt : '';
         const taskStatus = normalizePendingStatus(task.status);
         const generations = Array.isArray(task.generations) ? task.generations : [];
+
+        // Early stages (preprocessing, queued, etc.) have empty generations — use task itself
+        if (generations.length === 0) {
+          if (!taskId) continue;
+          const copy = { ...task, id: taskId };
+          copy.task_id = taskId;
+          if (!copy.prompt && taskPrompt) copy.prompt = taskPrompt;
+          const baseCreationConfig = copy.creation_config && typeof copy.creation_config === 'object'
+            ? { ...copy.creation_config }
+            : {};
+          if (!baseCreationConfig.prompt && taskPrompt) baseCreationConfig.prompt = taskPrompt;
+          copy.creation_config = baseCreationConfig;
+          copy.pending_status = taskStatus;
+          copy.pending_task_status = taskStatus;
+          copy.is_pending = true;
+          out.push(copy);
+          continue;
+        }
 
         for (let i = 0; i < generations.length; i += 1) {
           const generation = generations[i];
@@ -677,8 +694,8 @@
     assignTrimmed('prompt');
     assignTrimmed('model');
     assignTrimmed('orientation');
-    assignTrimmed('resolution');
-    assignTrimmed('style');
+    assignTrimmed('size');
+    assignTrimmed('style_id');
     assignTrimmed('mode');
 
     if (typeof overrides.seed === 'string') {
@@ -737,19 +754,19 @@
         changed = true;
       }
 
-      if (normalized.resolution) {
-        if (obj.resolution !== normalized.resolution) {
-          obj.resolution = normalized.resolution;
+      if (normalized.size) {
+        if (obj.size !== normalized.size) {
+          obj.size = normalized.size;
           changed = true;
         }
-        if (creationConfig.resolution !== normalized.resolution) {
-          creationConfig.resolution = normalized.resolution;
+        if (creationConfig.size !== normalized.size) {
+          creationConfig.size = normalized.size;
           changed = true;
         }
       }
 
-      if (normalized.style && creationConfig.style !== normalized.style) {
-        creationConfig.style = normalized.style;
+      if (normalized.style_id && creationConfig.style_id !== normalized.style_id) {
+        creationConfig.style_id = normalized.style_id;
         changed = true;
       }
 
@@ -1016,7 +1033,6 @@
   function normalizeViewState(raw) {
     const out = {
       filterState: DEFAULT_VIEW_STATE.filterState,
-      sortState: DEFAULT_VIEW_STATE.sortState,
       workspaceFilter: DEFAULT_VIEW_STATE.workspaceFilter,
       searchQuery: DEFAULT_VIEW_STATE.searchQuery,
     };
@@ -1024,17 +1040,6 @@
 
     if (typeof raw.filterState === 'string' && VIEW_FILTER_VALUES.has(raw.filterState)) {
       out.filterState = raw.filterState;
-    }
-
-    if (typeof raw.sortState === 'string') {
-      const normalizedRawSortState = raw.sortState.trim().toLowerCase();
-      const legacyMappedSortState =
-        normalizedRawSortState === 'api' || normalizedRawSortState === 'duration'
-          ? 'newest'
-          : normalizedRawSortState;
-      if (VIEW_SORT_VALUES.has(legacyMappedSortState)) {
-        out.sortState = legacyMappedSortState;
-      }
     }
 
     if (typeof raw.workspaceFilter === 'string' && raw.workspaceFilter.trim()) {
@@ -1061,7 +1066,7 @@
       const id = toDraftId(draft && draft.id);
       if (!id) continue;
       if (draft && draft.hidden) hidden += 1;
-      if (isDraftUnread(draft) && !justSeen.has(id)) newCount += 1;
+      if (draft && draft.is_unsynced !== true && isDraftUnread(draft) && !justSeen.has(id)) newCount += 1;
       if (bookmarks.has(id)) bookmarked += 1;
     }
 

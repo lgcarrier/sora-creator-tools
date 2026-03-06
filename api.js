@@ -296,28 +296,28 @@
   const getSoraSettings = (menuEl) => {
     const modelText = getSettingsValueText('Model', menuEl) || '';
     const resolutionText = getSettingsValueText('Resolution', menuEl) || '';
-    const model = /sora\s*2\s*pro/i.test(modelText) ? 'sora2pro' : /sora\s*2/i.test(modelText) ? 'sora2' : null;
-    const resolution = /high/i.test(resolutionText) ? 'high' : /standard/i.test(resolutionText) ? 'standard' : null;
-    return { model, resolution };
+    const model = /sora\s*2\s*pro/i.test(modelText) ? 'sy_ore' : /sora\s*2/i.test(modelText) ? 'sy_8' : null;
+    const size = /high/i.test(resolutionText) ? 'large' : /standard/i.test(resolutionText) ? 'small' : null;
+    return { model, size };
   };
 
   const getGenCost = (seconds, settings) => {
     const s = Number(seconds);
     if (!Number.isFinite(s)) return null;
     const model = settings?.model || null;
-    const resolution = settings?.resolution || null;
+    const size = settings?.size || null;
 
-    if (model === 'sora2') {
+    if (model === 'sy_8') {
       const costs = { 5: 1, 10: 1, 15: 2, 25: 3 };
       return costs[s] ?? null;
     }
 
-    if (model === 'sora2pro') {
-      if (resolution === 'high') {
+    if (model === 'sy_ore') {
+      if (size === 'large') {
         const costs = { 5: 5, 10: 5, 15: 10, 25: null };
         return costs[s] ?? null;
       }
-      // Default to Standard if not present/unknown.
+      // Default to small (Standard) if not present/unknown.
       const costs = { 5: 2, 10: 2, 15: 4, 25: 12 };
       return costs[s] ?? null;
     }
@@ -330,9 +330,8 @@
 
   const shouldOffer25s = (settings) => {
     if (planIsFree === true) return false;
-    // 25s is not available for Sora 2 Pro when Resolution is High.
-    // Allow when Sora 2 Pro + Standard (or unknown) and for Sora 2.
-    return !(settings?.model === 'sora2pro' && settings?.resolution === 'high');
+    // 25s is not available for Sora 2 Pro when size is large (High resolution).
+    return !(settings?.model === 'sy_ore' && settings?.size === 'large');
   };
 
   function ensureVideoGensWarning(seconds) {
@@ -1113,6 +1112,11 @@
       } catch {}
       const method = (init && init.method) || (typeof input === 'object' && input?.method) || 'GET';
       const isCreate = typeof url === 'string' && NF_CREATE_RE.test(url) && String(method).toUpperCase() === 'POST';
+
+      // Skip interceptor for direct composer API calls
+      if (init?.__sctDirect) {
+        return origFetch.call(this, input, init);
+      }
 
       // Draft remix task tracking (used by inject.js to enable correct redo behavior later).
       const sourceDraftId = isCreate && isRemixRoute() ? getDraftIdFromDraftRoute() : null;

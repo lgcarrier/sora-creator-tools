@@ -7755,7 +7755,7 @@ async function renderAnalyzeTable(force = false) {
       let pendingBatchRequest = null;
       try {
         const url = typeof input === 'string' ? input : input?.url || '';
-        if (NF_CREATE_RE.test(url) || NF_BULK_CREATE_RE.test(url)) {
+        if ((NF_CREATE_RE.test(url) || NF_BULK_CREATE_RE.test(url)) && !init?.__sctDirect) {
           const isBulkCreateRequest = NF_BULK_CREATE_RE.test(url);
           const onNativeDraftsRoute = /^\/drafts(?:\/|$)/i.test(String(location.pathname || ''));
           const batchState = loadPendingCreateBatchState();
@@ -7899,7 +7899,7 @@ async function renderAnalyzeTable(force = false) {
         if (skipDraftDetailProcessing) return res;
 
         // Intercept /backend/nf/create to capture task_id -> source draft mapping for draft remixes
-        if (NF_CREATE_RE.test(url)) {
+        if (NF_CREATE_RE.test(url) && !init?.__sctDirect) {
           // Only capture if we're on a draft remix page (/d/{genId}?remix=)
           const draftRemixMatch = location.pathname.match(/^\/d\/([A-Za-z0-9_-]+)/i);
           if (draftRemixMatch && location.search.includes('remix')) {
