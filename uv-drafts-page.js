@@ -4,6 +4,89 @@
 (function initSoraUVDraftsPageModule(globalScope) {
   'use strict';
 
+  function getComposerModelFamily(value) {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (!normalized) return '';
+    if (normalized === 'sora2pro' || normalized === 'sy_ore' || normalized.startsWith('sy_ore_')) return 'sy_ore';
+    if (normalized === 'sora2' || normalized === 'sy_8' || normalized.startsWith('sy_8_')) return 'sy_8';
+    return '';
+  }
+
+  function composerModelMatchesFamily(model, family) {
+    if (!model || typeof model !== 'object' || !family) return false;
+    if (getComposerModelFamily(model.value) === family) return true;
+    const label = typeof model.label === 'string' ? model.label : '';
+    if (family === 'sy_ore') return /sora\s*2\s*pro/i.test(label);
+    if (family === 'sy_8') return /sora\s*2(?!\s*pro)/i.test(label);
+    return false;
+  }
+
+  function resolveComposerModelValue(models, value) {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    if (!normalized) return '';
+    const available = Array.isArray(models) ? models : [];
+    if (available.some((model) => model?.value === normalized)) return normalized;
+    const family = getComposerModelFamily(normalized);
+    if (!family) return '';
+    return available.find((model) => composerModelMatchesFamily(model, family))?.value || '';
+  }
+
+  function buildPublicPostPayload(generationId, postText) {
+    const id = typeof generationId === 'string' ? generationId.trim() : '';
+    if (!id) throw new Error('Missing draft ID');
+    return {
+      post_text: typeof postText === 'string' ? postText : '',
+      attachments_to_create: [
+        {
+          kind: 'sora',
+          generation_id: id,
+        },
+      ],
+      destinations: [{ type: 'public' }],
+    };
+  }
+
+  function extractPublishedPost(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const candidates = [
+      payload.post,
+      payload.item?.post,
+      payload.data?.post,
+      Array.isArray(payload.items) ? payload.items[0]?.post || payload.items[0] : null,
+    ];
+    for (const candidate of candidates) {
+      if (candidate && typeof candidate === 'object') return candidate;
+    }
+    if (payload.id || payload.permalink || payload.visibility || payload.post_text != null) return payload;
+    return null;
+  }
+
+  function applyPublishedPostToDraftData(draft, publishedPost) {
+    if (!draft || typeof draft !== 'object') return draft;
+    const next = draft;
+    const post = publishedPost && typeof publishedPost === 'object' ? publishedPost : {};
+    const postId = post.id || next.post_id || next.post_meta?.id || null;
+    const permalink = post.permalink || next.post_permalink || next.post_meta?.permalink || null;
+    next.post_id = postId;
+    next.post_permalink = permalink;
+    next.post_visibility = 'public';
+    next.posted_to_public = true;
+    next.post_meta = {
+      ...(next.post_meta && typeof next.post_meta === 'object' ? next.post_meta : {}),
+      id: postId,
+      permalink,
+      visibility: 'public',
+      posted_to_public: true,
+      share_ref: post.share_ref ?? next.post_meta?.share_ref ?? null,
+      share_setting: post.permissions?.share_setting ?? post.share_setting ?? next.post_meta?.share_setting ?? null,
+    };
+    delete next.scheduled_post_id;
+    delete next.scheduled_post_at;
+    delete next.scheduled_post_status;
+    delete next.scheduled_post_caption;
+    return next;
+  }
+
   function createSoraUVDraftsPageModule(deps = {}) {
     let capturedAuthToken = null;
     let modelOverride = null;
@@ -27,8 +110,8 @@
       }
     })();
     const COMPOSER_MODELS = [
-      { value: 'sora2', label: 'Sora 2' },
-      { value: 'sora2pro', label: 'Sora 2 Pro' },
+      { value: 'sy_8', label: 'Sora 2' },
+      { value: 'sy_ore', label: 'Sora 2 Pro' },
     ];
     let composerModels = COMPOSER_MODELS.slice();
     let composerModelValues = new Set(composerModels.map((item) => item.value));
@@ -43,6 +126,8 @@
     // Cameo state for composer
     let composerCameoIds = [];
     let composerCameoReplacements = {};
+    let composerCameoUsernames = {};
+    let composerSourceCameoIds = new Set();
 
     // Sentinel SDK state
     let sentinelInitialized = false;
@@ -164,8 +249,7 @@
     }
 
     function normalizeComposerModel(value) {
-      const normalized = typeof value === 'string' ? value.trim() : '';
-      return composerModelValues.has(normalized) ? normalized : '';
+      return resolveComposerModelValue(composerModels, value);
     }
 
     function getDefaultComposerModel() {
@@ -828,6 +912,10 @@
       // Note: bookmarked is stored separately in localStorage via BOOKMARKS_KEY
       hidden: existingData.hidden ?? false,
       workspace_id: existingData.workspace_id ?? uvDraftsPendingWorkspaceTags.get(apiDraft.task_id) ?? null,
+      scheduled_post_id: existingData.scheduled_post_id || null,
+      scheduled_post_at: Number(existingData.scheduled_post_at) > 0 ? Number(existingData.scheduled_post_at) : null,
+      scheduled_post_status: existingData.scheduled_post_status || null,
+      scheduled_post_caption: typeof existingData.scheduled_post_caption === 'string' ? existingData.scheduled_post_caption : '',
       is_unsynced: fromDraftsApi ? false : existingData?.is_unsynced === true,
       cached_at: Date.now(),
       last_fetched: Date.now()
@@ -1355,7 +1443,6 @@
       orientation: 'portrait',
       size: 'small',
       style_id: '',
-      seed: '',
     };
   }
 
@@ -1390,7 +1477,6 @@
       out.size = raw.size;
     }
     if (typeof raw.style_id === 'string') out.style_id = raw.style_id;
-    if (typeof raw.seed === 'string') out.seed = raw.seed.replace(/[^\d]/g, '').slice(0, 10);
     return out;
   }
 
@@ -1468,10 +1554,6 @@
     takeString('orientation');
     takeString('size');
     takeString('style_id');
-    if (typeof overrides.seed === 'string') {
-      const seed = overrides.seed.replace(/[^\d]/g, '').slice(0, 10);
-      if (seed) normalized.seed = seed;
-    }
     if (!Object.keys(normalized).length) return bodyString;
 
     const applyOverrides = (obj) => {
@@ -1526,13 +1608,6 @@
       if (normalized.style_id) {
         if (obj.creation_config.style_id !== normalized.style_id) {
           obj.creation_config.style_id = normalized.style_id;
-          changed = true;
-        }
-      }
-
-      if (normalized.seed) {
-        if (obj.creation_config.seed !== normalized.seed) {
-          obj.creation_config.seed = normalized.seed;
           changed = true;
         }
       }
@@ -2427,10 +2502,13 @@
       }
     }
     if (statusEl) {
-      statusEl.textContent = nextSource
-        ? 'Source ready. Use Remix or Extend.'
-        : 'No source selected. Use Create, or drop a draft card for Remix/Extend.';
-      statusEl.dataset.tone = nextSource ? 'ok' : '';
+      if (nextSource) {
+        statusEl.textContent = 'Source ready. Use Remix or Extend.';
+        statusEl.dataset.tone = 'ok';
+      } else {
+        statusEl.textContent = '';
+        delete statusEl.dataset.tone;
+      }
     }
   }
 
@@ -2491,6 +2569,160 @@
     return token;
   }
 
+  function setComposerStatus(text, tone = '') {
+    const statusEl = uvDraftsComposerEl?.querySelector?.('[data-uvd-compose-status="1"]');
+    if (!statusEl) return;
+    statusEl.textContent = typeof text === 'string' ? text : '';
+    if (tone) statusEl.dataset.tone = tone;
+    else delete statusEl.dataset.tone;
+  }
+
+  function normalizeCameoUsername(value) {
+    return typeof value === 'string' ? value.trim().replace(/^@/, '') : '';
+  }
+
+  function rememberComposerCameoIdentity(userId, username = '') {
+    const id = typeof userId === 'string' ? userId.trim() : '';
+    const normalizedUsername = normalizeCameoUsername(username);
+    if (!id || !normalizedUsername) return;
+    composerCameoUsernames[id] = normalizedUsername;
+  }
+
+  function getComposerCameoLabel(userId) {
+    const id = typeof userId === 'string' ? userId.trim() : '';
+    if (!id) return '';
+    const username = composerCameoUsernames[id];
+    return username ? `@${username}` : id;
+  }
+
+  function getComposerCameoPromptValue(userId) {
+    const id = typeof userId === 'string' ? userId.trim() : '';
+    if (!id) return '';
+    const username = composerCameoUsernames[id];
+    return username ? `@${username}` : id;
+  }
+
+  async function resolveComposerCameoInput(rawInput) {
+    const trimmed = typeof rawInput === 'string' ? rawInput.trim() : '';
+    if (!trimmed) throw new Error('Enter a cameo username or user ID.');
+    const directId = trimmed.replace(/^@/, '');
+    if (/^(user-|ch_)/i.test(directId)) {
+      return { userId: directId, username: composerCameoUsernames[directId] || '' };
+    }
+    if (!capturedAuthToken) {
+      throw new Error('Browse Sora first so cameo username lookup can authenticate.');
+    }
+
+    const username = normalizeCameoUsername(trimmed);
+    const params = new URLSearchParams({
+      username,
+      intent: 'cameo',
+      limit: '10',
+    });
+    const res = await fetch(`https://sora.chatgpt.com/backend/project_y/profile/search_mentions?${params.toString()}`, {
+      headers: { Authorization: capturedAuthToken },
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      throw new Error(`Cameo lookup failed (HTTP ${res.status}).`);
+    }
+    const json = await res.json();
+    const items = Array.isArray(json?.items) ? json.items : [];
+    const normalizedNeedle = username.toLowerCase();
+    const picked = items.find((item) => normalizeCameoUsername(item?.profile?.username).toLowerCase() === normalizedNeedle) || items[0];
+    const userId = picked?.profile?.user_id || picked?.profile?.id || picked?.user_id || '';
+    const foundUsername = normalizeCameoUsername(picked?.profile?.username || picked?.username || username);
+    if (!userId) {
+      throw new Error(`No cameo match found for @${username}.`);
+    }
+    return { userId: String(userId).trim(), username: foundUsername };
+  }
+
+  function buildPendingRingMarkup(progressPct) {
+    const pct = Number(progressPct);
+    const pctNorm = Number.isFinite(pct) && pct > 0 ? Math.min(pct, 100) : 0;
+    const indeterminate = pctNorm === 0;
+    const radius = 22;
+    const circumference = 2 * Math.PI * radius;
+    const dashArray = indeterminate
+      ? `${circumference * 0.25} ${circumference * 0.75}`
+      : `${circumference}`;
+    const dashOffset = indeterminate
+      ? circumference * 0.125
+      : circumference - (pctNorm / 100) * circumference;
+    const spinner = indeterminate
+      ? '<animateTransform attributeName="transform" type="rotate" from="0 28 28" to="360 28 28" dur="1.4s" repeatCount="indefinite" />'
+      : '';
+    const text = pctNorm > 0 ? `${Math.round(pctNorm)}%` : '';
+    return `<svg width="56" height="56" viewBox="0 0 56 56">
+      <circle cx="28" cy="28" r="${radius}" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="3"/>
+      <g data-pending-ring-spinner="1">
+        <circle data-pending-ring-progress="1" cx="28" cy="28" r="${radius}" fill="none" stroke="#89b6ff" stroke-width="3"
+          stroke-linecap="round" stroke-dasharray="${dashArray}" stroke-dashoffset="${dashOffset}"
+          transform="rotate(-90 28 28)" style="transition:stroke-dashoffset 0.6s ease;"/>
+        ${spinner}
+      </g>
+      <text x="28" y="28" dy="0.35em" text-anchor="middle"
+        fill="#89b6ff" font-size="13" font-weight="600" font-family="system-ui,sans-serif">${text}</text>
+    </svg>`;
+  }
+
+  async function createPublicPostForDraft(draft, caption) {
+    if (!draft?.id) throw new Error('Missing draft ID');
+    if (!capturedAuthToken) throw new Error('Not authenticated. Browse Sora first to capture auth token.');
+    const sentinel = await getSentinelToken();
+    const headers = {
+      Authorization: capturedAuthToken,
+      'Content-Type': 'application/json',
+      'openai-sentinel-token': sentinel,
+    };
+    const res = await fetch('https://sora.chatgpt.com/backend/project_y/post', {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify(buildPublicPostPayload(draft.id, caption)),
+      __sctDirect: true,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) {
+      const detail = json?.error || json?.detail || json?.message || `HTTP ${res.status}`;
+      throw new Error(detail);
+    }
+    return extractPublishedPost(json);
+  }
+
+  async function deleteScheduledPostsForDraft(draftId) {
+    const id = typeof draftId === 'string' ? draftId.trim() : '';
+    if (!id) return;
+    const scheduledPosts = await uvDBGetAll(UV_DRAFTS_STORES.scheduledPosts);
+    for (const scheduledPost of scheduledPosts) {
+      if (scheduledPost?.draft_id === id) {
+        await uvDBDelete(UV_DRAFTS_STORES.scheduledPosts, scheduledPost.id);
+      }
+    }
+  }
+
+  async function persistDraftRecord(draft) {
+    if (!draft?.id) return;
+    await uvDBPut(UV_DRAFTS_STORES.drafts, draft);
+  }
+
+  async function setDraftScheduledState(draft, scheduledPost = null) {
+    if (!draft || typeof draft !== 'object') return;
+    if (scheduledPost && typeof scheduledPost === 'object') {
+      draft.scheduled_post_id = scheduledPost.id || draft.scheduled_post_id || null;
+      draft.scheduled_post_at = Number(scheduledPost.scheduled_at) > 0 ? Number(scheduledPost.scheduled_at) : null;
+      draft.scheduled_post_status = typeof scheduledPost.status === 'string' ? scheduledPost.status : 'pending';
+      draft.scheduled_post_caption = typeof scheduledPost.caption === 'string' ? scheduledPost.caption : '';
+    } else {
+      delete draft.scheduled_post_id;
+      delete draft.scheduled_post_at;
+      delete draft.scheduled_post_status;
+      delete draft.scheduled_post_caption;
+    }
+    await persistDraftRecord(draft);
+  }
+
   // ---- API: Fetch models & styles ----
 
   async function fetchComposerModels() {
@@ -2528,12 +2760,19 @@
     if (!uvDraftsComposerEl) return;
     const sel = uvDraftsComposerEl.querySelector('[data-uvd-compose-model="1"]');
     if (!sel) return;
-    const current = sel.value;
+    const preferredValue =
+      normalizeComposerModel(uvDraftsComposerState?.model) ||
+      normalizeComposerModel(modelOverride) ||
+      normalizeComposerModel(sel.value);
     sel.innerHTML = composerModels.map(m =>
       `<option value="${escapeHtml(m.value)}">${escapeHtml(m.label)}</option>`
     ).join('');
-    if (composerModelValues.has(current)) sel.value = current;
-    else sel.value = composerModels[0]?.value || '';
+    sel.value = preferredValue || composerModels[0]?.value || '';
+    if (uvDraftsComposerState) {
+      uvDraftsComposerState.model = sel.value || getDefaultComposerModel();
+      persistUVDraftsComposerState();
+    }
+    if (sel.value) modelOverride = sel.value;
   }
 
   function refreshComposerStyleSelect() {
@@ -2574,12 +2813,13 @@
     if (!listEl) return;
     listEl.innerHTML = '';
     composerCameoIds.forEach((userId, idx) => {
+      const canSwap = !!uvDraftsComposerSource && composerSourceCameoIds.has(userId);
       const chip = document.createElement('div');
       chip.className = 'uvd-cameo-chip';
       const replacement = composerCameoReplacements[userId];
       const labelEl = document.createElement('span');
       labelEl.className = 'uvd-cameo-label';
-      labelEl.textContent = replacement ? `${userId} → ${replacement}` : userId;
+      labelEl.textContent = replacement ? `${getComposerCameoLabel(userId)} → ${getComposerCameoLabel(replacement)}` : getComposerCameoLabel(userId);
       const swapBtn = document.createElement('button');
       swapBtn.type = 'button';
       swapBtn.className = 'uvd-cameo-swap';
@@ -2590,20 +2830,41 @@
       removeBtn.className = 'uvd-cameo-remove';
       removeBtn.title = 'Remove cameo';
       removeBtn.textContent = '×';
-      chip.append(labelEl, swapBtn, removeBtn);
+      chip.append(labelEl);
+      if (canSwap) chip.append(swapBtn);
+      chip.append(removeBtn);
       removeBtn.addEventListener('click', () => {
         composerCameoIds.splice(idx, 1);
         delete composerCameoReplacements[userId];
+        delete composerCameoUsernames[userId];
+        composerSourceCameoIds.delete(userId);
         renderCameoList();
       });
-      swapBtn.addEventListener('click', () => {
-        const newId = globalScope.prompt('Replace with user ID:', composerCameoReplacements[userId] || '');
-        if (newId && newId.trim()) {
-          composerCameoReplacements[userId] = newId.trim();
-        } else if (newId === '') {
+      swapBtn.addEventListener('click', async () => {
+        const input = globalScope.prompt(
+          'Replace with username or user ID:',
+          getComposerCameoPromptValue(composerCameoReplacements[userId] || '')
+        );
+        if (input === null) return;
+        if (input.trim() === '') {
           delete composerCameoReplacements[userId];
+          renderCameoList();
+          setComposerStatus(`Removed replacement for ${getComposerCameoLabel(userId)}.`, 'ok');
+          return;
         }
-        renderCameoList();
+        try {
+          swapBtn.disabled = true;
+          setComposerStatus(`Looking up ${input.trim()}...`);
+          const resolved = await resolveComposerCameoInput(input);
+          composerCameoReplacements[userId] = resolved.userId;
+          rememberComposerCameoIdentity(resolved.userId, resolved.username);
+          renderCameoList();
+          setComposerStatus(`Replacement set to ${getComposerCameoLabel(resolved.userId)}.`, 'ok');
+        } catch (err) {
+          setComposerStatus(err?.message || 'Failed to resolve cameo username.', 'error');
+        } finally {
+          swapBtn.disabled = false;
+        }
       });
       listEl.appendChild(chip);
     });
@@ -2612,14 +2873,22 @@
   function populateCameosFromSource(source) {
     composerCameoIds = [];
     composerCameoReplacements = {};
+    composerSourceCameoIds = new Set();
     if (source?.cameo_profiles && Array.isArray(source.cameo_profiles)) {
       for (const cp of source.cameo_profiles) {
         const rawId = typeof cp === 'string'
           ? cp
-          : cp?.user_id || cp?.id || cp?.username || cp?.handle || cp?.name || cp?.user?.id || cp?.user?.username || cp?.user?.handle || '';
+          : cp?.user_id || cp?.id || cp?.user?.id || cp?.username || cp?.handle || cp?.name || cp?.user?.username || cp?.user?.handle || '';
         const userId = String(rawId || '').trim().replace(/^@/, '');
+        const username = normalizeCameoUsername(
+          typeof cp === 'string'
+            ? ''
+            : cp?.username || cp?.handle || cp?.name || cp?.user?.username || cp?.user?.handle || ''
+        );
+        rememberComposerCameoIdentity(userId, username);
         if (userId && !composerCameoIds.includes(userId)) {
           composerCameoIds.push(userId);
+          composerSourceCameoIds.add(userId);
         }
       }
     }
@@ -2634,7 +2903,6 @@
     persistUVDraftsComposerState();
 
     const prompt = state.prompt.trim();
-    const seed = state.seed.trim();
     const source = uvDraftsComposerSource;
 
     const setStatus = (text, tone = 'info') => {
@@ -2679,9 +2947,6 @@
 
     // Style
     if (state.style_id) body.style_id = state.style_id;
-
-    // Seed
-    if (seed) body.seed = Number(seed);
 
     // Cameos
     if (composerCameoIds.length) body.cameo_ids = [...composerCameoIds];
@@ -2802,12 +3067,12 @@
     composer.innerHTML = `
       <div class="uvd-composer-head">
         <h2>Compose</h2>
-        <p>Create from prompt, or drop a draft card to remix or extend.</p>
+        <p></p>
       </div>
       <div class="uvd-dropzone" data-uvd-dropzone="1">
         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:.45"><rect x="2" y="2" width="20" height="20" rx="2"/><polygon points="10,8 16,12 10,16"/></svg>
-        <strong>Drop Source Video</strong>
-        <span>Drag a draft card here to remix or extend</span>
+        <strong>Drag Draft Here</strong>
+        <span>Drag and drop a draft to remix or extend</span>
       </div>
       <div class="uvd-compose-source-card" data-uvd-compose-source-panel="1" hidden>
         <div class="uvd-compose-source-preview" data-uvd-compose-source-preview="1"></div>
@@ -2817,7 +3082,7 @@
         </div>
         <button type="button" class="uvd-compose-source-clear" data-uvd-compose-source-clear="1">Remove</button>
       </div>
-      <div class="uvd-compose-source-empty" data-uvd-compose-source-empty="1">No source selected.</div>
+      <div class="uvd-compose-source-empty" data-uvd-compose-source-empty="1"></div>
       <div class="uvd-firstframe-zone" data-uvd-firstframe-zone="1">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:.45"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
         <strong>First Frame Image</strong>
@@ -2879,16 +3144,12 @@
             ${styleOptionsHtml}
           </select>
         </label>
-        <label class="uvd-field">
-          <span>Seed</span>
-          <input type="text" data-uvd-compose-seed="1" placeholder="optional seed" inputmode="numeric" />
-        </label>
       </div>
       <div class="uvd-cameo-section" data-uvd-cameo-section="1">
         <span class="uvd-field-label">Cameos</span>
         <div class="uvd-cameo-list" data-uvd-cameo-list="1"></div>
         <div class="uvd-cameo-add-row">
-          <input type="text" data-uvd-cameo-input="1" placeholder="user-xxx or @username" class="uvd-cameo-input" />
+          <input type="text" data-uvd-cameo-input="1" placeholder="@username or user-xxx" class="uvd-cameo-input" />
           <button type="button" data-uvd-cameo-add="1" class="uvd-cameo-add-btn">Add</button>
         </div>
       </div>
@@ -2908,7 +3169,6 @@
     const orientationEl = composer.querySelector('[data-uvd-compose-orientation="1"]');
     const sizeEl = composer.querySelector('[data-uvd-compose-size="1"]');
     const styleEl = composer.querySelector('[data-uvd-compose-style="1"]');
-    const seedEl = composer.querySelector('[data-uvd-compose-seed="1"]');
     const dropzone = composer.querySelector('[data-uvd-dropzone="1"]');
     const clearSourceBtn = composer.querySelector('[data-uvd-compose-source-clear="1"]');
 
@@ -2928,7 +3188,6 @@
         orientation: orientationEl.value,
         size: sizeEl.value,
         style_id: styleEl.value,
-        seed: seedEl.value,
       });
       persistUVDraftsComposerState();
       persistComposerGensCount(uvDraftsComposerState.gensCount);
@@ -2945,12 +3204,11 @@
     orientationEl.value = uvDraftsComposerState.orientation;
     sizeEl.value = uvDraftsComposerState.size;
     styleEl.value = uvDraftsComposerState.style_id;
-    seedEl.value = uvDraftsComposerState.seed;
     syncGensFieldLimits();
     persistUVDraftsComposerState();
     persistComposerGensCount(uvDraftsComposerState.gensCount);
 
-    [promptEl, modelEl, durationEl, gensEl, orientationEl, sizeEl, styleEl, seedEl].filter(Boolean).forEach((el) => {
+    [promptEl, modelEl, durationEl, gensEl, orientationEl, sizeEl, styleEl].filter(Boolean).forEach((el) => {
       el.addEventListener('input', syncStateFromFields);
       el.addEventListener('change', syncStateFromFields);
     });
@@ -2967,17 +3225,32 @@
     // Cameo add button
     const cameoInput = composer.querySelector('[data-uvd-cameo-input="1"]');
     const cameoAddBtn = composer.querySelector('[data-uvd-cameo-add="1"]');
-    const addCameoFromInput = () => {
-      const val = (cameoInput?.value || '').trim().replace(/^@/, '');
-      if (val && !composerCameoIds.includes(val)) {
-        composerCameoIds.push(val);
-        renderCameoList();
+    const addCameoFromInput = async () => {
+      const rawValue = cameoInput?.value || '';
+      if (!rawValue.trim()) return;
+      try {
+        if (cameoAddBtn) cameoAddBtn.disabled = true;
+        setComposerStatus(`Looking up ${rawValue.trim()}...`);
+        const resolved = await resolveComposerCameoInput(rawValue);
+        rememberComposerCameoIdentity(resolved.userId, resolved.username);
+        if (!composerCameoIds.includes(resolved.userId)) {
+          composerCameoIds.push(resolved.userId);
+          renderCameoList();
+        }
+        if (cameoInput) cameoInput.value = '';
+        setComposerStatus(`Added cameo ${getComposerCameoLabel(resolved.userId)}.`, 'ok');
+      } catch (err) {
+        setComposerStatus(err?.message || 'Failed to resolve cameo username.', 'error');
+      } finally {
+        if (cameoAddBtn) cameoAddBtn.disabled = false;
       }
-      if (cameoInput) cameoInput.value = '';
     };
-    cameoAddBtn?.addEventListener('click', addCameoFromInput);
+    cameoAddBtn?.addEventListener('click', () => { void addCameoFromInput(); });
     cameoInput?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); addCameoFromInput(); }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        void addCameoFromInput();
+      }
     });
 
     const setDropVisual = (active) => {
@@ -3585,25 +3858,10 @@
 
       const warningIcon = document.createElement('div');
       if (isPendingDraft) {
-        // Circular progress ring matching Sora's in-progress style
         const pctVal = Number(draft.progress_pct);
         const pctNorm = Number.isFinite(pctVal) && pctVal > 0 ? Math.min(pctVal, 100) : 0;
-        const indeterminate = pctNorm === 0;
-        const radius = 22;
-        const circumference = 2 * Math.PI * radius;
-        const offset = indeterminate
-          ? circumference * 0.75 // show a 25% arc for indeterminate spin
-          : circumference - (pctNorm / 100) * circumference;
         warningIcon.dataset.pendingRing = '1';
-        const spinStyle = indeterminate ? 'animation:uvd-ring-spin 1.4s linear infinite;transform-origin:28px 28px;' : '';
-        warningIcon.innerHTML = `<svg width="56" height="56" viewBox="0 0 56 56">
-          <circle cx="28" cy="28" r="${radius}" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="3"/>
-          <circle cx="28" cy="28" r="${radius}" fill="none" stroke="#89b6ff" stroke-width="3"
-            stroke-linecap="round" stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
-            transform="rotate(-90 28 28)" style="transition:stroke-dashoffset 0.6s ease;${spinStyle}"/>
-          <text x="28" y="28" dy="0.35em" text-anchor="middle"
-            fill="#89b6ff" font-size="13" font-weight="600" font-family="system-ui,sans-serif">${pctNorm > 0 ? Math.round(pctNorm) + '%' : ''}</text>
-        </svg>`;
+        warningIcon.innerHTML = buildPendingRingMarkup(pctNorm);
       } else {
         warningIcon.textContent = isProcessingError ? '⚙️' : '⚠️';
         warningIcon.style.fontSize = '48px';
@@ -4088,12 +4346,7 @@
         });
         if (res.ok) {
           await uvDBDelete(UV_DRAFTS_STORES.drafts, draft.id);
-          const scheduledPosts = await uvDBGetAll(UV_DRAFTS_STORES.scheduledPosts);
-          for (const scheduledPost of scheduledPosts) {
-            if (scheduledPost?.draft_id === draft.id) {
-              await uvDBDelete(UV_DRAFTS_STORES.scheduledPosts, scheduledPost.id);
-            }
-          }
+          await deleteScheduledPostsForDraft(draft.id);
           uvDraftsData = removeDraftById(uvDraftsData, draft.id);
           uvDraftsJustSeenIds.delete(draft.id);
           removeBookmark(draft.id);
@@ -4115,6 +4368,29 @@
     // Second row for post/schedule actions
     const actionsRow2 = document.createElement('div');
     actionsRow2.className = 'uvd-actions-row2';
+    const isDraftScheduled = () => String(draft?.scheduled_post_status || '').toLowerCase() === 'pending'
+      && Number(draft?.scheduled_post_at) > 0;
+
+    let scheduleBtn = null;
+    const syncScheduleButtonState = () => {
+      if (!scheduleBtn) return;
+      if (isDraftPubliclyPosted(draft)) {
+        scheduleBtn.textContent = 'Posted ✓';
+        scheduleBtn.disabled = true;
+        scheduleBtn.dataset.tone = 'success';
+        return;
+      }
+      if (isPendingDraft) {
+        scheduleBtn.textContent = 'Pending...';
+        scheduleBtn.disabled = true;
+        delete scheduleBtn.dataset.tone;
+        return;
+      }
+      scheduleBtn.textContent = isDraftScheduled() ? 'Scheduled' : 'Schedule';
+      scheduleBtn.disabled = false;
+      if (isDraftScheduled()) scheduleBtn.dataset.tone = 'info';
+      else delete scheduleBtn.dataset.tone;
+    };
 
     // Post button
     const postBtn = document.createElement('button');
@@ -4139,56 +4415,28 @@
       try {
         postBtn.textContent = 'Posting...';
         postBtn.disabled = true;
-
-        // Post the draft (this is a simplified version - actual API may differ)
-        const postHeaders = { 'Content-Type': 'application/json' };
-        if (capturedAuthToken) postHeaders['Authorization'] = capturedAuthToken;
-        const res = await fetch('https://sora.chatgpt.com/backend/project_y/posts', {
-          method: 'POST',
-          credentials: 'include',
-          headers: postHeaders,
-          body: JSON.stringify({
-            draft_id: draft.id,
-            caption: caption,
-            visibility: 'public'
-          })
-        });
-
-        if (res.ok) {
-          draft.post_visibility = 'public';
-          draft.posted_to_public = true;
-          draft.post_meta = {
-            ...(draft.post_meta || {}),
-            id: draft.post_id || draft.post_meta?.id || null,
-            visibility: 'public',
-            posted_to_public: true,
-            permalink: draft.post_permalink || draft.post_meta?.permalink || null,
-          };
-          await uvDBPut(UV_DRAFTS_STORES.drafts, draft);
-          postBtn.textContent = 'Posted ✓';
-          postBtn.dataset.tone = 'success';
-        } else {
-          postBtn.textContent = 'Post';
-          postBtn.disabled = false;
-          postBtn.dataset.tone = '';
-          alert('Failed to post draft. The API may have changed.');
-        }
+        const publishedPost = await createPublicPostForDraft(draft, caption);
+        await deleteScheduledPostsForDraft(draft.id);
+        applyPublishedPostToDraftData(draft, publishedPost);
+        await persistDraftRecord(draft);
+        postBtn.textContent = 'Posted ✓';
+        postBtn.dataset.tone = 'success';
+        syncScheduleButtonState();
       } catch (err) {
         console.error('[UV Drafts] Post error:', err);
         postBtn.textContent = 'Post';
         postBtn.disabled = false;
-        postBtn.dataset.tone = '';
-        alert('Failed to post draft');
+        delete postBtn.dataset.tone;
+        alert(`Failed to post draft${err?.message ? `: ${err.message}` : ''}`);
       }
     });
     actionsRow2.appendChild(postBtn);
 
     // Schedule button
-    const scheduleBtn = document.createElement('button');
+    scheduleBtn = document.createElement('button');
     scheduleBtn.className = 'uvd-action-pill';
     scheduleBtn.type = 'button';
-    scheduleBtn.textContent = '📅 Schedule';
-    scheduleBtn.disabled = isPendingDraft;
+    syncScheduleButtonState();
     scheduleBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (isDraftPubliclyPosted(draft)) {
@@ -4196,7 +4444,7 @@
         return;
       }
 
-      const dateStr = prompt('Schedule post for (YYYY-MM-DD HH:MM):',
+      const dateStr = prompt(`${isDraftScheduled() ? 'Reschedule' : 'Schedule'} post for (YYYY-MM-DD HH:MM):`,
         new Date(Date.now() + 3600000).toISOString().slice(0, 16).replace('T', ' '));
       if (!dateStr) return;
 
@@ -4210,21 +4458,23 @@
       if (caption === null) return;
 
       try {
-        await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, {
-          id: `schedule_${Date.now()}`,
+        await deleteScheduledPostsForDraft(draft.id);
+        const scheduledPost = {
+          id: `schedule_${draft.id}`,
           draft_id: draft.id,
           scheduled_at: scheduledTime,
-          caption: caption,
+          caption,
           visibility: 'public',
-          status: 'pending'
-        });
-
-        scheduleBtn.textContent = '📅 Scheduled';
-        scheduleBtn.dataset.tone = 'info';
+          status: 'pending',
+        };
+        await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, scheduledPost);
+        await setDraftScheduledState(draft, scheduledPost);
+        syncScheduleButtonState();
         alert(`Post scheduled for ${new Date(scheduledTime).toLocaleString()}`);
       } catch (err) {
         console.error('[UV Drafts] Schedule error:', err);
-        alert('Failed to schedule post');
+        syncScheduleButtonState();
+        alert(`Failed to schedule post${err?.message ? `: ${err.message}` : ''}`);
       }
     });
     actionsRow2.appendChild(scheduleBtn);
@@ -4417,20 +4667,7 @@
       // Update progress ring
       const ring = card.querySelector('[data-pending-ring]');
       if (ring) {
-        const indeterminate = pctNorm === 0;
-        const radius = 22;
-        const circumference = 2 * Math.PI * radius;
-        const offset = indeterminate
-          ? circumference * 0.75
-          : circumference - (pctNorm / 100) * circumference;
-        const progressCircle = ring.querySelector('circle:nth-child(2)');
-        if (progressCircle) {
-          progressCircle.setAttribute('stroke-dashoffset', String(offset));
-          progressCircle.style.animation = indeterminate ? 'uvd-ring-spin 1.4s linear infinite' : 'none';
-          progressCircle.style.transformOrigin = indeterminate ? '28px 28px' : '';
-        }
-        const textEl = ring.querySelector('text');
-        if (textEl) textEl.textContent = pctNorm > 0 ? Math.round(pctNorm) + '%' : '';
+        ring.innerHTML = buildPendingRingMarkup(pctNorm);
       }
     }
   }
@@ -4771,52 +5008,40 @@
       const scheduled = await uvDBGetAll(UV_DRAFTS_STORES.scheduledPosts);
       scheduledPostsFailureCount = 0; // Reset on success
       const now = Date.now();
+      const hasDuePosts = scheduled.some((post) => post?.status === 'pending' && post?.scheduled_at <= now);
+      if (hasDuePosts && !capturedAuthToken) {
+        console.warn('[UV Drafts] Skipping scheduled posts until auth token is available.');
+        return;
+      }
 
       for (const post of scheduled) {
         if (post.status === 'pending' && post.scheduled_at <= now) {
           console.log('[UV Drafts] Executing scheduled post:', post.draft_id);
 
           try {
-            // Post the draft
-            const scheduledHeaders = { 'Content-Type': 'application/json' };
-            if (capturedAuthToken) scheduledHeaders['Authorization'] = capturedAuthToken;
-            const res = await fetch('https://sora.chatgpt.com/backend/project_y/posts', {
-              method: 'POST',
-              credentials: 'include',
-              headers: scheduledHeaders,
-              body: JSON.stringify({
-                draft_id: post.draft_id,
-                caption: post.caption,
-                visibility: post.visibility || 'public'
-              })
-            });
-
-            if (res.ok) {
-              post.status = 'posted';
-              await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, post);
-
-              // Update draft status in cache
-              const draft = await uvDBGet(UV_DRAFTS_STORES.drafts, post.draft_id);
-              if (draft) {
-                draft.post_visibility = 'public';
-                draft.posted_to_public = true;
-                draft.post_meta = {
-                  ...(draft.post_meta || {}),
-                  visibility: 'public',
-                  posted_to_public: true,
-                };
-                await uvDBPut(UV_DRAFTS_STORES.drafts, draft);
-              }
-
-              console.log('[UV Drafts] Scheduled post succeeded:', post.draft_id);
-            } else {
+            const draft = await uvDBGet(UV_DRAFTS_STORES.drafts, post.draft_id);
+            if (!draft) {
               post.status = 'failed';
               await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, post);
-              console.error('[UV Drafts] Scheduled post failed:', post.draft_id, res.status);
+              console.error('[UV Drafts] Scheduled post failed: missing draft', post.draft_id);
+              continue;
+            }
+
+            const publishedPost = await createPublicPostForDraft(draft, post.caption || '');
+            if (publishedPost || publishedPost === null) {
+              post.status = 'posted';
+              await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, post);
+              applyPublishedPostToDraftData(draft, publishedPost);
+              await persistDraftRecord(draft);
+              console.log('[UV Drafts] Scheduled post succeeded:', post.draft_id);
             }
           } catch (err) {
             post.status = 'failed';
             await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, post);
+            const draft = await uvDBGet(UV_DRAFTS_STORES.drafts, post.draft_id);
+            if (draft) {
+              await setDraftScheduledState(draft, post);
+            }
             console.error('[UV Drafts] Scheduled post error:', err);
           }
         }
@@ -4900,7 +5125,6 @@
       .uvd-header-controls { display:flex; gap:10px; align-items:center; justify-content:flex-end; flex-shrink: 0; margin-left: auto; }
       .uvd-title-wrap h1 { font-size: 60px; margin: 8px 0 10px; letter-spacing: -0.035em; line-height: .96; color: var(--uvd-text); font-weight: 700; }
       .uvd-title-wrap .uv-drafts-stats { color: var(--uvd-subtext); font-size: 18px; }
-      .uvd-back-btn { background:none; border:none; color: var(--uvd-subtext); cursor:pointer; font-size: 16px; font-weight: 600; padding: 4px 0; margin-bottom: 6px; }
       .uvd-header-actions { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
       .uvd-cta { border:1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); border-radius: 14px; padding: 12px 16px; font-size: 16px; font-weight: 600; cursor:pointer; transition: background .16s ease, border-color .16s ease; white-space: nowrap; }
       .uvd-cta:hover { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
@@ -5062,15 +5286,6 @@
 
     const titleSection = document.createElement('div');
     titleSection.className = 'uvd-title-wrap';
-
-    const backBtn = document.createElement('button');
-    backBtn.className = 'uvd-back-btn';
-    backBtn.textContent = '← Back';
-    backBtn.addEventListener('click', () => {
-      hideUVDraftsPage();
-      history.back();
-    });
-    titleSection.appendChild(backBtn);
 
     const title = document.createElement('h1');
     title.textContent = 'My Drafts';
@@ -5339,7 +5554,12 @@
     }
 
     function setModelOverride(value) {
-      modelOverride = typeof value === 'string' && value ? value : null;
+      const normalized = normalizeComposerModel(value);
+      if (normalized) {
+        modelOverride = normalized;
+        return;
+      }
+      modelOverride = typeof value === 'string' && value.trim() ? value.trim() : null;
     }
 
     function getModelOverride() {
@@ -5364,5 +5584,12 @@
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = createSoraUVDraftsPageModule;
+    module.exports.__test = {
+      getComposerModelFamily,
+      resolveComposerModelValue,
+      buildPublicPostPayload,
+      extractPublishedPost,
+      applyPublishedPostToDraftData,
+    };
   }
 })(typeof globalThis !== 'undefined' ? globalThis : window);
