@@ -1658,7 +1658,8 @@ function badgeEmojiFor(id, meta) {
     const lpmVal = likesPerMinute(likes, ageMin);
     const vpmVal = viewsPerMinute(totalViews, ageMin);
     const rateBaseStr = Number.isFinite(vpmVal) ? `${vpmVal.toFixed(1)} VPM` : null;
-    const rateStr = rateBaseStr ? (flamesStr ? `${rateBaseStr} ${flamesStr}` : rateBaseStr) : null;
+    const rateStr = rateBaseStr || null;
+    const flamesTip = flamesStr ? 'Hotness based on likes and post age' : null;
     const lpmTip = rateBaseStr
       ? [
           Number.isFinite(vpmVal) ? `${vpmVal.toFixed(2)} views/minute` : null,
@@ -1670,7 +1671,7 @@ function badgeEmojiFor(id, meta) {
     badge.style.background = 'transparent';
     const pillBg = bg || 'rgba(37,37,37,0.7)';
 
-    const newKey = JSON.stringify([durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, rateStr, pillBg]);
+    const newKey = JSON.stringify([durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, rateStr, flamesStr, pillBg]);
     if (badge.dataset.key === newKey) {
       badge.style.boxShadow = 'none';
       return;
@@ -1684,6 +1685,10 @@ function badgeEmojiFor(id, meta) {
         tooltip += ` – ${fmtInt(totalViews)} Total Views – ${impactStr} Views Per Person`;
       }
       const el = createPill(badge, viewsStr, tooltip, true);
+      el.style.background = pillBg;
+    }
+    if (rateStr) {
+      const el = createPill(badge, rateStr, lpmTip, true);
       el.style.background = pillBg;
     }
     if (irStr) {
@@ -1720,8 +1725,8 @@ function badgeEmojiFor(id, meta) {
       const el = createPill(badge, `${durationStr}`, tooltip, true);
       el.style.background = pillBg;
     }
-    if (rateStr) {
-      const el = createPill(badge, rateStr, lpmTip, true);
+    if (flamesStr) {
+      const el = createPill(badge, flamesStr, flamesTip, true);
       el.style.background = pillBg;
       if (isSuperHot) {
         el.style.boxShadow = '0 0 10px 3px hsla(0, 100%, 50%, 0.7)';
@@ -2357,7 +2362,8 @@ function badgeEmojiFor(id, meta) {
     const lpmVal = likesPerMinute(likes ?? 0, ageMin);
     const vpmVal = viewsPerMinute(totalViews, ageMin);
     const rateBaseStr = Number.isFinite(vpmVal) ? `${vpmVal.toFixed(1)} VPM` : null;
-    const rateStr = rateBaseStr ? (flamesStr ? `${rateBaseStr} ${flamesStr}` : rateBaseStr) : null;
+    const rateStr = rateBaseStr || null;
+    const flamesTip = flamesStr ? 'Hotness based on likes and post age' : null;
     const lpmTip = rateBaseStr
       ? [
           Number.isFinite(vpmVal) ? `${vpmVal.toFixed(2)} views/minute` : null,
@@ -2391,7 +2397,7 @@ function badgeEmojiFor(id, meta) {
     const durationStr = duration ? formatDuration(duration) : null;
 
     // Determine if we have any data to display
-    if (viewsStr == null && irStr == null && rrStr == null && impactStr == null && timeEmojiStr == null && durationStr == null && rateStr == null) {
+    if (viewsStr == null && irStr == null && rrStr == null && impactStr == null && timeEmojiStr == null && durationStr == null && rateStr == null && !flamesStr) {
       el.innerHTML = '';
       return;
     }
@@ -2399,7 +2405,7 @@ function badgeEmojiFor(id, meta) {
     // Use a key to prevent unnecessary DOM updates - match feed badge key format
     const bg = badgeBgFor(sid, meta);
     const pillBg = bg || 'rgba(37,37,37,0.7)';
-    const newKey = JSON.stringify([durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, rateStr, pillBg]);
+    const newKey = JSON.stringify([durationStr, viewsStr, irStr, rrStr, impactStr, timeEmojiStr, rateStr, flamesStr, pillBg]);
     const hasPills = el.querySelectorAll('.sora-uv-pill').length > 0;
     if (el.dataset.key === newKey && hasPills) return;
     el.dataset.key = newKey;
@@ -2417,21 +2423,28 @@ function badgeEmojiFor(id, meta) {
       metEl.style.pointerEvents = 'auto';
     }
     
-    // 2. IR Pill - match feed badge exactly
+    // 2. VPM Pill
+    if (rateStr) {
+      const metEl = createPill(el, rateStr, lpmTip, true);
+      metEl.style.background = pillBg;
+      metEl.style.pointerEvents = 'auto';
+    }
+
+    // 3. IR Pill - match feed badge exactly
     if (irStr) {
       const metEl = createPill(el, irStr, 'Likes + Comments relative to Unique Views', true);
       metEl.style.background = pillBg;
       metEl.style.pointerEvents = 'auto';
     }
     
-    // 3. RR Pill - match feed badge exactly
+    // 4. RR Pill - match feed badge exactly
     if (rrStr) {
       const metEl = createPill(el, rrStr, 'Total Remixes relative to Likes', true);
       metEl.style.background = pillBg;
       metEl.style.pointerEvents = 'auto';
     }
     
-    // 4. Time/Age Pill - match feed badge exactly
+    // 5. Time/Age Pill - match feed badge exactly
     if (timeEmojiStr) {
       const tip = Number.isFinite(ageMin) ? expireEtaTooltip(ageMin, meta) : null;
       const nearDay = isNearWholeDay(ageMin);
@@ -2442,7 +2455,7 @@ function badgeEmojiFor(id, meta) {
       timeEl.style.pointerEvents = 'auto';
     }
 
-    // 5. Duration Pill - moved to end
+    // 6. Duration Pill
     if (durationStr) {
       const dims = idToDimensions.get(sid);
       let modelName = '';
@@ -2464,16 +2477,15 @@ function badgeEmojiFor(id, meta) {
       metEl.style.pointerEvents = 'auto';
     }
 
-    // 6. LPM Pill - always last
-    if (rateStr) {
-      const lpmEl = createPill(el, rateStr, lpmTip, true);
-      lpmEl.style.background = pillBg;
-      lpmEl.style.pointerEvents = 'auto';
-
+    // 7. Flames Pill - always last
+    if (flamesStr) {
+      const flameEl = createPill(el, flamesStr, flamesTip, true);
+      flameEl.style.background = pillBg;
+      flameEl.style.pointerEvents = 'auto';
       if (isSuperHot) {
-        lpmEl.style.boxShadow = '0 0 10px 3px hsla(0, 100%, 50%, 0.7)';
+        flameEl.style.boxShadow = '0 0 10px 3px hsla(0, 100%, 50%, 0.7)';
       } else if (isVeryHot) {
-        lpmEl.style.boxShadow = '0 0 8px 2px hsla(0, 100%, 50%, 0.5)';
+        flameEl.style.boxShadow = '0 0 8px 2px hsla(0, 100%, 50%, 0.5)';
       }
     }
 
