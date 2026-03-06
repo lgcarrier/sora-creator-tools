@@ -4118,6 +4118,7 @@
     const isContextViolation = isContextViolationDraft(draft);
     const isProcessingError = isProcessingErrorDraft(draft);
     const isSpecialError = isContentViolation || isContextViolation || isProcessingError;
+    const hasBlockedDraftActions = isPendingDraft || isSpecialError;
     const usePlaceholderThumb = isSpecialError || isPendingDraft;
     const isNew = isDraftUnreadState(draft) && !uvDraftsJustSeenIds.has(draft.id);
     const draftUrl = `https://sora.chatgpt.com/d/${encodeURIComponent(draft.id)}`;
@@ -4127,7 +4128,7 @@
     if (isContentViolation || isContextViolation) card.classList.add('is-violation');
     if (isProcessingError) card.classList.add('is-processing-error');
     card.dataset.draftId = draft.id;
-    if (isPendingDraft) card.style.cursor = 'default';
+    if (hasBlockedDraftActions) card.style.cursor = 'default';
     card.draggable = !isPendingDraft;
     let suppressCardNavUntil = 0;
     const blockCardNavigation = (ms = 180) => {
@@ -4135,7 +4136,7 @@
     };
     const shouldIgnoreCardNavigationTarget = (target) => (
       target instanceof Element && !!target.closest(
-        'a,button,input,textarea,select,video,label,[role="button"],[contenteditable="true"],.uv-play-btn,.uvd-actions-row,.uvd-actions-row2'
+        'a,button,input,textarea,select,video,label,[role="button"],[contenteditable="true"],.uv-play-btn'
       )
     );
     card.addEventListener('dragstart', (e) => {
@@ -4176,7 +4177,7 @@
       background: isPendingDraft
         ? '#182435'
         : (isContentViolation || isContextViolation ? '#2a1515' : (isProcessingError ? '#1b2235' : '#1a1a1a')),
-      cursor: 'pointer',
+      cursor: hasBlockedDraftActions ? 'default' : 'pointer',
     });
 
     // For violations/processing errors, show a placeholder instead of blank/broken media.
@@ -4468,10 +4469,10 @@
     // Wrap thumbnail in anchor for right-click "open in new tab" support
     const thumbLink = document.createElement('a');
     thumbLink.className = 'uvd-thumb-link';
-    thumbLink.href = isPendingDraft ? '#' : draftUrl;
+    thumbLink.href = hasBlockedDraftActions ? '#' : draftUrl;
     thumbLink.draggable = false; // Prevent drag interfering with video scrubber
     thumbLink.addEventListener('dragstart', (e) => e.preventDefault());
-    if (isPendingDraft) {
+    if (hasBlockedDraftActions) {
       thumbLink.addEventListener('click', (e) => e.preventDefault());
       thumbLink.style.cursor = 'default';
     }
@@ -4566,7 +4567,7 @@
         statusEl.dataset.tone = 'ok';
       }
     });
-    sourceBtn.disabled = isPendingDraft;
+    sourceBtn.disabled = hasBlockedDraftActions;
     actionsRow.appendChild(sourceBtn);
 
     // Bookmark button
@@ -4666,7 +4667,7 @@
         console.error('[UV Drafts] Download error:', err);
       }
     });
-    downloadBtn.disabled = isPendingDraft || !draft.download_url;
+    downloadBtn.disabled = hasBlockedDraftActions || !draft.download_url;
     actionsRow.appendChild(downloadBtn);
 
     // Hide button
@@ -4742,6 +4743,13 @@
         delete scheduleBtn.dataset.tone;
         return;
       }
+      if (hasBlockedDraftActions) {
+        scheduleBtn.textContent = isDraftScheduled() ? 'Scheduled' : 'Schedule';
+        scheduleBtn.disabled = true;
+        if (isDraftScheduled()) scheduleBtn.dataset.tone = 'info';
+        else delete scheduleBtn.dataset.tone;
+        return;
+      }
       scheduleBtn.textContent = isDraftScheduled() ? 'Scheduled' : 'Schedule';
       scheduleBtn.disabled = false;
       if (isDraftScheduled()) scheduleBtn.dataset.tone = 'info';
@@ -4759,6 +4767,8 @@
       postBtn.dataset.tone = 'success';
     } else if (isPendingDraft) {
       postBtn.textContent = 'Pending...';
+      postBtn.disabled = true;
+    } else if (hasBlockedDraftActions) {
       postBtn.disabled = true;
     }
     postBtn.addEventListener('click', async (e) => {
@@ -4781,7 +4791,7 @@
       } catch (err) {
         console.error('[UV Drafts] Post error:', err);
         postBtn.textContent = 'Post';
-        postBtn.disabled = false;
+        postBtn.disabled = hasBlockedDraftActions;
         delete postBtn.dataset.tone;
         alert(`Failed to post draft${err?.message ? `: ${err.message}` : ''}`);
       }
@@ -4839,7 +4849,7 @@
     trimBtn.className = 'uvd-action-pill';
     trimBtn.type = 'button';
     trimBtn.textContent = 'Trim';
-    trimBtn.disabled = isPendingDraft || !canTrimDraft(draft);
+    trimBtn.disabled = hasBlockedDraftActions || !canTrimDraft(draft);
     trimBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const trimUrl = getDraftTrimUrl(draft);
@@ -4851,7 +4861,7 @@
     card.appendChild(actionsRow2);
 
     card.addEventListener('click', (e) => {
-      if (isPendingDraft) return;
+      if (hasBlockedDraftActions) return;
       if (e.defaultPrevented) return;
       if (Date.now() < suppressCardNavUntil) return;
       if (shouldIgnoreCardNavigationTarget(e.target)) return;
@@ -4867,7 +4877,7 @@
     });
 
     card.addEventListener('auxclick', (e) => {
-      if (isPendingDraft) return;
+      if (hasBlockedDraftActions) return;
       if (e.defaultPrevented) return;
       if (Date.now() < suppressCardNavUntil) return;
       if (shouldIgnoreCardNavigationTarget(e.target)) return;
@@ -5591,13 +5601,14 @@
       .uvd-time { font-size: 12px; color: var(--uvd-subtext); }
       .uvd-actions-row { display:grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap:6px; padding: 0 10px 10px; }
       .uvd-actions-row2 { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:6px; padding: 0 10px 10px; }
-      .uvd-icon-btn { width: 100%; height: 34px; border-radius: 9px; border: 1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); display:flex; align-items:center; justify-content:center; cursor:pointer; transition: background .15s ease, border-color .15s ease; }
-      .uvd-icon-btn:hover { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
-      .uvd-action-pill { width: 100%; min-height: 38px; border: 1px solid var(--uvd-border); background: var(--uvd-surface); border-radius: 9px; color: var(--uvd-text); font-size: 13px; font-weight: 600; cursor:pointer; transition: background .15s ease, border-color .15s ease; }
+      .uvd-icon-btn { width: 100%; height: 34px; border-radius: 9px; border: 1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); display:flex; align-items:center; justify-content:center; cursor:pointer; transition: background .15s ease, border-color .15s ease, color .15s ease, opacity .15s ease; }
+      .uvd-icon-btn:hover:not(:disabled) { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
+      .uvd-icon-btn:disabled { opacity: .42; cursor:not-allowed; color: var(--uvd-text-dim); background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.08); pointer-events: none; }
+      .uvd-action-pill { width: 100%; min-height: 38px; border: 1px solid var(--uvd-border); background: var(--uvd-surface); border-radius: 9px; color: var(--uvd-text); font-size: 13px; font-weight: 600; cursor:pointer; transition: background .15s ease, border-color .15s ease, color .15s ease, opacity .15s ease; }
       .uvd-action-pill:hover:not(:disabled) { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
       .uvd-action-pill[data-tone="success"] { background: #1f8d51; border-color: #1f8d51; }
       .uvd-action-pill[data-tone="info"] { background: #215ba6; border-color: #215ba6; }
-      .uvd-action-pill:disabled { opacity: .6; cursor:not-allowed; }
+      .uvd-action-pill:disabled { opacity: .42; cursor:not-allowed; color: var(--uvd-text-dim); background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.08); pointer-events: none; }
       .uv-drafts-loading, .uvd-empty-state, .uv-drafts-load-more { grid-column: 1 / -1; text-align: center; color: var(--uvd-subtext); }
       .uv-drafts-loading { display:flex; align-items:center; justify-content:center; padding: 42px 18px; font-size: 16px; }
       .uvd-empty-state { padding: 60px 20px; font-size: 16px; }
