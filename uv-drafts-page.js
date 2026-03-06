@@ -30,6 +30,7 @@
       { value: 'sora2', label: 'Sora 2' },
       { value: 'sora2pro', label: 'Sora 2 Pro' },
     ];
+    let composerModels = COMPOSER_MODELS.slice();
     let composerModelValues = new Set(composerModels.map((item) => item.value));
 
     // Mutable — updated from API via fetchComposerStyles()
@@ -3386,10 +3387,9 @@
 
   // ---- Filtering (no sorting) ----
 
-  function applyDraftFilters(drafts) {
+  function applyDraftFilters(drafts, options = {}) {
     let filtered = [...drafts];
     const bookmarks = getBookmarks();
-    const skipSort = !!options?.skipSort;
 
     // Optional diagnostics for bookmark mismatch investigation.
     const _bmIds = [...bookmarks];
