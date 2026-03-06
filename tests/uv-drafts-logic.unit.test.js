@@ -102,34 +102,28 @@ test('computeDraftStats excludes no-date violation/processing drafts from new co
   assert.equal(stats.newCount, 1);
 });
 
+test('computeDraftStats excludes unsynced drafts from new count', () => {
+  const drafts = [
+    { id: 'a', is_read: false, is_unsynced: true },
+    { id: 'b', is_read: false, is_unsynced: false },
+    { id: 'c', is_read: false },
+  ];
+  const stats = computeDraftStats(drafts, new Set(), new Set());
+  assert.equal(stats.newCount, 2, 'only non-unsynced unread drafts count as new');
+});
+
 test('normalizeViewState accepts only supported values and trims workspace', () => {
   const state = normalizeViewState({
     filterState: 'bookmarked',
-    sortState: 'newest',
     workspaceFilter: '  ws_1  ',
     searchQuery: 'cats',
   });
 
   assert.deepEqual(state, {
     filterState: 'bookmarked',
-    sortState: 'newest',
     workspaceFilter: 'ws_1',
     searchQuery: 'cats',
   });
-});
-
-test('normalizeViewState maps legacy api/duration sort values to newest', () => {
-  const fromApi = normalizeViewState({ sortState: 'api' });
-  const fromDuration = normalizeViewState({ sortState: 'duration' });
-  assert.equal(fromApi.sortState, 'newest');
-  assert.equal(fromDuration.sortState, 'newest');
-});
-
-test('normalizeViewState preserves newest/oldest API-order sort modes', () => {
-  const fromNewest = normalizeViewState({ sortState: 'newest' });
-  const fromOldest = normalizeViewState({ sortState: 'oldest' });
-  assert.equal(fromNewest.sortState, 'newest');
-  assert.equal(fromOldest.sortState, 'oldest');
 });
 
 test('normalizeViewState accepts unsynced filter state', () => {
@@ -140,7 +134,6 @@ test('normalizeViewState accepts unsynced filter state', () => {
 test('normalizeViewState falls back to defaults for invalid values', () => {
   const state = normalizeViewState({
     filterState: 'invalid',
-    sortState: 'bad',
     workspaceFilter: '   ',
     searchQuery: 123,
   });
@@ -231,8 +224,8 @@ test('applyCreateBodyOverrides applies overrides to root and nested body payload
     prompt: 'new prompt',
     model: 'sora2',
     orientation: 'landscape',
-    resolution: 'high',
-    style: 'cinematic',
+    size: 'high',
+    style_id: 'cinematic',
     seed: '12a34',
   });
 
@@ -244,8 +237,8 @@ test('applyCreateBodyOverrides applies overrides to root and nested body payload
   assert.equal(parsed.creation_config.prompt, 'new prompt');
   assert.equal(parsed.creation_config.model, 'sora2');
   assert.equal(parsed.creation_config.orientation, 'landscape');
-  assert.equal(parsed.creation_config.resolution, 'high');
-  assert.equal(parsed.creation_config.style, 'cinematic');
+  assert.equal(parsed.creation_config.size, 'high');
+  assert.equal(parsed.creation_config.style_id, 'cinematic');
   assert.equal(parsed.creation_config.seed, '1234');
 
   assert.equal(inner.prompt, 'new prompt');
@@ -381,6 +374,48 @@ test('pending helpers ignore non-pending statuses', () => {
   };
   const out = flattenPendingV2Payload(payload);
   assert.deepEqual(out.map((item) => item.id), ['gen_pending']);
+});
+
+test('pending helpers use task itself when generations array is empty (preprocessing/queued)', () => {
+  const payload = [
+    {
+      id: 'task_early',
+      status: 'preprocessing',
+      prompt: 'test prompt',
+      generations: [],
+      creation_config: { orientation: 'portrait', n_frames: 300 },
+      width: 352,
+      height: 640,
+    },
+    {
+      id: 'task_queued',
+      status: 'queued',
+      prompt: 'another prompt',
+      generations: [],
+    },
+  ];
+
+  const out = flattenPendingV2Payload(payload);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].id, 'task_early');
+  assert.equal(out[0].task_id, 'task_early');
+  assert.equal(out[0].prompt, 'test prompt');
+  assert.equal(out[0].is_pending, true);
+  assert.equal(out[0].pending_status, 'preprocessing');
+  assert.equal(out[0].creation_config.prompt, 'test prompt');
+  assert.equal(out[1].id, 'task_queued');
+  assert.equal(out[1].pending_status, 'queued');
+});
+
+test('pending helpers show empty-generation tasks regardless of status', () => {
+  const payload = [
+    { id: 'task_a', status: 'completed', prompt: 'done', generations: [] },
+    { id: 'task_b', status: 'running', prompt: 'active', generations: [] },
+    { id: 'task_c', status: 'unknown_status', prompt: 'mystery', generations: [] },
+  ];
+  const out = flattenPendingV2Payload(payload);
+  assert.equal(out.length, 3);
+  assert.deepEqual(out.map(d => d.id), ['task_a', 'task_b', 'task_c']);
 });
 
 test('pending helpers keep generation-level pending even if task status differs', () => {
