@@ -7710,12 +7710,69 @@ async function renderAnalyzeTable(force = false) {
     } catch {}
   }
 
+  function isLikelyJsonContentType(value) {
+    try {
+      const ct = String(value || '').toLowerCase();
+      return ct.includes('application/json') || ct.includes('+json');
+    } catch {
+      return false;
+    }
+  }
+
+  function parseJsonPayloadSafely(text, meta = {}) {
+    if (typeof text !== 'string') return null;
+    const trimmed = text.trim();
+    if (!trimmed) return null;
+
+    const contentType = String(meta?.contentType || '');
+    const firstChar = trimmed[0];
+    const shouldParse = isLikelyJsonContentType(contentType) || firstChar === '{' || firstChar === '[';
+
+    if (!shouldParse) {
+      if (firstChar === '<') {
+        try {
+          dlog('feed', 'skipping non-json payload', {
+            source: meta?.source || '',
+            url: meta?.url || '',
+            contentType,
+            preview: truncateInline(trimmed.replace(/\s+/g, ' '), 120),
+          });
+        } catch {}
+      }
+      return null;
+    }
+
+    try {
+      return JSON.parse(trimmed);
+    } catch (err) {
+      if (firstChar === '<') {
+        try {
+          dlog('feed', 'skipping invalid html-like payload', {
+            source: meta?.source || '',
+            url: meta?.url || '',
+            contentType,
+            preview: truncateInline(trimmed.replace(/\s+/g, ' '), 120),
+          });
+        } catch {}
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  async function cloneJsonResponseSafely(res, meta = {}) {
+    const clone = typeof res?.clone === 'function' ? res.clone() : null;
+    if (!clone) return null;
+    const contentType = String(clone.headers?.get?.('content-type') || '');
+    const text = await clone.text();
+    return parseJsonPayloadSafely(text, { ...meta, contentType });
+  }
+
   function installFetchSniffer() {
     dlog('feed', 'install fetch sniffer');
     const isLikelyJsonResponse = (res) => {
       try {
-        const ct = String(res?.headers?.get?.('content-type') || '').toLowerCase();
-        return ct.includes('application/json') || ct.includes('+json');
+        return isLikelyJsonContentType(res?.headers?.get?.('content-type') || '');
       } catch {
         return false;
       }
@@ -7904,7 +7961,7 @@ async function renderAnalyzeTable(force = false) {
           const draftRemixMatch = location.pathname.match(/^\/d\/([A-Za-z0-9_-]+)/i);
           if (draftRemixMatch && location.search.includes('remix')) {
             const sourceDraftId = draftRemixMatch[1];
-            res.clone().json().then((json) => {
+            cloneJsonResponseSafely(res, { source: 'fetch', url }).then((json) => {
               const taskId = json?.id;
               if (taskId && sourceDraftId) {
                 saveTaskToSourceDraft(taskId, sourceDraftId);
@@ -7918,7 +7975,11 @@ async function renderAnalyzeTable(force = false) {
         if (NF_PENDING_V2_RE.test(url)) {
           if (!res.ok) scheduleDraftsBackupFetch('pending_v2_not_ok');
           const limitHint = inferBatchSlotLimitFromHeaders(res?.headers);
-          res.clone().json().then((payload) => {
+          cloneJsonResponseSafely(res, { source: 'fetch', url }).then((payload) => {
+            if (!payload) {
+              scheduleDraftsBackupFetch('pending_v2_parse_failed');
+              return;
+            }
             processPendingV2Json(payload, { source: 'fetch', limitHint });
           }).catch(() => {
             scheduleDraftsBackupFetch('pending_v2_parse_failed');
@@ -7930,27 +7991,33 @@ async function renderAnalyzeTable(force = false) {
         if (POST_DETAIL_RE.test(url)) {
           dlog('feed', 'fetch matched post detail', { url });
           rememberPostDetailTemplate(url);
-          res.clone().json().then((j) => {
+          cloneJsonResponseSafely(res, { source: 'fetch', url }).then((j) => {
+            if (!j) return;
             dlog('feed', 'post detail parsed', { url, hasPost: !!j?.post, hasRemixes: !!j?.remix_posts?.items });
             processPostDetailJson(j);
           }).catch((err) => {
             console.error('[SoraUV] Error parsing post detail fetch response:', err);
           });
         } else if (CHARACTERS_RE.test(url)) {
-          res.clone().json().then(processCharactersJson).catch((err) => {
+          cloneJsonResponseSafely(res, { source: 'fetch', url }).then((j) => {
+            if (!j) return;
+            processCharactersJson(j);
+          }).catch((err) => {
             console.error('[SoraUV] Error parsing characters fetch response:', err);
           });
         } else if (DRAFTS_RE.test(url)) {
           decorateDraftsResponse(res);
-          res.clone().json().then(processDraftsJson).catch((err) => {
+          cloneJsonResponseSafely(res, { source: 'fetch', url }).then((j) => {
+            if (!j) return;
+            processDraftsJson(j);
+          }).catch((err) => {
             console.error('[SoraUV] Error parsing drafts fetch response:', err);
           });
         } else if (FEED_RE.test(url)) {
           dlog('feed', 'fetch matched', { url });
-          res
-            .clone()
-            .json()
+          cloneJsonResponseSafely(res, { source: 'fetch', url })
             .then((j) => {
+              if (!j) return;
               dlog('feed', 'fetch parsed', { url, items: (j?.items || j?.data?.items || []).length });
               processFeedJson(j);
             })
@@ -7958,10 +8025,9 @@ async function renderAnalyzeTable(force = false) {
         } else if (typeof url === 'string' && url.startsWith(location.origin)) {
           // Avoid cloning/parsing bodies for non-JSON same-origin requests (can be very expensive on /d/...).
           if (isLikelyJsonResponse(res)) {
-            res
-              .clone()
-              .json()
+            cloneJsonResponseSafely(res, { source: 'fetch', url })
               .then((j) => {
+                if (!j) return;
                 if (looksLikePostDetail(j)) {
                   dlog('feed', 'fetch autodetected post detail', { url, hasPost: !!j?.post });
                   processPostDetailJson(j);
@@ -7986,6 +8052,16 @@ async function renderAnalyzeTable(force = false) {
       this.addEventListener('load', function () {
         try {
             if (typeof url === 'string') {
+              const responseContentType =
+                typeof this.getResponseHeader === 'function'
+                  ? String(this.getResponseHeader('content-type') || '')
+                  : '';
+              const parseXhrJson = () =>
+                parseJsonPayloadSafely(this.responseText, {
+                  source: 'xhr',
+                  url,
+                  contentType: responseContentType,
+                });
               const skipDraftDetailProcessing =
                 isDraftDetail() &&
                 !DRAFTS_RE.test(url) &&
@@ -7998,7 +8074,7 @@ async function renderAnalyzeTable(force = false) {
                 if (draftRemixMatch && location.search.includes('remix')) {
                 const sourceDraftId = draftRemixMatch[1];
                 try {
-                  const json = JSON.parse(this.responseText);
+                  const json = parseXhrJson();
                   const taskId = json?.id;
                   if (taskId && sourceDraftId) {
                     saveTaskToSourceDraft(taskId, sourceDraftId);
@@ -8012,7 +8088,9 @@ async function renderAnalyzeTable(force = false) {
               if (NF_PENDING_V2_RE.test(url)) {
                 if (this.status && this.status >= 400) scheduleDraftsBackupFetch('pending_v2_xhr_not_ok');
                 try {
-                  processPendingV2Json(JSON.parse(this.responseText), {
+                  const payload = parseXhrJson();
+                  if (!payload) throw new Error('non-json pending/v2 payload');
+                  processPendingV2Json(payload, {
                     source: 'xhr',
                     limitHint: inferBatchSlotLimitFromHeaders(
                       typeof this.getAllResponseHeaders === 'function' ? this.getAllResponseHeaders() : ''
@@ -8029,7 +8107,8 @@ async function renderAnalyzeTable(force = false) {
                 dlog('feed', 'xhr matched post detail', { url });
                 rememberPostDetailTemplate(url);
                 try {
-                const j = JSON.parse(this.responseText);
+                const j = parseXhrJson();
+                if (!j) return;
                 dlog('feed', 'post detail parsed (XHR)', { url, hasPost: !!j?.post, hasRemixes: !!j?.remix_posts?.items });
                 processPostDetailJson(j);
               } catch (err) {
@@ -8037,28 +8116,33 @@ async function renderAnalyzeTable(force = false) {
               }
             } else if (CHARACTERS_RE.test(url)) {
               try {
-                processCharactersJson(JSON.parse(this.responseText));
+                const j = parseXhrJson();
+                if (!j) return;
+                processCharactersJson(j);
               } catch (err) {
                 console.error('[SoraUV] Error parsing characters XHR:', err);
               }
             } else if (DRAFTS_RE.test(url)) {
               try {
-                processDraftsJson(JSON.parse(this.responseText));
+                const j = parseXhrJson();
+                if (!j) return;
+                processDraftsJson(j);
               } catch (err) {
                 console.error('[SoraUV] Error parsing drafts XHR:', err);
               }
             } else if (FEED_RE.test(url)) {
               dlog('feed', 'xhr matched', { url });
               try {
-                const j = JSON.parse(this.responseText);
+                const j = parseXhrJson();
+                if (!j) return;
                 dlog('feed', 'xhr parsed', { url, items: (j?.items || j?.data?.items || []).length });
                 processFeedJson(j);
               } catch {}
             } else if (url.startsWith(location.origin)) {
               try {
-                const ct = String(this.getResponseHeader('content-type') || '').toLowerCase();
-                if (ct.includes('application/json') || ct.includes('+json')) {
-                  const j = JSON.parse(this.responseText);
+                if (isLikelyJsonContentType(responseContentType)) {
+                  const j = parseXhrJson();
+                  if (!j) return;
                   if (looksLikePostDetail(j)) {
                     dlog('feed', 'xhr autodetected post detail', { url, hasPost: !!j?.post });
                     processPostDetailJson(j);
