@@ -1160,6 +1160,18 @@
     return (!!draftId && bookmarkSet.has(draftId)) || (!!isUnread && !justSeen) || justSeen;
   }
 
+  function isDraftVisibleInFilterState(draft, filterState) {
+    if (!draft || typeof draft !== 'object') return false;
+    const state = typeof filterState === 'string' ? filterState.trim().toLowerCase() : 'all';
+    const isHidden = draft.hidden === true;
+    const isUnsynced = draft.is_unsynced === true;
+
+    if (state === 'hidden') return isHidden;
+    if (state === 'unsynced') return isUnsynced && !isHidden;
+    if (isUnsynced) return false;
+    return !isHidden;
+  }
+
   function createSoraUVDraftsPageModule(deps = {}) {
     let capturedAuthToken = null;
     let modelOverride = null;
@@ -5110,23 +5122,20 @@
 
     filtered = filterDraftsByWorkspace(filtered, uvDraftsWorkspaceFilter);
 
-    if (uvDraftsFilterState === 'unsynced') {
-      filtered = filtered.filter((d) => d?.is_unsynced === true);
-    } else {
-      filtered = filtered.filter((d) => d?.is_unsynced !== true);
-    }
+    filtered = filtered.filter((d) => isDraftVisibleInFilterState(d, uvDraftsFilterState));
 
     if (uvDraftsFilterState === 'bookmarked') {
       filtered = filtered.filter((d) => isDraftVisibleInBookmarkedFilter(d, bookmarks, uvDraftsJustSeenIds, isDraftUnreadState(d)));
     } else if (uvDraftsFilterState === 'hidden') {
-      filtered = filtered.filter(d => d?.is_unsynced !== true && d.hidden);
+      filtered = filtered.filter((d) => d.hidden);
+    } else if (uvDraftsFilterState === 'unsynced') {
+      filtered = filtered.filter((d) => d?.is_unsynced === true);
     } else if (uvDraftsFilterState === 'violations') {
-      filtered = filtered.filter(d => d?.is_unsynced !== true && (isContentViolationDraft(d) || isContextViolationDraft(d)));
+      filtered = filtered.filter((d) => isContentViolationDraft(d) || isContextViolationDraft(d));
     } else if (uvDraftsFilterState === 'new') {
       // Only show drafts confirmed by the API this session to avoid ghost drafts from stale cache
       const requireConfirmed = uvDraftsSyncConfirmedIds.size > 0;
-      filtered = filtered.filter(d =>
-        d?.is_unsynced !== true &&
+      filtered = filtered.filter((d) =>
         isDraftUnreadState(d) &&
         !uvDraftsJustSeenIds.has(d.id) &&
         (!requireConfirmed || uvDraftsSyncConfirmedIds.has(d.id))
@@ -7414,6 +7423,7 @@
       resolvePreferredComposerPromptValue,
       filterDraftsByWorkspace,
       isDraftVisibleInBookmarkedFilter,
+      isDraftVisibleInFilterState,
       slugifyWorkspaceName,
       getWorkspaceUrlSlug,
       findWorkspaceIdByUrlSlug,

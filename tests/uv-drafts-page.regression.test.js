@@ -24,6 +24,7 @@ const {
   resolvePreferredComposerPromptValue,
   filterDraftsByWorkspace,
   isDraftVisibleInBookmarkedFilter,
+  isDraftVisibleInFilterState,
   slugifyWorkspaceName,
   getWorkspaceUrlSlug,
   findWorkspaceIdByUrlSlug,
@@ -346,6 +347,33 @@ test('bookmarked filter excludes hidden drafts even when they are bookmarked or 
   assert.equal(
     isDraftVisibleInBookmarkedFilter({ id: 'draft_visible_new', hidden: false, is_read: false }, bookmarks, justSeen, true),
     true
+  );
+});
+
+test('hidden drafts stay out of non-hidden views and move into the hidden view', () => {
+  assert.equal(
+    isDraftVisibleInFilterState({ id: 'draft_hidden', hidden: true }, 'all'),
+    false
+  );
+  assert.equal(
+    isDraftVisibleInFilterState({ id: 'draft_hidden_new', hidden: true, is_read: false }, 'new'),
+    false
+  );
+  assert.equal(
+    isDraftVisibleInFilterState({ id: 'draft_hidden_violation', hidden: true, kind: 'sora_content_violation' }, 'violations'),
+    false
+  );
+  assert.equal(
+    isDraftVisibleInFilterState({ id: 'draft_hidden_unsynced', hidden: true, is_unsynced: true }, 'unsynced'),
+    false
+  );
+  assert.equal(
+    isDraftVisibleInFilterState({ id: 'draft_hidden_tab', hidden: true, is_unsynced: true }, 'hidden'),
+    true
+  );
+  assert.equal(
+    isDraftVisibleInFilterState({ id: 'draft_visible_hidden_tab', hidden: false }, 'hidden'),
+    false
   );
 });
 
