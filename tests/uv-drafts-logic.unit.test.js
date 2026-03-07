@@ -121,6 +121,16 @@ test('computeDraftStats excludes unsynced drafts from new count', () => {
   assert.equal(stats.newCount, 2, 'only non-unsynced unread drafts count as new');
 });
 
+test('computeDraftStats excludes publicly posted s_ drafts from new count', () => {
+  const drafts = [
+    { id: 'a', is_read: false, post_id: 's_123' },
+    { id: 'b', is_read: false },
+  ];
+
+  const stats = computeDraftStats(drafts, new Set(), new Set());
+  assert.equal(stats.newCount, 1);
+});
+
 test('normalizeViewState accepts only supported values and trims workspace', () => {
   const state = normalizeViewState({
     filterState: 'bookmarked',
@@ -435,6 +445,79 @@ test('getDraftPostUrl prefers permalink and falls back to post id', () => {
     getDraftPostUrl({ post_id: 'xyz987' }),
     'https://sora.chatgpt.com/p/xyz987'
   );
+  assert.equal(
+    getDraftPostUrl({ post: { post: { permalink: '/p/s_nested_123', id: 's_nested_123' } } }),
+    'https://sora.chatgpt.com/p/s_nested_123'
+  );
+});
+
+test('getDraftRemixSource resolves nested post target candidates', () => {
+  const out = getDraftRemixSource({
+    creation_config: {
+      remix_target_post: { post: { id: 's_nested123' } },
+    },
+  });
+  assert.deepEqual(out, {
+    isRemix: true,
+    sourceType: 'post',
+    sourceId: 's_nested123',
+    sourcePostId: 's_nested123',
+    sourceDraftId: '',
+  });
+});
+
+test('getDraftRemixSource resolves draft target candidates', () => {
+  const out = getDraftRemixSource({
+    creation_config: {
+      remix_target_draft: { id: 'draft_src_1' },
+    },
+  });
+  assert.deepEqual(out, {
+    isRemix: true,
+    sourceType: 'draft',
+    sourceId: 'draft_src_1',
+    sourcePostId: '',
+    sourceDraftId: 'draft_src_1',
+  });
+});
+
+test('getDraftRemixSource prioritizes post source over draft source', () => {
+  const out = getDraftRemixSource({
+    remix_target_post_id: 's_post_first',
+    remix_target_draft_id: 'draft_second',
+  });
+  assert.equal(out.isRemix, true);
+  assert.equal(out.sourceType, 'post');
+  assert.equal(out.sourcePostId, 's_post_first');
+  assert.equal(out.sourceDraftId, '');
+});
+
+test('getDraftRemixSource returns non-remix shape for regular draft', () => {
+  const out = getDraftRemixSource({
+    id: 'draft_plain',
+    creation_config: { mode: 'compose' },
+  });
+  assert.deepEqual(out, {
+    isRemix: false,
+    sourceType: '',
+    sourceId: '',
+    sourcePostId: '',
+    sourceDraftId: '',
+  });
+});
+
+test('getDraftRemixSource ignores malformed source ids', () => {
+  const out = getDraftRemixSource({
+    remix_target_post_id: 'abc123',
+    remix_target_draft_id: 'bad id with spaces',
+  });
+  assert.deepEqual(out, {
+    isRemix: false,
+    sourceType: '',
+    sourceId: '',
+    sourcePostId: '',
+    sourceDraftId: '',
+  });
 });
 
 test('getDraftRemixSource resolves nested post target candidates', () => {
@@ -542,6 +625,8 @@ test('draft kind helpers treat violation/processing kinds as always old', () => 
 
   assert.equal(isDraftUnread({ kind: 'sora_content_violation', is_read: false }), false);
   assert.equal(isDraftUnread({ kind: 'sora_processing_error', is_read: false }), false);
+  assert.equal(isDraftUnread({ kind: 'sora_draft', is_read: false, post_id: 's_123' }), false);
+  assert.equal(isDraftUnread({ kind: 'sora_draft', is_read: false, post: { post: { id: 's_nested_123' } } }), false);
   assert.equal(isDraftUnread({ kind: 'sora_draft', is_read: false }), true);
 });
 

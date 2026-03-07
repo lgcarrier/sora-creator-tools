@@ -86,8 +86,14 @@
           <button id="last10">Past 10</button>
           <button id="top5">Top 5</button>
           <button id="top10">Top 10</button>
+          <button id="topIR">Top IR</button>
+          <button id="topRR">Top RR</button>
+          <button id="mostRemixes">Most Remixes</button>
+          <button id="mostComments">Most Comments</button>
           <button id="bottom5">Bottom 5</button>
           <button id="bottom10">Bottom 10</button>
+          <button id="bottomIR">Bottom IR</button>
+          <button id="bottomRR">Bottom RR</button>
           <button id="stale">Stale</button>
           <div id="customFiltersWrap" class="custom-filters-list" aria-label="Custom filters"></div>
         </div>
@@ -303,6 +309,52 @@
           </div>
         </div>
       </div>
+      <div class="chart-block">
+        <h4 id="likesPerMinuteTitle" class="chart-title">Likes Per Minute over time</h4>
+        <div class="chart-wrap chart-wrap-spaced">
+          <div class="chart-y-axis-label">Likes Per Minute</div>
+          <div class="chart-canvas-stack">
+            <canvas id="likesPerMinuteTimeChart" class="chart-canvas" width="900" height="540"></canvas>
+            <canvas id="likesPerMinuteChart" class="chart-canvas is-canvas-hidden" width="900" height="540"></canvas>
+          </div>
+          <div id="likesPerMinuteTimeTooltip" class="tooltip"></div>
+          <div id="likesPerMinuteTooltip" class="tooltip"></div>
+          <div id="likesPerMinuteSliderWrap" class="chart-slider is-hidden">
+            <div class="chart-slider-row">
+              <label class="chart-slider-label">Time Window</label>
+              <div class="chart-slider-track" id="likesPerMinuteSliderTrack">
+                <div class="chart-slider-range" id="likesPerMinuteSliderRange"></div>
+                <input type="range" id="likesPerMinuteSliderMin" min="0" max="21600" value="0" step="1" class="chart-slider-input chart-slider-input--min" />
+                <input type="range" id="likesPerMinuteSliderMax" min="0" max="21600" value="1440" step="1" class="chart-slider-input chart-slider-input--max" />
+              </div>
+              <span id="likesPerMinuteSliderValue" class="chart-slider-value">0m–24h</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="chart-block">
+        <h4 id="viewsPerMinuteTitle" class="chart-title">Views Per Minute over time</h4>
+        <div class="chart-wrap chart-wrap-spaced">
+          <div class="chart-y-axis-label">Views Per Minute</div>
+          <div class="chart-canvas-stack">
+            <canvas id="viewsPerMinuteTimeChart" class="chart-canvas" width="900" height="540"></canvas>
+            <canvas id="viewsPerMinuteChart" class="chart-canvas is-canvas-hidden" width="900" height="540"></canvas>
+          </div>
+          <div id="viewsPerMinuteTimeTooltip" class="tooltip"></div>
+          <div id="viewsPerMinuteTooltip" class="tooltip"></div>
+          <div id="viewsPerMinuteSliderWrap" class="chart-slider is-hidden">
+            <div class="chart-slider-row">
+              <label class="chart-slider-label">Time Window</label>
+              <div class="chart-slider-track" id="viewsPerMinuteSliderTrack">
+                <div class="chart-slider-range" id="viewsPerMinuteSliderRange"></div>
+                <input type="range" id="viewsPerMinuteSliderMin" min="0" max="21600" value="0" step="1" class="chart-slider-input chart-slider-input--min" />
+                <input type="range" id="viewsPerMinuteSliderMax" min="0" max="21600" value="1440" step="1" class="chart-slider-input chart-slider-input--max" />
+              </div>
+              <span id="viewsPerMinuteSliderValue" class="chart-slider-value">0m–24h</span>
+            </div>
+          </div>
+        </div>
+      </div>
       <h3 class="section-title section-title-compare">Compare Total Metrics</h3>
       <p class="section-note">You must run Gather mode on any profile for up-to-date and complete data</p>
       <div class="compare-section">
@@ -359,7 +411,7 @@
         <canvas id="followersChart" width="900" height="540"></canvas>
         <div id="followersTooltip" class="tooltip"></div>
       </div>
-      <h4 id="allViewsOverTimeTitle" class="chart-title">Total Views over Time</h4>
+      <h4 id="allViewsOverTimeTitle" class="chart-title">Total Views over time</h4>
       <div class="chart-wrap chart-wrap-spaced">
         <div class="chart-y-axis-label" data-axis="views">Total Views</div>
         <canvas id="allViewsChart" width="900" height="540"></canvas>
@@ -380,7 +432,7 @@
 
       <div class="brought-by">
         <h3 class="section-title">Brought to You By</h3>
-        <p class="section-note">This free, open-source extension was built entirely by the following people for the Sora community. Unofficial and not affiliated with or endorsed by OpenAI.</p>
+        <p class="section-note">This free, open-source extension was built entirely by the following people for the Sora community.</p>
         <div class="brought-by-grid">
           <a class="brought-by-card" href="https://sora.chatgpt.com/profile/cameoed" target="_blank" rel="noopener">
             <div class="brought-by-info">
@@ -403,6 +455,27 @@
             </div>
             <span class="brought-by-follow">Follow</span>
           </a>
+          <a class="brought-by-card" href="https://sora.chatgpt.com/profile/alexandria" target="_blank" rel="noopener">
+            <div class="brought-by-info">
+              <div class="brought-by-name">Alexandria</div>
+            <span class="brought-by-meta"><span class="brought-by-role">Support</span></span>
+            </div>
+            <span class="brought-by-follow">Follow</span>
+          </a>
+          <a class="brought-by-card" href="https://sora.chatgpt.com/profile/sloppyyolk" target="_blank" rel="noopener">
+            <div class="brought-by-info">
+              <div class="brought-by-name">David</div>
+            <span class="brought-by-meta"><span class="brought-by-role">Support</span></span>
+            </div>
+            <span class="brought-by-follow">Follow</span>
+          </a>
+          <a class="brought-by-card" href="https://sora.chatgpt.com/profile/aidaredevils" target="_blank" rel="noopener">
+            <div class="brought-by-info">
+              <div class="brought-by-name">Louis-Guillaume</div>
+            <span class="brought-by-meta"><span class="brought-by-role">Support</span></span>
+            </div>
+            <span class="brought-by-follow">Follow</span>
+          </a>
           <a class="brought-by-card" href="https://sora.chatgpt.com/profile/kingplum" target="_blank" rel="noopener">
             <div class="brought-by-info">
               <div class="brought-by-name">Travis</div>
@@ -417,25 +490,29 @@
             </div>
             <span class="brought-by-follow">Follow</span>
           </a>
-          <a class="brought-by-card" href="https://sora.chatgpt.com/profile/binaryrot" target="_blank" rel="noopener">
+          <a class="brought-by-card" href="https://sora.chatgpt.com/profile/possum-kingdom" target="_blank" rel="noopener">
             <div class="brought-by-info">
-              <div class="brought-by-name">Binary Rot</div>
+              <div class="brought-by-name">Steven</div>
             <span class="brought-by-meta"><span class="brought-by-role">Support</span></span>
             </div>
             <span class="brought-by-follow">Follow</span>
           </a>
-        </div>
-      </div>
-
-      <div class="theme-song" aria-label="Theme song">
-        <div class="theme-song-panel" role="group" aria-label="Theme song player">
-          <div class="theme-song-meta">
-            <div class="theme-song-kicker">Theme Song</div>
-            <div class="theme-song-label">Extension Dreamz by Binary Rot</div>
+          <a class="brought-by-card" href="https://sora.chatgpt.com/profile/binaryrot" target="_blank" rel="noopener">
+            <div class="brought-by-info">
+              <div class="brought-by-name">Binary&nbsp;Rot</div>
+            <span class="brought-by-meta"><span class="brought-by-role">Support</span></span>
+            </div>
+            <span class="brought-by-follow">Follow</span>
+          </a>
+          <div class="theme-song-panel brought-by-song-card" role="group" aria-label="Theme song player">
+            <div class="theme-song-meta">
+              <div class="theme-song-kicker">Theme Song</div>
+              <div class="theme-song-label">Extension Dreamz by Binary Rot</div>
+            </div>
+            <audio class="theme-song-audio" controls preload="none" loop>
+              <source src="Extension%20Dreamz%20(Theme%20Song)%20by%20Binary%20Rot.mp3" type="audio/mpeg" />
+            </audio>
           </div>
-          <audio class="theme-song-audio" controls preload="none" loop>
-            <source src="Extension%20Dreamz%20(Theme%20Song)%20by%20Binary%20Rot.mp3" type="audio/mpeg" />
-          </audio>
         </div>
       </div>
 

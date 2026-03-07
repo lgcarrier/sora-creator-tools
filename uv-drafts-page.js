@@ -30,7 +30,9 @@
       { value: 'sora2', label: 'Sora 2' },
       { value: 'sora2pro', label: 'Sora 2 Pro' },
     ];
-    const COMPOSER_MODEL_VALUES = new Set(COMPOSER_MODELS.map((item) => item.value));
+    let composerModels = COMPOSER_MODELS.slice();
+    let composerModelValues = new Set(composerModels.map((item) => item.value));
+    let composerStyles = [];
     const REMIX_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 20 20" style="pointer-events:none;">
       <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.556"></circle>
       <path stroke="currentColor" stroke-linecap="round" stroke-width="1.556" d="M11.945 10c0-4.667-9.723-5.833-8.75 1.556"></path>
@@ -149,13 +151,14 @@
 
     function normalizeComposerModel(value) {
       const normalized = typeof value === 'string' ? value.trim() : '';
-      return COMPOSER_MODEL_VALUES.has(normalized) ? normalized : '';
+      return composerModelValues.has(normalized) ? normalized : '';
     }
 
     function getDefaultComposerModel() {
       return (
         normalizeComposerModel(uvDraftsComposerState?.model) ||
         normalizeComposerModel(modelOverride) ||
+        composerModels[0]?.value ||
         COMPOSER_MODELS[0].value
       );
     }
@@ -698,6 +701,7 @@
             hadUpdates = true;
           }
           uvDraftsData = mergedData;
+          uvDraftsAwaitingMoreResults = false;
 
           pageNum++;
           if (onProgress) onProgress(uvDraftsData.length, pageNum);
@@ -746,6 +750,7 @@
               });
               for (const incoming of incomingById2.values()) mergedData2.push(incoming);
               uvDraftsData = mergedData2;
+              uvDraftsAwaitingMoreResults = false;
               if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') renderUVDraftsSyncUpdate();
               updateUVDraftsStats();
             }
@@ -1040,6 +1045,7 @@
   let uvDraftsRenderedCount = 0;
   let uvDraftsFilteredCache = []; // Cache filtered results to avoid re-filtering on scroll
   let uvDraftsScrollHandler = null;
+  let uvDraftsAwaitingMoreResults = false; // First page was empty, but pagination indicates more drafts are still arriving.
   let uvDraftsJustSeenIds = new Set(); // Drafts marked seen this session (stay visible until refresh/filter change)
   let uvDraftsInitRunId = 0;
   let uvDraftsWorkspaceModalEl = null;
@@ -1474,6 +1480,72 @@
   function persistUVDraftsComposerState() {
     try {
       localStorage.setItem(UV_DRAFTS_COMPOSER_KEY, JSON.stringify(uvDraftsComposerState || defaultUVDraftsComposerState()));
+    } catch {}
+  }
+
+  function refreshComposerModelSelect() {
+    if (!uvDraftsComposerEl) return;
+    const modelEl = uvDraftsComposerEl.querySelector('[data-uvd-compose-model="1"]');
+    if (!modelEl) return;
+    const preferredValue =
+      normalizeComposerModel(uvDraftsComposerState?.model) ||
+      normalizeComposerModel(modelOverride) ||
+      normalizeComposerModel(modelEl.value);
+    modelEl.innerHTML = composerModels
+      .map((model) => `<option value="${escapeHtml(model.value)}">${escapeHtml(model.label)}</option>`)
+      .join('');
+    modelEl.value = preferredValue || composerModels[0]?.value || '';
+    if (uvDraftsComposerState) {
+      uvDraftsComposerState.model = modelEl.value || getDefaultComposerModel();
+      persistUVDraftsComposerState();
+    }
+    if (modelEl.value) modelOverride = modelEl.value;
+    modelEl.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function refreshComposerStyleSuggestions() {
+    if (!uvDraftsComposerEl) return;
+    const styleListEl = uvDraftsComposerEl.querySelector('[data-uvd-compose-style-list="1"]');
+    if (!styleListEl) return;
+    styleListEl.innerHTML = composerStyles
+      .map((style) => `<option value="${escapeHtml(style.value)}">${escapeHtml(style.label)}</option>`)
+      .join('');
+  }
+
+  async function fetchComposerModels() {
+    if (!capturedAuthToken) return;
+    try {
+      const res = await fetch('https://sora.chatgpt.com/backend/models?nf2=true', {
+        headers: { Authorization: capturedAuthToken },
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      if (Array.isArray(json.data) && json.data.length) {
+        composerModels = json.data.map((model) => ({
+          value: model.id,
+          label: model.label || model.id,
+        }));
+        composerModelValues = new Set(composerModels.map((model) => model.value));
+        refreshComposerModelSelect();
+      }
+    } catch {}
+  }
+
+  async function fetchComposerStyles() {
+    if (!capturedAuthToken) return;
+    try {
+      const res = await fetch('https://sora.chatgpt.com/backend/project_y/initialize_async', {
+        headers: { Authorization: capturedAuthToken },
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      if (Array.isArray(json.styles) && json.styles.length) {
+        composerStyles = json.styles.map((style) => ({
+          value: style.id,
+          label: style.display_name || style.id,
+        }));
+        refreshComposerStyleSuggestions();
+      }
     } catch {}
   }
 
@@ -2963,8 +3035,11 @@
       uvDraftsComposerFirstFrame = null;
     }
     loadUVDraftsComposerState();
-    const modelOptionsHtml = COMPOSER_MODELS
-      .map((model) => `<option value="${model.value}">${model.label}</option>`)
+    const modelOptionsHtml = composerModels
+      .map((model) => `<option value="${escapeHtml(model.value)}">${escapeHtml(model.label)}</option>`)
+      .join('');
+    const styleOptionsHtml = composerStyles
+      .map((style) => `<option value="${escapeHtml(style.value)}">${escapeHtml(style.label)}</option>`)
       .join('');
     const composer = document.createElement('aside');
     composer.className = 'uvd-composer';
@@ -3071,7 +3146,8 @@
       <div class="uvd-field-grid">
         <label class="uvd-field">
           <span>Style</span>
-          <input type="text" data-uvd-compose-style="1" placeholder="cinematic, anime, gritty..." />
+          <input type="text" data-uvd-compose-style="1" list="uvd-compose-style-list" placeholder="cinematic, anime, gritty..." />
+          <datalist id="uvd-compose-style-list" data-uvd-compose-style-list="1">${styleOptionsHtml}</datalist>
         </label>
         <label class="uvd-field">
           <span>Seed</span>
@@ -3353,7 +3429,7 @@
 
     promptEl.value = uvDraftsComposerState.prompt;
     modelEl.value = normalizeComposerModel(uvDraftsComposerState.model) || getDefaultComposerModel();
-    if (!modelEl.value) modelEl.value = COMPOSER_MODELS[0].value;
+    if (!modelEl.value) modelEl.value = composerModels[0]?.value || COMPOSER_MODELS[0].value;
     uvDraftsComposerState.model = modelEl.value;
     modelOverride = modelEl.value;
     durationEl.value = String(uvDraftsComposerState.durationSeconds);
@@ -4882,12 +4958,47 @@
     return card;
   }
 
+  function isUVDraftsLoadingIndicatorVisible() {
+    if (!uvDraftsLoadingEl) return false;
+    const display = String(uvDraftsLoadingEl.style.display || '').trim().toLowerCase();
+    return !!display && display !== 'none';
+  }
+
+  function showUVDraftsLoadingIndicator(message = 'Loading drafts...') {
+    if (!uvDraftsLoadingEl) return;
+    uvDraftsLoadingEl.textContent = message;
+    uvDraftsLoadingEl.style.display = 'flex';
+  }
+
+  function hideUVDraftsLoadingIndicator() {
+    if (!uvDraftsLoadingEl) return;
+    uvDraftsLoadingEl.style.display = 'none';
+  }
+
+  function shouldDeferUVDraftsEmptyState() {
+    if (String(uvDraftsSearchQuery || '').trim()) return false;
+    return uvDraftsAwaitingMoreResults || uvDraftsSyncUiState?.syncing === true;
+  }
+
+  function shouldRerenderUVDraftsEmptyStateAfterSync() {
+    const renderableDrafts = getRenderableUVDrafts();
+    return !Array.isArray(renderableDrafts) || renderableDrafts.length === 0;
+  }
+
   // Lightweight render for background sync — updates cache and appends new cards
   // without destroying existing DOM elements (no flicker).
   function renderUVDraftsSyncUpdate() {
     if (!uvDraftsGridEl) return;
     uvDraftsFilteredCache = getRenderableUVDrafts();
-    if (uvDraftsFilteredCache.length === 0) return;
+    if (uvDraftsFilteredCache.length === 0) {
+      if (shouldDeferUVDraftsEmptyState() && !isUVDraftsLoadingIndicatorVisible()) {
+        showUVDraftsLoadingIndicator(uvDraftsAwaitingMoreResults ? 'Syncing drafts...' : 'Loading drafts...');
+      }
+      return;
+    }
+    const emptyStateEl = uvDraftsGridEl.querySelector('.uvd-empty-state');
+    if (emptyStateEl) emptyStateEl.remove();
+    hideUVDraftsLoadingIndicator();
     renderMoreUVDrafts();
   }
 
@@ -4904,6 +5015,14 @@
 
     if (uvDraftsFilteredCache.length === 0) {
       uvDraftsGridEl.innerHTML = '';
+      uvDraftsRenderedCount = 0;
+      if (shouldDeferUVDraftsEmptyState()) {
+        if (!isUVDraftsLoadingIndicatorVisible()) {
+          showUVDraftsLoadingIndicator(uvDraftsAwaitingMoreResults ? 'Syncing drafts...' : 'Loading drafts...');
+        }
+        return;
+      }
+      hideUVDraftsLoadingIndicator();
       const empty = document.createElement('div');
       empty.className = 'uvd-empty-state';
       empty.textContent = uvDraftsSearchQuery ? 'No drafts match your search' : 'No drafts found';
@@ -4911,6 +5030,7 @@
       return;
     }
 
+    hideUVDraftsLoadingIndicator();
     // Render initial batch
     renderMoreUVDrafts();
 
@@ -5012,12 +5132,10 @@
   async function initUVDraftsPage() {
     const runId = ++uvDraftsInitRunId;
     const isStaleRun = () => runId !== uvDraftsInitRunId;
+    uvDraftsAwaitingMoreResults = false;
 
     // Show loading
-    if (uvDraftsLoadingEl) {
-      uvDraftsLoadingEl.style.display = 'flex';
-      uvDraftsLoadingEl.textContent = 'Loading drafts from cache...';
-    }
+    showUVDraftsLoadingIndicator('Loading drafts from cache...');
     const preserveSyncing = uvDraftsSyncUiState.syncing === true && !capturedAuthToken;
     setUVDraftsSyncUiState({
       syncing: preserveSyncing || !!capturedAuthToken,
@@ -5033,9 +5151,7 @@
     if (uvDraftsData.length > 0) {
       renderUVDraftsGrid();
       updateUVDraftsStats();
-      if (uvDraftsLoadingEl) {
-        uvDraftsLoadingEl.style.display = 'none';
-      }
+      hideUVDraftsLoadingIndicator();
     }
 
     // Check if we have an auth token - if not, show message but don't block
@@ -5084,8 +5200,11 @@
     // Quick first fetch - get 8 drafts instantly for immediate render
     try {
       const fullSyncIds = new Set();
+      const hadCachedData = uvDraftsData.length > 0;
       const firstBatch = await fetchFirstUVDrafts(8);
       if (isStaleRun()) return;
+      const doFullSync = !hadCachedData;
+      uvDraftsAwaitingMoreResults = !hadCachedData && firstBatch.items.length === 0 && !!firstBatch.cursor;
 
       if (firstBatch.items.length > 0) {
         // Get existing data for merging
@@ -5105,6 +5224,7 @@
 
         // Merge with existing cache data (first batch at top, dedupe rest)
         uvDraftsData = mergeDraftListById(transformed, uvDraftsData);
+        uvDraftsAwaitingMoreResults = false;
         setUVDraftsSyncUiState({ processed: uvDraftsData.length, page: 1 });
 
         // Render immediately
@@ -5113,9 +5233,7 @@
       }
 
       // Even when the first batch is empty, leave loading state and show empty view.
-      if (uvDraftsLoadingEl) {
-        uvDraftsLoadingEl.style.display = 'none';
-      }
+      hideUVDraftsLoadingIndicator();
       if (uvDraftsData.length === 0) {
         renderUVDraftsGrid();
         updateUVDraftsStats();
@@ -5131,22 +5249,37 @@
         }, runId, firstBatch.items.length, fullSyncIds)
           .then(async (syncSucceeded) => {
             if (!syncSucceeded || isStaleRun()) return;
-            await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
+            if (doFullSync) {
+              await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
+            }
           })
           .catch((syncErr) => {
             console.error('[UV Drafts] Background sync failed:', syncErr);
           })
           .finally(() => {
-          if (isStaleRun()) return;
-          setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
-        });
+            if (isStaleRun()) return;
+            uvDraftsAwaitingMoreResults = false;
+            setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
+            if (shouldRerenderUVDraftsEmptyStateAfterSync()) {
+              renderUVDraftsGrid();
+              updateUVDraftsStats();
+            }
+          });
       } else {
-        await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
+        uvDraftsAwaitingMoreResults = false;
+        if (doFullSync) {
+          await archiveUnsyncedDraftsAfterFullSync(fullSyncIds, runId);
+        }
         if (isStaleRun()) return;
         setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
+        if (shouldRerenderUVDraftsEmptyStateAfterSync()) {
+          renderUVDraftsGrid();
+          updateUVDraftsStats();
+        }
       }
     } catch (err) {
       console.error('[UV Drafts] Quick fetch failed, falling back to full sync:', err);
+      uvDraftsAwaitingMoreResults = false;
       // Fall back to full sync
       try {
         setUVDraftsSyncUiState({ syncing: true, processed: uvDraftsData.length, page: 1 });
@@ -5169,8 +5302,10 @@
         console.error('[UV Drafts] Full sync also failed:', syncErr);
         setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
       }
-      if (uvDraftsLoadingEl) {
-        uvDraftsLoadingEl.style.display = 'none';
+      hideUVDraftsLoadingIndicator();
+      if (shouldRerenderUVDraftsEmptyStateAfterSync()) {
+        renderUVDraftsGrid();
+        updateUVDraftsStats();
       }
     }
   }
@@ -5721,6 +5856,14 @@
     uvDraftsGridEl = grid;
 
     uvDraftsComposerEl = buildUVDraftsComposer();
+    if (capturedAuthToken) {
+      queueMicrotask(() => {
+        if (uvDraftsComposerEl) {
+          fetchComposerModels();
+          fetchComposerStyles();
+        }
+      });
+    }
     layout.appendChild(uvDraftsComposerEl);
     layout.appendChild(mainPanel);
     container.appendChild(layout);
@@ -5773,6 +5916,9 @@
       const gainedToken = !capturedAuthToken && !!nextToken;
       capturedAuthToken = nextToken;
       if (!gainedToken) return;
+
+      fetchComposerModels();
+      fetchComposerStyles();
 
       if (uvDraftsMarkAllState?.active) {
         resumePersistedMarkAllProgress({ queue: true });
