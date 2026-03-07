@@ -369,7 +369,7 @@
   let uvDraftsScriptsInjected = false;
   let uvDraftsScriptsInjecting = false;
   let uvDraftsScriptReadyCallbacks = [];
-  const UV_DRAFTS_ROUTE_RE = /^\/(?:uv-drafts|creatortools)(?:\/|$)/i;
+  const UV_DRAFTS_ROUTE_RE = /^\/creatortools(?:\/|$)/i;
 
   function isUVDraftsRoute(pathname = location.pathname) {
     return UV_DRAFTS_ROUTE_RE.test(String(pathname || ''));
@@ -407,7 +407,7 @@
     });
   }
 
-  // Inject core page scripts first. UV Drafts modules are lazy-loaded on demand.
+  // Inject core page scripts first. Creator Tools modules are lazy-loaded on demand.
   injectPageScript('api.js', () => {
     injectPageScript('inject.js', () => {
       if (isUVDraftsRoute()) ensureUVDraftsScriptsInjected();

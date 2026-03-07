@@ -10,7 +10,7 @@
 
 # Sora Creator Tools
 
-Chrome extension for `https://sora.chatgpt.com/*` that adds Sora feed overlays, gather/analyze tools, an advanced drafts workflow (`/uv-drafts`), and a local analytics dashboard.
+Chrome extension for `https://sora.chatgpt.com/*` that adds Sora feed overlays, gather/analyze tools, **Creator Tools** (`/creatortools`), and a local analytics dashboard.
 Unofficial community extension. Not affiliated with, endorsed by, or sponsored by OpenAI. "Sora" is a trademark of OpenAI.
 
 ![](/imagery/extension1.jpg)
@@ -23,7 +23,7 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 - Adds feed controls including filtering, Gather mode, and Analyze mode on Top feed.
 - Captures metrics snapshots locally while you browse.
 - Provides a full dashboard (`dashboard.html`) with mode switching (`Metrics` / `Harvest`), charts, compare mode, Harvest table tooling, import/export, and data purge tools.
-- Adds a dedicated `/uv-drafts` page with:
+- Adds a dedicated Creator Tools page (`/creatortools`) with:
   - Draft caching and progressive sync
   - Pending task polling
   - Bookmarking, filtering, search, and workspace management
@@ -97,7 +97,7 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
   - Metrics: CSV import/export and cleanup tools.
   - Harvest: CSV and JSONL exports for **all records** or **current filtered view**.
 
-### UV Drafts (`/uv-drafts`)
+### Creator Tools (`/creatortools`)
 
 - Local draft cache with progressive sync and pending-task polling.
 - Bookmarking, search, custom filters, and workspace-aware organization.
@@ -110,7 +110,7 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 
 - Manifest: [manifest.json](./manifest.json)
 - Content script: [content.js](./content.js)
-- Injected page scripts: [api.js](./api.js) and [inject.js](./inject.js) load on Sora pages; [uv-drafts-logic.js](./uv-drafts-logic.js) + [uv-drafts-page.js](./uv-drafts-page.js) are loaded on demand for `/uv-drafts`
+- Injected page scripts: [api.js](./api.js) and [inject.js](./inject.js) load on Sora pages; [uv-drafts-logic.js](./uv-drafts-logic.js) + [uv-drafts-page.js](./uv-drafts-page.js) are loaded on demand for `/creatortools`
 - Background service worker: [background.js](./background.js)
 - Dashboard UI: [dashboard.html](./dashboard.html), [dashboard.js](./dashboard.js), [dashboard.css](./dashboard.css), [theme.js](./theme.js)
 
@@ -130,7 +130,7 @@ Cross-context bridge notes:
 
 ### Storage Model
 
-- Local-first only (`chrome.storage.local`, `localStorage`, and IndexedDB for `/uv-drafts`).
+- Local-first only (`chrome.storage.local`, `localStorage`, and IndexedDB for Creator Tools).
 - Metrics hot/cold split:
   - Hot key: latest-per-post metrics in `metrics`
   - Cold keys: historical snapshots by user under `snapshots_<userKey>`
@@ -203,7 +203,7 @@ Current repository test suite (Node built-in test runner):
 - `87` passing
 - `0` failing
 
-Primary coverage currently targets dashboard regressions and shared UV drafts logic.
+Primary coverage currently targets dashboard regressions and shared Creator Tools logic.
 
 ## Project Layout
 
@@ -211,7 +211,7 @@ Primary coverage currently targets dashboard regressions and shared UV drafts lo
 - [content.js](./content.js): bridge between page scripts and extension runtime
 - [inject.js](./inject.js): feed UI overlays + gather/analyze + runtime integration
 - [api.js](./api.js): composer/network patching and duration/gen controls
-- [uv-drafts-page.js](./uv-drafts-page.js): `/uv-drafts` page module and workflows
+- [uv-drafts-page.js](./uv-drafts-page.js): `/creatortools` page module and workflows
 - [uv-drafts-logic.js](./uv-drafts-logic.js): shared pure logic for runtime/tests
 - [background.js](./background.js): metrics persistence/cache/index/migration
 - [dashboard.html](./dashboard.html), [dashboard.js](./dashboard.js), [dashboard.css](./dashboard.css), [theme.js](./theme.js): dashboard UI and analytics

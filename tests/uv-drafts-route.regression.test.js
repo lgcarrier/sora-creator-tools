@@ -9,7 +9,7 @@ const INJECT_PATH = path.join(__dirname, '..', 'inject.js');
 
 function buildContentRouteHarness() {
   const src = fs.readFileSync(CONTENT_PATH, 'utf8');
-  const start = src.indexOf("  const UV_DRAFTS_ROUTE_RE = /^\\/(?:uv-drafts|creatortools)(?:\\/|$)/i;");
+  const start = src.indexOf("  const UV_DRAFTS_ROUTE_RE = /^\\/creatortools(?:\\/|$)/i;");
   assert.notEqual(start, -1, 'content UV drafts route snippet start not found');
   const end = src.indexOf('  function flushUVDraftsReadyCallbacks() {', start);
   assert.notEqual(end, -1, 'content UV drafts route snippet end not found');
@@ -108,7 +108,6 @@ function buildInjectRouteHarness() {
       reset,
       isUVDrafts,
       getCanonicalUVDraftsPath,
-      maybeCanonicalizeUVDraftsRoute,
       navigateToUVDraftsRoute,
       snapshot() {
         return {
@@ -119,7 +118,6 @@ function buildInjectRouteHarness() {
           prevTitle: uvDraftsPrevDocTitle,
           onRouteChangeCalls,
           pushedUrls: history.pushed.map((entry) => entry.url),
-          replacedUrls: history.replaced.map((entry) => entry.url),
         };
       },
     };
@@ -130,29 +128,27 @@ function buildInjectRouteHarness() {
   return context.__injectRouteApi;
 }
 
-test('content route helper recognizes both legacy and canonical UV Drafts paths', () => {
+test('content route helper recognizes only the creatortools route', () => {
   const api = buildContentRouteHarness();
 
-  assert.equal(api.isUVDraftsRoute('/uv-drafts'), true);
-  assert.equal(api.isUVDraftsRoute('/uv-drafts/workspace-a'), true);
   assert.equal(api.isUVDraftsRoute('/creatortools'), true);
   assert.equal(api.isUVDraftsRoute('/creatortools/workspace-a'), true);
+  assert.equal(api.isUVDraftsRoute('/explore'), false);
   assert.equal(api.isUVDraftsRoute('/drafts'), false);
 });
 
-test('inject route helper canonicalizes legacy UV Drafts links onto /creatortools', () => {
+test('inject route helper keeps creatortools paths and falls back to the creatortools root', () => {
   const api = buildInjectRouteHarness();
 
-  api.reset('/uv-drafts/music-lab', '?view=grid', '#top');
+  api.reset('/creatortools/music-lab', '?view=grid', '#top');
   assert.equal(api.isUVDrafts(), true);
-  assert.equal(api.getCanonicalUVDraftsPath('/uv-drafts/music-lab'), '/creatortools/music-lab');
-  assert.equal(api.maybeCanonicalizeUVDraftsRoute(), true);
+  assert.equal(api.getCanonicalUVDraftsPath('/creatortools/music-lab'), '/creatortools/music-lab');
+  assert.equal(api.getCanonicalUVDraftsPath('/explore'), '/creatortools');
 
   const snapshot = api.snapshot();
   assert.equal(snapshot.pathname, '/creatortools/music-lab');
   assert.equal(snapshot.search, '?view=grid');
   assert.equal(snapshot.hash, '#top');
-  assert.deepEqual(Array.from(snapshot.replacedUrls), ['/creatortools/music-lab?view=grid#top']);
 });
 
 test('navigateToUVDraftsRoute uses the canonical /creatortools path', () => {

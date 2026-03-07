@@ -1,5 +1,5 @@
 /*
- * UV Drafts page module extracted from inject.js.
+ * Creator Tools page module extracted from inject.js.
  */
 (function initSoraUVDraftsPageModule(globalScope) {
   'use strict';
@@ -79,7 +79,7 @@
           }
         } catch {}
         if (rawCount > 1 && bookmarksSet.size < rawCount - 1) {
-          console.error('[UV Drafts] Bookmark safety: blocked write of', bookmarksSet.size,
+          console.error('[Creator Tools] Bookmark safety: blocked write of', bookmarksSet.size,
             'bookmarks when storage has', rawCount, '. Potential data loss prevented.');
           return;
         }
@@ -424,7 +424,7 @@
     syncState: 'sync_state'
   };
 
-  // == IndexedDB Cache Layer for UV Drafts ==
+  // == IndexedDB Cache Layer for Creator Tools ==
   let uvDraftsDB = null;
 
   async function openUVDraftsDB() {
@@ -560,7 +560,7 @@
     });
   }
 
-  // == UV Drafts API Fetcher ==
+  // == Creator Tools API Fetcher ==
   async function fetchAllUVDrafts(onProgress) {
     const allDrafts = [];
     let cursor = null;
@@ -587,7 +587,7 @@
 
         if (!response.ok) {
           if (response.status === 401) {
-            console.error('[UV Drafts] Auth token missing or expired. Navigate to another page to capture a fresh token.');
+            console.error('[Creator Tools] Auth token missing or expired. Navigate to another page to capture a fresh token.');
           }
           throw new Error(`Drafts API error: ${response.status}`);
         }
@@ -622,7 +622,7 @@
           }
         }
       } catch (err) {
-        console.error('[UV Drafts] Fetch error:', err);
+        console.error('[Creator Tools] Fetch error:', err);
         throw err;
       }
     } while (cursor);
@@ -763,7 +763,7 @@
           }
         }
       } catch (err) {
-        console.error('[UV Drafts] Background sync error:', err);
+        console.error('[Creator Tools] Background sync error:', err);
         syncSucceeded = false;
         break;
       }
@@ -951,7 +951,7 @@
       if (!res.ok) {
         // 400 = server rejected it, won't succeed on retry — accept local mark and move on
         if (res.status === 400) {
-          console.warn('[UV Drafts] Server returned 400 for mark-read, accepting local state:', draftId);
+          console.warn('[Creator Tools] Server returned 400 for mark-read, accepting local state:', draftId);
           uvDraftsUnsyncedReads.delete(draftId);
           onReadSyncDelivered(draftId);
           return;
@@ -963,7 +963,7 @@
       uvDraftsUnsyncedReads.delete(draftId);
       onReadSyncDelivered(draftId);
     } catch (err) {
-      console.error('[UV Drafts] Failed to mark draft as read on server:', err);
+      console.error('[Creator Tools] Failed to mark draft as read on server:', err);
       // Add to unsynced for retry
       uvDraftsUnsyncedReads.add(draftId);
       startUnsyncedReadsRetry();
@@ -1009,16 +1009,16 @@
 
         if (res.ok) {
           uvDraftsUnsyncedReads.delete(draftId);
-          console.log('[UV Drafts] Retry succeeded for:', draftId);
+          console.log('[Creator Tools] Retry succeeded for:', draftId);
           onReadSyncDelivered(draftId);
         } else if (res.status === 400) {
           // 400 = server won't accept it, stop retrying
           uvDraftsUnsyncedReads.delete(draftId);
-          console.warn('[UV Drafts] Retry got 400, giving up for:', draftId);
+          console.warn('[Creator Tools] Retry got 400, giving up for:', draftId);
           onReadSyncDelivered(draftId);
         }
       } catch (err) {
-        console.log('[UV Drafts] Retry failed for:', draftId, err.message);
+        console.log('[Creator Tools] Retry failed for:', draftId, err.message);
       }
       updateMarkAllProgressUI();
     }, 5000); // Retry one every 5 seconds
@@ -1030,7 +1030,7 @@
     return new Set(seenDrafts.map(d => d.id));
   }
 
-  // == UV Drafts Page State ==
+  // == Creator Tools Page State ==
   let uvDraftsPageEl = null;
   let uvDraftsGridEl = null;
   let uvDraftsFilterBarEl = null;
@@ -2185,7 +2185,7 @@
     try {
       uvWorkspaces = await uvDBGetAll(UV_DRAFTS_STORES.workspaces);
     } catch (err) {
-      console.error('[UV Drafts] Load workspaces error:', err);
+      console.error('[Creator Tools] Load workspaces error:', err);
       uvWorkspaces = [];
     }
     return uvWorkspaces;
@@ -2415,7 +2415,7 @@
         renderWorkspaceOptions();
         setStatus('Workspace created.', 'ok');
       } catch (err) {
-        console.error('[UV Drafts] Create workspace error:', err);
+        console.error('[Creator Tools] Create workspace error:', err);
         setStatus('Failed to create workspace.', 'error');
       } finally {
         createBtn.disabled = false;
@@ -2454,7 +2454,7 @@
         }
         closeDraftWorkspacePicker();
       } catch (err) {
-        console.error('[UV Drafts] Failed to update workspace:', err);
+        console.error('[Creator Tools] Failed to update workspace:', err);
         setStatus('Failed to update workspace.', 'error');
         saveBtn.disabled = false;
       }
@@ -3363,13 +3363,13 @@
       modal.innerHTML = `
         <div class="uvd-modal-head">
           <h3>Review Batch</h3>
-          <p>Confirm queued prompts before launch. UV Drafts batch settings will be applied via create-request overrides.</p>
+          <p>Confirm queued prompts before launch. Creator Tools batch settings will be applied via create-request overrides.</p>
         </div>
         <div class="uvd-jsonl-review-summary">
           <div><strong>Prompts</strong>: ${pendingPrompts.length}</div>
           <div><strong>Estimated Generations / Prompt</strong>: ${Math.max(1, Number(settings.gensCount || 1))}</div>
           <div><strong>Estimated Total Jobs</strong>: ${totalJobs}</div>
-          <div><strong>Override Mode</strong>: Applies UV Drafts model/duration/gens/orientation/resolution/style/seed on each queued create.</div>
+          <div><strong>Override Mode</strong>: Applies Creator Tools model/duration/gens/orientation/resolution/style/seed on each queued create.</div>
         </div>
         <div class="uvd-jsonl-review-list"></div>
         <div class="uvd-modal-footer">
@@ -3419,7 +3419,7 @@
           );
         }
         if (statusEl) {
-          statusEl.textContent = `Batch armed (${pendingPrompts.length} prompts). Opening native composer with UV Drafts request overrides...`;
+          statusEl.textContent = `Batch armed (${pendingPrompts.length} prompts). Opening native composer with Creator Tools request overrides...`;
           statusEl.dataset.tone = 'ok';
         }
         close();
@@ -3548,7 +3548,7 @@
         );
       }
       if (statusEl) {
-        statusEl.textContent = 'Resuming batch in native composer with UV Drafts request overrides...';
+        statusEl.textContent = 'Resuming batch in native composer with Creator Tools request overrides...';
         statusEl.dataset.tone = 'ok';
       }
       renderJsonlQueue();
@@ -3593,11 +3593,11 @@
         renderJsonlQueue();
 
         if (statusEl) {
-          statusEl.textContent = `Prompt queue ready (${queue.remaining} remaining). Use Create for one selected prompt, or Review Batch for full queue run with UV Drafts request overrides.`;
+          statusEl.textContent = `Prompt queue ready (${queue.remaining} remaining). Use Create for one selected prompt, or Review Batch for full queue run with Creator Tools request overrides.`;
           statusEl.dataset.tone = 'ok';
         }
       } catch (err) {
-        console.error('[UV Drafts] JSONL upload failed:', err);
+        console.error('[Creator Tools] JSONL upload failed:', err);
         setJsonlSummary('Failed to read file.');
         renderJsonlQueue();
         if (statusEl) {
@@ -3739,7 +3739,7 @@
       const drafts = await uvDBGetAll(UV_DRAFTS_STORES.drafts);
       return drafts;
     } catch (err) {
-      console.error('[UV Drafts] Cache load error:', err);
+      console.error('[Creator Tools] Cache load error:', err);
       return [];
     }
   }
@@ -3769,7 +3769,7 @@
 
       return transformedDrafts;
     } catch (err) {
-      console.error('[UV Drafts] API sync error:', err);
+      console.error('[Creator Tools] API sync error:', err);
       throw err;
     }
   }
@@ -3907,7 +3907,7 @@
       if (isStaleRun()) return;
     })()
       .catch((err) => {
-        console.error('[UV Drafts] Top refresh failed after pending change:', reason, err);
+        console.error('[Creator Tools] Top refresh failed after pending change:', reason, err);
       })
       .finally(() => {
         setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
@@ -3947,14 +3947,14 @@
     uvDraftsPendingFailures = 0;
     pollPendingDraftsOnce().catch((err) => {
       uvDraftsPendingFailures += 1;
-      console.error('[UV Drafts] Initial pending poll failed:', err);
+      console.error('[Creator Tools] Initial pending poll failed:', err);
     });
     uvDraftsPendingPollTimerId = setInterval(() => {
       pollPendingDraftsOnce().catch((err) => {
         uvDraftsPendingFailures += 1;
-        console.error('[UV Drafts] Pending poll failed:', err);
+        console.error('[Creator Tools] Pending poll failed:', err);
         if (uvDraftsPendingFailures >= UV_DRAFTS_PENDING_MAX_FAILURES) {
-          console.error('[UV Drafts] Stopping pending polling after repeated failures');
+          console.error('[Creator Tools] Stopping pending polling after repeated failures');
           stopPendingDraftsPolling(false);
         }
       });
@@ -3995,20 +3995,20 @@
       const d = filtered.find(x => x?.id === id);
       return d?.is_unsynced === true;
     });
-    debugLog('[UV Drafts DEBUG] filterState:', uvDraftsFilterState,
+    debugLog('[Creator Tools DEBUG] filterState:', uvDraftsFilterState,
       '| bookmarks in storage:', _bmIds.length,
       '| drafts in data:', filtered.length,
       '| found in data:', _bmInData.length,
       '| missing from data:', _bmMissing.length,
       '| unsynced:', _bmUnsynced.length);
     if (_bmIds.length > 0) {
-      debugLog('[UV Drafts DEBUG] bookmark IDs:', _bmIds);
+      debugLog('[Creator Tools DEBUG] bookmark IDs:', _bmIds);
     }
     if (_bmMissing.length > 0) {
-      debugLog('[UV Drafts DEBUG] missing IDs:', _bmMissing);
+      debugLog('[Creator Tools DEBUG] missing IDs:', _bmMissing);
     }
     // Also log raw localStorage value for format check
-    debugLog('[UV Drafts DEBUG] raw localStorage:', localStorage.getItem(BOOKMARKS_KEY));
+    debugLog('[Creator Tools DEBUG] raw localStorage:', localStorage.getItem(BOOKMARKS_KEY));
 
     // Apply search filter
     if (uvDraftsSearchQuery) {
@@ -4367,7 +4367,7 @@
         playBtn.style.display = 'none';
         uvDraftsCurrentlyPlayingVideo = video;
         video.play().catch((err) => {
-          console.log('[UV Drafts] Play button click failed:', err);
+          console.log('[Creator Tools] Play button click failed:', err);
         });
       });
       thumbContainer.appendChild(playBtn);
@@ -4628,7 +4628,7 @@
         await Promise.resolve(navigator?.clipboard?.writeText?.(prompt));
         flashIconSuccess(copyBtn, icons.copy);
       } catch (err) {
-        console.warn('[UV Drafts] Clipboard copy failed:', err);
+        console.warn('[Creator Tools] Clipboard copy failed:', err);
       }
     });
     copyBtn.disabled = !String(draft.prompt || '').trim();
@@ -4679,7 +4679,7 @@
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 10000);
       } catch (err) {
-        console.error('[UV Drafts] Download error:', err);
+        console.error('[Creator Tools] Download error:', err);
       }
     });
     downloadBtn.disabled = isPendingDraft || !draft.download_url;
@@ -4730,7 +4730,7 @@
           alert('Failed to delete draft');
         }
       } catch (err) {
-        console.error('[UV Drafts] Delete error:', err);
+        console.error('[Creator Tools] Delete error:', err);
         alert('Failed to delete draft');
       }
     }));
@@ -4799,7 +4799,7 @@
           alert('Failed to post draft. The API may have changed.');
         }
       } catch (err) {
-        console.error('[UV Drafts] Post error:', err);
+        console.error('[Creator Tools] Post error:', err);
         postBtn.textContent = 'Post';
         postBtn.disabled = false;
         postBtn.dataset.tone = '';
@@ -4848,7 +4848,7 @@
         scheduleBtn.dataset.tone = 'info';
         alert(`Post scheduled for ${new Date(scheduledTime).toLocaleString()}`);
       } catch (err) {
-        console.error('[UV Drafts] Schedule error:', err);
+        console.error('[Creator Tools] Schedule error:', err);
         alert('Failed to schedule post');
       }
     });
@@ -5169,7 +5169,7 @@
         page: uvDraftsSyncUiState.syncing === true ? uvDraftsSyncUiState.page : 0,
       });
       resumePersistedMarkAllProgress({ queue: false });
-      console.log('[UV Drafts] No auth token yet, will retry on refresh');
+      console.log('[Creator Tools] No auth token yet, will retry on refresh');
       if (uvDraftsLoadingEl) {
         if (uvDraftsData.length === 0) {
           // No cache and no auth - show helpful message
@@ -5250,7 +5250,7 @@
         // Don't await - let it run in background
         syncRemainingDrafts(firstBatch.cursor, (count, page) => {
           // Optionally show background sync progress in a subtle way
-          console.log(`[UV Drafts] Background sync: ${count} drafts (page ${page})`);
+          console.log(`[Creator Tools] Background sync: ${count} drafts (page ${page})`);
           setUVDraftsSyncUiState({ syncing: true, processed: count, page });
         }, runId, firstBatch.items.length, fullSyncIds)
           .then(async (syncSucceeded) => {
@@ -5260,7 +5260,7 @@
             }
           })
           .catch((syncErr) => {
-            console.error('[UV Drafts] Background sync failed:', syncErr);
+            console.error('[Creator Tools] Background sync failed:', syncErr);
           })
           .finally(() => {
             if (isStaleRun()) return;
@@ -5284,7 +5284,7 @@
         }
       }
     } catch (err) {
-      console.error('[UV Drafts] Quick fetch failed, falling back to full sync:', err);
+      console.error('[Creator Tools] Quick fetch failed, falling back to full sync:', err);
       uvDraftsAwaitingMoreResults = false;
       // Fall back to full sync
       try {
@@ -5305,7 +5305,7 @@
         updateUVDraftsStats();
         setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
       } catch (syncErr) {
-        console.error('[UV Drafts] Full sync also failed:', syncErr);
+        console.error('[Creator Tools] Full sync also failed:', syncErr);
         setUVDraftsSyncUiState({ syncing: false, processed: uvDraftsData.length, page: 0 });
       }
       hideUVDraftsLoadingIndicator();
@@ -5329,7 +5329,7 @@
 
       for (const post of scheduled) {
         if (post.status === 'pending' && post.scheduled_at <= now) {
-          console.log('[UV Drafts] Executing scheduled post:', post.draft_id);
+          console.log('[Creator Tools] Executing scheduled post:', post.draft_id);
 
           try {
             // Post the draft
@@ -5363,24 +5363,24 @@
                 await uvDBPut(UV_DRAFTS_STORES.drafts, draft);
               }
 
-              console.log('[UV Drafts] Scheduled post succeeded:', post.draft_id);
+              console.log('[Creator Tools] Scheduled post succeeded:', post.draft_id);
             } else {
               post.status = 'failed';
               await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, post);
-              console.error('[UV Drafts] Scheduled post failed:', post.draft_id, res.status);
+              console.error('[Creator Tools] Scheduled post failed:', post.draft_id, res.status);
             }
           } catch (err) {
             post.status = 'failed';
             await uvDBPut(UV_DRAFTS_STORES.scheduledPosts, post);
-            console.error('[UV Drafts] Scheduled post error:', err);
+            console.error('[Creator Tools] Scheduled post error:', err);
           }
         }
       }
     } catch (err) {
-      console.error('[UV Drafts] Check scheduled posts error:', err);
+      console.error('[Creator Tools] Check scheduled posts error:', err);
       scheduledPostsFailureCount++;
       if (scheduledPostsFailureCount >= SCHEDULED_POSTS_MAX_FAILURES) {
-        console.error('[UV Drafts] Too many failures, stopping scheduled post checks');
+        console.error('[Creator Tools] Too many failures, stopping scheduled post checks');
         if (scheduledPostsTimerId) {
           clearInterval(scheduledPostsTimerId);
           scheduledPostsTimerId = null;
@@ -5833,7 +5833,7 @@
         renderUVDraftsGrid();
         updateUVDraftsStats();
       } catch (err) {
-        console.error('[UV Drafts] Failed to remove unsynced drafts:', err);
+        console.error('[Creator Tools] Failed to remove unsynced drafts:', err);
       }
       removeUnsyncedBtn.disabled = false;
       removeUnsyncedBtn.textContent = 'Remove All Unsynced';
