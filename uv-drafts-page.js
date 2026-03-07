@@ -31,6 +31,130 @@
     return available.find((model) => composerModelMatchesFamily(model, family))?.value || '';
   }
 
+  function mergePendingDraftStatesById(primaryDrafts, secondaryDrafts) {
+    const merged = [];
+    const seen = new Set();
+    const pushUnique = (draft) => {
+      const id = String(draft?.id || '').trim();
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      merged.push(draft);
+    };
+    for (const draft of Array.isArray(primaryDrafts) ? primaryDrafts : []) pushUnique(draft);
+    for (const draft of Array.isArray(secondaryDrafts) ? secondaryDrafts : []) pushUnique(draft);
+    return merged;
+  }
+
+  function buildPendingCompletionDraft(draft) {
+    const next = draft && typeof draft === 'object' ? { ...draft } : {};
+    next.is_pending = true;
+    next.pending_status = 'complete';
+    next.pending_task_status = 'complete';
+    next.progress_pct = 100;
+    next.pending_completion_waiting = true;
+    return next;
+  }
+
+  function isDraftPresentInCollection(drafts, draftId) {
+    const id = String(draftId || '').trim();
+    if (!id || !Array.isArray(drafts)) return false;
+    return drafts.some((draft) => String(draft?.id || '').trim() === id);
+  }
+
+  function resolvePendingPollState(previousVisibleDrafts, previousEndpointIds, nextEndpointDrafts, existingDrafts, pendingLogic = null) {
+    const priorVisible = Array.isArray(previousVisibleDrafts) ? previousVisibleDrafts : [];
+    const priorEndpointIds = previousEndpointIds instanceof Set
+      ? previousEndpointIds
+      : new Set(
+        (Array.isArray(previousEndpointIds) ? previousEndpointIds : [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      );
+    const nextPending = Array.isArray(nextEndpointDrafts) ? nextEndpointDrafts : [];
+    const nextEndpointIds = new Set(
+      nextPending
+        .map((draft) => String(draft?.id || '').trim())
+        .filter(Boolean)
+    );
+    const droppedIds = pendingLogic && typeof pendingLogic.getDroppedIds === 'function'
+      ? pendingLogic.getDroppedIds(priorEndpointIds, nextEndpointIds)
+      : [...priorEndpointIds].filter((id) => !nextEndpointIds.has(id));
+    const priorById = new Map(
+      priorVisible
+        .map((draft) => [String(draft?.id || '').trim(), draft])
+        .filter(([id]) => id)
+    );
+    const settlingDrafts = [];
+    const settlingSeen = new Set();
+
+    const maybePushSettlingDraft = (draft) => {
+      const id = String(draft?.id || '').trim();
+      if (!id || settlingSeen.has(id) || nextEndpointIds.has(id) || isDraftPresentInCollection(existingDrafts, id)) return;
+      settlingSeen.add(id);
+      settlingDrafts.push(buildPendingCompletionDraft(draft));
+    };
+
+    for (const draft of priorVisible) {
+      if (draft?.pending_completion_waiting === true) {
+        maybePushSettlingDraft(draft);
+      }
+    }
+    for (const droppedId of droppedIds) {
+      maybePushSettlingDraft(priorById.get(droppedId) || { id: droppedId });
+    }
+
+    const visibleDrafts = mergePendingDraftStatesById(nextPending, settlingDrafts);
+    const visibleIds = new Set(
+      visibleDrafts
+        .map((draft) => String(draft?.id || '').trim())
+        .filter(Boolean)
+    );
+    return {
+      droppedIds,
+      endpointIds: nextEndpointIds,
+      settlingDrafts,
+      visibleDrafts,
+      visibleIds,
+      requiresTopRefresh: droppedIds.length > 0 || settlingDrafts.length > 0,
+    };
+  }
+
+  function didPendingPollStateChange(previousVisibleDrafts, previousVisibleIds, nextVisibleDrafts, nextVisibleIds) {
+    const priorIds = previousVisibleIds instanceof Set
+      ? previousVisibleIds
+      : new Set(
+        (Array.isArray(previousVisibleIds) ? previousVisibleIds : [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      );
+    const nextIds = nextVisibleIds instanceof Set
+      ? nextVisibleIds
+      : new Set(
+        (Array.isArray(nextVisibleIds) ? nextVisibleIds : [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      );
+    if (nextIds.size !== priorIds.size || [...nextIds].some((id) => !priorIds.has(id))) return true;
+
+    const priorVisible = Array.isArray(previousVisibleDrafts) ? previousVisibleDrafts : [];
+    const nextVisible = Array.isArray(nextVisibleDrafts) ? nextVisibleDrafts : [];
+    if (nextVisible.length !== priorVisible.length) return true;
+
+    return nextVisible.some((draft, index) => {
+      const prev = priorVisible[index];
+      if (!prev) return true;
+      const draftId = String(draft?.id || '').trim();
+      const prevId = String(prev?.id || '').trim();
+      const draftProgress = draft?.progress_pct == null ? null : Number(draft.progress_pct);
+      const prevProgress = prev?.progress_pct == null ? null : Number(prev.progress_pct);
+      return draftId !== prevId ||
+        draftProgress !== prevProgress ||
+        String(draft?.pending_status || '') !== String(prev?.pending_status || '') ||
+        String(draft?.pending_task_status || '') !== String(prev?.pending_task_status || '') ||
+        (draft?.pending_completion_waiting === true) !== (prev?.pending_completion_waiting === true);
+    });
+  }
+
   function buildPublicPostPayload(generationId, postText) {
     const id = typeof generationId === 'string' ? generationId.trim() : '';
     if (!id) throw new Error('Missing draft ID');
@@ -1793,6 +1917,7 @@
   let uvDraftsWorkspaceFilter = null; // workspace_id or null
   let uvDraftsSearchQuery = '';
   let uvDraftsData = []; // Current loaded drafts
+  let uvDraftsInitialLoadComplete = false;
 
   // Virtual scrolling state
   const UV_DRAFTS_BATCH_SIZE = 50; // Render 50 cards at a time
@@ -1824,6 +1949,7 @@
   let uvDraftsMarkAllState = loadPersistedMarkAllState();
   let uvDraftsPendingData = [];
   let uvDraftsPendingIds = new Set();
+  let uvDraftsPendingEndpointIds = new Set();
   let uvDraftsPendingPollTimerId = null;
   let uvDraftsPendingFailures = 0;
   let uvDraftsPendingMinPolls = 0; // minimum polls before auto-stop (for newly submitted tasks)
@@ -4545,25 +4671,31 @@
     if (runId !== uvDraftsInitRunId) return;
 
     const pendingDrafts = buildPendingDraftsFromPayload(payload);
-    const nextIds = new Set(pendingDrafts.map((draft) => String(draft?.id || '')).filter(Boolean));
-    const droppedIds = uvDraftsLogic && typeof uvDraftsLogic.getDroppedIds === 'function'
-      ? uvDraftsLogic.getDroppedIds(uvDraftsPendingIds, nextIds)
-      : [...uvDraftsPendingIds].filter((id) => !nextIds.has(id));
+    const previousPendingDrafts = Array.isArray(uvDraftsPendingData) ? uvDraftsPendingData : [];
+    const previousPendingIds = uvDraftsPendingIds;
+    const pendingState = resolvePendingPollState(
+      previousPendingDrafts,
+      uvDraftsPendingEndpointIds,
+      pendingDrafts,
+      uvDraftsData,
+      uvDraftsLogic
+    );
+    const nextIds = pendingState.visibleIds;
 
-    // Re-render if IDs changed OR if progress/status data updated
-    const idsChanged = nextIds.size !== uvDraftsPendingIds.size ||
-      [...nextIds].some(id => !uvDraftsPendingIds.has(id));
-    const dataChanged = !idsChanged && pendingDrafts.some((d, i) => {
-      const prev = uvDraftsPendingData[i];
-      if (!prev) return true;
-      return d.progress_pct !== prev.progress_pct ||
-        d.pending_status !== prev.pending_status ||
-        d.pending_task_status !== prev.pending_task_status;
-    });
+    // Re-render if IDs changed OR if progress/status/completion data updated
+    const idsChanged = nextIds.size !== previousPendingIds.size ||
+      [...nextIds].some((id) => !previousPendingIds.has(id));
+    const dataChanged = !idsChanged && didPendingPollStateChange(
+      previousPendingDrafts,
+      previousPendingIds,
+      pendingState.visibleDrafts,
+      nextIds
+    );
     const pendingChanged = idsChanged || dataChanged;
 
+    uvDraftsPendingEndpointIds = pendingState.endpointIds;
     uvDraftsPendingIds = nextIds;
-    uvDraftsPendingData = pendingDrafts;
+    uvDraftsPendingData = pendingState.visibleDrafts;
     uvDraftsPendingFailures = 0;
 
     if (pendingChanged && isUVDraftsPageVisible()) {
@@ -4572,12 +4704,43 @@
         renderUVDraftsGrid(true);
       } else {
         // Only progress/status changed — update pending cards in-place
-        updatePendingCardsInPlace(pendingDrafts);
+        updatePendingCardsInPlace(uvDraftsPendingData);
       }
     }
 
-    if (droppedIds.length > 0) {
+    if (pendingState.requiresTopRefresh) {
       await refreshTopUVDraftsFromAPI('pending_dropped');
+      if (runId !== uvDraftsInitRunId) return;
+
+      const previousRefreshPendingDrafts = Array.isArray(uvDraftsPendingData) ? uvDraftsPendingData : [];
+      const previousRefreshPendingIds = uvDraftsPendingIds;
+      const refreshedPendingState = resolvePendingPollState(
+        previousRefreshPendingDrafts,
+        uvDraftsPendingEndpointIds,
+        pendingDrafts,
+        uvDraftsData,
+        uvDraftsLogic
+      );
+      const refreshIdsChanged = refreshedPendingState.visibleIds.size !== previousRefreshPendingIds.size ||
+        [...refreshedPendingState.visibleIds].some((id) => !previousRefreshPendingIds.has(id));
+      const refreshDataChanged = !refreshIdsChanged && didPendingPollStateChange(
+        previousRefreshPendingDrafts,
+        previousRefreshPendingIds,
+        refreshedPendingState.visibleDrafts,
+        refreshedPendingState.visibleIds
+      );
+
+      uvDraftsPendingEndpointIds = refreshedPendingState.endpointIds;
+      uvDraftsPendingIds = refreshedPendingState.visibleIds;
+      uvDraftsPendingData = refreshedPendingState.visibleDrafts;
+
+      if ((refreshIdsChanged || refreshDataChanged) && isUVDraftsPageVisible()) {
+        if (refreshIdsChanged) {
+          renderUVDraftsGrid(true);
+        } else {
+          updatePendingCardsInPlace(uvDraftsPendingData);
+        }
+      }
     }
   }
 
@@ -4624,6 +4787,7 @@
     if (clearState) {
       uvDraftsPendingData = [];
       uvDraftsPendingIds = new Set();
+      uvDraftsPendingEndpointIds = new Set();
       uvDraftsPendingFailures = 0;
     }
   }
@@ -5676,6 +5840,7 @@
   }
 
   function shouldDeferUVDraftsEmptyState() {
+    if (!uvDraftsInitialLoadComplete) return true;
     if (String(uvDraftsSearchQuery || '').trim()) return false;
     if (uvDraftsAwaitingMoreResults) return true;
     if (uvDraftsSyncUiState?.syncing === true) return true;
@@ -6018,6 +6183,7 @@
     const runId = ++uvDraftsInitRunId;
     const isStaleRun = () => runId !== uvDraftsInitRunId;
     uvDraftsAwaitingMoreResults = false;
+    uvDraftsInitialLoadComplete = false;
 
     // Only show loading indicator if there's no cached data already rendered
     if (uvDraftsLoadingEl && (!uvDraftsGridEl || uvDraftsGridEl.children.length === 0)) {
@@ -6033,6 +6199,7 @@
     // Load from cache first regardless of auth token
     uvDraftsData = await loadUVDraftsFromCache();
     if (isStaleRun()) return;
+    uvDraftsInitialLoadComplete = true;
     setUVDraftsSyncUiState({ processed: uvDraftsData.length });
     resumePersistedMarkAllProgress({ queue: false });
 
@@ -6910,6 +7077,7 @@
       extendDraftRenderEndToRowBoundary,
       extendLandscapeRunRenderEnd,
       isGenerationDraftId,
+      resolvePendingPollState,
       extractErrorMessage,
     };
   }

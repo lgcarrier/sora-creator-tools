@@ -130,6 +130,7 @@ function buildRenderHarness() {
     let uvDraftsAwaitingMoreResults = false;
     let uvDraftsSearchQuery = '';
     let uvDraftsData = [];
+    let uvDraftsInitialLoadComplete = true;
     let uvDraftsSyncUiState = { syncing: false, processed: 0, page: 0 };
     let uvDraftsCurrentlyPlayingDraftId = null;
     let uvDraftsCurrentlyPlayingVideo = null;
@@ -199,6 +200,7 @@ function buildRenderHarness() {
       if (Object.prototype.hasOwnProperty.call(next, 'currentDrafts')) currentDrafts = Array.isArray(next.currentDrafts) ? next.currentDrafts.slice() : [];
       if (Object.prototype.hasOwnProperty.call(next, 'allDrafts')) uvDraftsData = Array.isArray(next.allDrafts) ? next.allDrafts.slice() : [];
       if (Object.prototype.hasOwnProperty.call(next, 'awaitingMoreResults')) uvDraftsAwaitingMoreResults = !!next.awaitingMoreResults;
+      if (Object.prototype.hasOwnProperty.call(next, 'initialLoadComplete')) uvDraftsInitialLoadComplete = !!next.initialLoadComplete;
       if (Object.prototype.hasOwnProperty.call(next, 'syncing')) uvDraftsSyncUiState = { ...uvDraftsSyncUiState, syncing: !!next.syncing };
       if (Object.prototype.hasOwnProperty.call(next, 'searchQuery')) uvDraftsSearchQuery = String(next.searchQuery || '');
       if (Object.prototype.hasOwnProperty.call(next, 'loadingDisplay')) uvDraftsLoadingEl.style.display = next.loadingDisplay;
@@ -260,6 +262,28 @@ test('renderUVDraftsGrid keeps loading state while initial sync is still in prog
     allDrafts: [],
     awaitingMoreResults: false,
     syncing: true,
+    searchQuery: '',
+    resetGrid: true,
+    loadingDisplay: '',
+    loadingText: '',
+  });
+
+  harness.renderGrid();
+  const snapshot = harness.snapshot();
+
+  assert.equal(snapshot.emptyText, null);
+  assert.equal(snapshot.loadingDisplay, 'flex');
+  assert.equal(snapshot.loadingText, 'Loading drafts...');
+});
+
+test('renderUVDraftsGrid keeps loading state during fresh boot before initial cache hydration finishes', () => {
+  const harness = buildRenderHarness();
+  harness.setState({
+    currentDrafts: [],
+    allDrafts: [],
+    awaitingMoreResults: false,
+    initialLoadComplete: false,
+    syncing: false,
     searchQuery: '',
     resetGrid: true,
     loadingDisplay: '',

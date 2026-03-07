@@ -42,6 +42,7 @@ const {
   extendDraftRenderEndToRowBoundary,
   extendLandscapeRunRenderEnd,
   isGenerationDraftId,
+  resolvePendingPollState,
   extractErrorMessage,
 } = createUVDraftsPageModule.__test;
 
@@ -539,4 +540,62 @@ test('extractErrorMessage prefers nested backend message fields over object stri
     extractErrorMessage({ error: { code: 'bad_request' } }, 'Unknown error'),
     /bad_request/
   );
+});
+
+test('resolvePendingPollState keeps dropped pending drafts visible as Complete until the draft appears', () => {
+  const state = resolvePendingPollState(
+    [
+      {
+        id: 'gen_drop_1',
+        prompt: 'slow reveal',
+        pending_status: 'running',
+        pending_task_status: 'running',
+        progress_pct: 72,
+        is_pending: true,
+      },
+    ],
+    new Set(['gen_drop_1']),
+    [],
+    []
+  );
+
+  assert.deepEqual(state.droppedIds, ['gen_drop_1']);
+  assert.deepEqual(Array.from(state.endpointIds), []);
+  assert.deepEqual(Array.from(state.visibleIds), ['gen_drop_1']);
+  assert.equal(state.requiresTopRefresh, true);
+  assert.deepEqual(state.visibleDrafts, [
+    {
+      id: 'gen_drop_1',
+      prompt: 'slow reveal',
+      pending_status: 'complete',
+      pending_task_status: 'complete',
+      progress_pct: 100,
+      is_pending: true,
+      pending_completion_waiting: true,
+    },
+  ]);
+});
+
+test('resolvePendingPollState removes completion placeholders once the matching draft is in drafts', () => {
+  const state = resolvePendingPollState(
+    [
+      {
+        id: 'gen_done_1',
+        prompt: 'ocean sunset',
+        pending_status: 'complete',
+        pending_task_status: 'complete',
+        progress_pct: 100,
+        is_pending: true,
+        pending_completion_waiting: true,
+      },
+    ],
+    new Set(),
+    [],
+    [{ id: 'gen_done_1', prompt: 'ocean sunset' }]
+  );
+
+  assert.deepEqual(state.droppedIds, []);
+  assert.deepEqual(Array.from(state.visibleIds), []);
+  assert.deepEqual(state.visibleDrafts, []);
+  assert.equal(state.requiresTopRefresh, false);
 });
