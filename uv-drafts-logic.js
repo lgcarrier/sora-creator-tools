@@ -1,5 +1,5 @@
 /*
- * Shared UV Drafts logic for runtime + tests.
+ * Shared Creator Tools logic for runtime + tests.
  */
 (function initUVDraftsLogic(globalScope) {
   'use strict';

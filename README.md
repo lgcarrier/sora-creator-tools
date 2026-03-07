@@ -17,7 +17,7 @@ Chrome extension for `https://sora.chatgpt.com/*` that adds four major product s
 - **Creator Tools**, an extension-owned advanced drafts workflow at `/creatortools`
 - A local analytics dashboard at `dashboard.html` with metrics, compare mode, and a Harvest record browser
 
-Creator Tools is the canonical name for the advanced drafts surface. The older `/uv-drafts` route is treated as a legacy deep-link alias and is redirected onto `/creatortools`.
+Creator Tools is the canonical name for the advanced drafts surface, mounted at `/creatortools`.
 
 Unofficial community extension. Not affiliated with, endorsed by, or sponsored by OpenAI. "Sora" is a trademark of OpenAI.
 
@@ -115,15 +115,13 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 
 ### Creator Tools (`/creatortools`)
 
-Creator Tools is the extension-owned advanced drafts workflow. It is loaded lazily only when the route matches `/creatortools` or the legacy `/uv-drafts` alias.
+Creator Tools is the extension-owned advanced drafts workflow. It is loaded lazily only when the route matches `/creatortools`.
 
 #### Route and access model
 
 - Canonical route: `/creatortools`
-- Legacy alias: `/uv-drafts`
 - Access paths:
   - direct navigation to `/creatortools`
-  - legacy deep links to `/uv-drafts` are canonicalized
   - sidebar **Creator Tools** button
   - native `/drafts` queue panel bridge
 
@@ -352,7 +350,6 @@ The dashboard is an extension page, not a Sora route. It is opened from the exte
   - `/d/<id>`
 - Extension virtual route:
   - `/creatortools`
-  - `/uv-drafts` remains supported as a legacy alias and is canonicalized to `/creatortools`
 - Extension page:
   - `dashboard.html`
 
@@ -522,7 +519,6 @@ Current automated coverage primarily targets:
 
 - Gather mode works best in a dedicated window or long-lived tab if you want uninterrupted local collection.
 - Creator Tools is an extension-owned overlay surface mounted on `/creatortools`, not a server-backed Sora page.
-- If an old `/uv-drafts` link still exists in your notes or bookmarks, it should resolve onto `/creatortools`.
 - After changing any injected script, always reload the unpacked extension and refresh the target Sora tab.
 
 ## Contributing

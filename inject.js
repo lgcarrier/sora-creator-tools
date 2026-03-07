@@ -120,7 +120,7 @@
   const DRAFT_BUTTON_SPACING = 4; // px between buttons
   const SORA_DEFAULT_FPS = 30; // Sora standard framerate (fallback if API doesn't provide fps)
 
-  // == UV Drafts Page Constants ==
+  // == Creator Tools Page Constants ==
   let capturedAuthToken = null; // Captured from intercepted fetch requests
   let modelOverride = null; // Custom model override for create requests
   let uvDraftsPage = null;
@@ -851,8 +851,7 @@
   const isDraftDetail = () => location.pathname === '/d' || location.pathname.startsWith('/d/');
   const isDraftEditor = () => location.pathname === '/de' || location.pathname.startsWith('/de/');
   const UV_DRAFTS_CANONICAL_PREFIX = '/creatortools';
-  const UV_DRAFTS_ROUTE_RE = /^\/(?:uv-drafts|creatortools)(?:\/|$)/i;
-  const UV_DRAFTS_LEGACY_ROUTE_RE = /^\/uv-drafts(?:\/|$)/i;
+  const UV_DRAFTS_ROUTE_RE = /^\/creatortools(?:\/|$)/i;
   const isUVDrafts = () => UV_DRAFTS_ROUTE_RE.test(String(location.pathname || ''));
 
   function getCanonicalUVDraftsPath(pathname = location.pathname) {
@@ -861,19 +860,7 @@
     if (current === UV_DRAFTS_CANONICAL_PREFIX || current.startsWith(`${UV_DRAFTS_CANONICAL_PREFIX}/`)) {
       return current;
     }
-    if (!UV_DRAFTS_LEGACY_ROUTE_RE.test(current)) {
-      return UV_DRAFTS_CANONICAL_PREFIX;
-    }
-    const suffix = current.slice('/uv-drafts'.length);
-    return `${UV_DRAFTS_CANONICAL_PREFIX}${suffix}`;
-  }
-
-  function maybeCanonicalizeUVDraftsRoute() {
-    if (!UV_DRAFTS_LEGACY_ROUTE_RE.test(String(location.pathname || ''))) return false;
-    const nextPath = getCanonicalUVDraftsPath(location.pathname);
-    const nextUrl = `${nextPath}${location.search || ''}${location.hash || ''}`;
-    history.replaceState(history.state, '', nextUrl);
-    return true;
+    return UV_DRAFTS_CANONICAL_PREFIX;
   }
 
   const isTopFeed = () => {
@@ -7811,7 +7798,7 @@ async function renderAnalyzeTable(force = false) {
     };
     const origFetch = window.fetch;
     window.fetch = async function (input, init) {
-      // Capture Authorization header from outgoing requests for UV Drafts API
+      // Capture Authorization header from outgoing requests for the Creator Tools API
       try {
         let headers = init?.headers;
 
@@ -9823,9 +9810,8 @@ async function renderAnalyzeTable(force = false) {
     const navigated = rk !== prev;
     lastRouteKey = rk;
 
-    // Handle UV Drafts page
+    // Handle Creator Tools page
     if (isUVDrafts()) {
-      if (maybeCanonicalizeUVDraftsRoute()) return;
       stopDraftDetailBadgeLoop();
       teardownDetailBadge();
       // Hide other overlays
@@ -9840,18 +9826,18 @@ async function renderAnalyzeTable(force = false) {
         stopApiHarvestRun('navigation');
       } catch {}
 
-      // Hide control bar on UV Drafts
+      // Hide control bar on Creator Tools
       teardownControlBar();
       stopPendingCreateBatchAutomation();
 
-      // Show UV Drafts page
+      // Show Creator Tools page
       const uvDraftsPageEl = ensureUVDraftsPage();
       if (!uvDraftsPageEl) requestUVDraftsScriptLoad(true);
       // The drafts route is extension-owned; keep the tab title from falling back to Sora's 404 title.
       startUVDraftsTitleGuard();
       return;
     } else {
-      // Hide UV Drafts page if we're not on that route
+      // Hide Creator Tools page if we're not on that route
       hideUVDraftsPage();
       restoreDocumentTitleAfterUVDrafts();
     }
@@ -10158,11 +10144,11 @@ async function renderAnalyzeTable(force = false) {
       dlog('feed', 'Dashboard button injected into left sidebar');
     } catch {}
 
-    // Also inject UV Drafts button
+    // Also inject the Creator Tools button
     injectUVDraftsButton();
   }
 
-  // Inject UV Drafts button into sidebar
+  // Inject Creator Tools button into the sidebar
   let uvDraftsBtnEl = null;
 
   function injectUVDraftsButton() {
@@ -10178,7 +10164,7 @@ async function renderAnalyzeTable(force = false) {
     const dashboardBtn = document.querySelector('.sora-uv-dashboard-btn');
     if (!dashboardBtn) return;
 
-    // Create UV Drafts button
+    // Create Creator Tools button
     const uvDraftsBtn = document.createElement('button');
     uvDraftsBtn.className = 'sora-uv-drafts-btn p-3.5 group data-[state=open]:opacity-100 opacity-50 hover:opacity-100 focus-visible:opacity-100';
     uvDraftsBtn.setAttribute('aria-label', 'Creator Tools');
@@ -10217,7 +10203,7 @@ async function renderAnalyzeTable(force = false) {
     uvDraftsBtnEl = uvDraftsBtn;
   }
 
-  // Global click delegation for UV Drafts button
+  // Global click delegation for the Creator Tools button
   document.addEventListener('click', (e) => {
     const btn = e.target.closest('.sora-uv-drafts-btn');
     if (!btn) return;
