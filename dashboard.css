@@ -52,7 +52,7 @@
   --radius-sm:10px;
   --radius-md:14px;
   --radius-lg:18px;
-  --sidebar-width:320px;
+  --sidebar-width:300px;
   --sidebar-min:260px;
   --sidebar-max:620px;
   --font-sans:"Sora","Space Grotesk","IBM Plex Sans","Avenir Next","Helvetica Neue",sans-serif;
@@ -1165,10 +1165,46 @@ body.is-resizing{cursor:col-resize;user-select:none}
   flex-wrap:wrap;
 }
 .metrics-auto-refresh{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
   font-size:12px;
   font-weight:400;
   letter-spacing:0.02em;
   color:rgba(255,255,255,0.55);
+}
+.metrics-auto-refresh-force{
+  all:unset;
+  display:inline-block;
+  position:relative;
+  top:-1px;
+  cursor:pointer;
+  color:rgba(255,255,255,0.65);
+  font-family:var(--font-mono);
+  font-size:16px;
+  letter-spacing:0;
+  line-height:1;
+  transform:rotate(90deg);
+  transform-origin:center;
+}
+.metrics-auto-refresh-force:hover{
+  color:rgba(255,255,255,0.9);
+  text-decoration:none;
+  transform:rotate(90deg);
+}
+.metrics-auto-refresh-force:active{
+  transform:rotate(90deg);
+}
+.metrics-auto-refresh-force:focus-visible{
+  outline:1px solid rgba(var(--accent-rgb),0.75);
+  outline-offset:2px;
+  border-radius:4px;
+  transform:rotate(90deg);
+}
+.metrics-auto-refresh-force:disabled{
+  cursor:default;
+  color:rgba(255,255,255,0.35);
+  text-decoration:none;
 }
 .metrics-auto-refresh.is-hidden{display:none}
 .is-hidden{display:none !important}
@@ -1739,7 +1775,7 @@ body.is-resizing{cursor:col-resize;user-select:none}
 }
 .brought-by-grid{
   display:grid;
-  grid-template-columns:repeat(3, minmax(220px, 1fr));
+  grid-template-columns:repeat(4, minmax(120px, 1fr));
   gap:12px;
 }
 .brought-by-card{
@@ -1840,6 +1876,10 @@ body.is-resizing{cursor:col-resize;user-select:none}
   transform:translateY(-1px);
   color:#eff7ff;
 }
+.brought-by-song-card{
+  grid-column:span 2;
+  height:100%;
+}
 .theme-song{
   margin:8px 0 28px;
 }
@@ -1916,9 +1956,13 @@ body.is-resizing{cursor:col-resize;user-select:none}
   .theme-song-panel{
     grid-template-columns:1fr;
   }
+  .brought-by-song-card{
+    grid-column:span 1;
+  }
 }
 @media (max-width: 1000px){
-  .brought-by-grid{grid-template-columns:repeat(2, minmax(220px, 1fr));}
+  .brought-by-grid{grid-template-columns:repeat(2, minmax(130px, 1fr));}
+  .brought-by-song-card{grid-column:span 2;}
 }
 @media (max-width: 720px){
   .brought-by-grid{grid-template-columns:1fr;}
@@ -1975,6 +2019,12 @@ body.is-resizing{cursor:col-resize;user-select:none}
   .sidebar{order:2;max-width:none;border-radius:14px}
   .content{padding:16px 18px 20px;border-radius:14px}
   .sidebar-resizer{display:none}
+}
+
+@media (min-width: 901px){
+  :root{
+    --sidebar-width:400px;
+  }
 }
 
 /* Purge Modal Styles */
