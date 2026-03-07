@@ -36,9 +36,12 @@ const {
   normalizeDraftOrientationValue,
   extractDraftDimensions,
   resolveDraftOrientationValue,
+  getDraftCardVideoObjectFit,
+  applyDraftCardVideoFullscreenPresentation,
   getDraftOrientationForLayout,
   getDraftCardPaddingTop,
   getDraftCardLayoutStyle,
+  getUVDraftsViewportRerenderTargetCount,
   shouldGroupLandscapeDraftCard,
   getLandscapeRunChunkPlan,
   planLandscapeRunChunks,
@@ -468,6 +471,29 @@ test('draft card layout keeps cards top-aligned while portraits stay full height
     alignSelf: 'start',
     paddingTop: '177.78%',
   });
+});
+
+test('viewport rerenders preserve the currently loaded draft depth instead of collapsing to the first batch', () => {
+  assert.equal(getUVDraftsViewportRerenderTargetCount(300, 180), 180);
+  assert.equal(getUVDraftsViewportRerenderTargetCount(180, 300), 180);
+  assert.equal(getUVDraftsViewportRerenderTargetCount(24, 0), 24);
+  assert.equal(getUVDraftsViewportRerenderTargetCount(0, 180), 0);
+});
+
+test('fullscreen draft video presentation switches portrait playback from cover to contain', () => {
+  const video = { style: {}, ownerDocument: { fullscreenElement: null } };
+
+  assert.equal(getDraftCardVideoObjectFit(false), 'cover');
+  assert.equal(getDraftCardVideoObjectFit(true), 'contain');
+
+  assert.equal(applyDraftCardVideoFullscreenPresentation(video, video.ownerDocument), false);
+  assert.equal(video.style.objectFit, 'cover');
+  assert.equal(video.style.background, '');
+
+  video.ownerDocument.fullscreenElement = video;
+  assert.equal(applyDraftCardVideoFullscreenPresentation(video, video.ownerDocument), true);
+  assert.equal(video.style.objectFit, 'contain');
+  assert.equal(video.style.background, '#000');
 });
 
 test('landscape run planner packs multiple items as half-height pairs by column', () => {

@@ -55,6 +55,28 @@
     return next;
   }
 
+  function getDraftCardVideoObjectFit(isFullscreen = false) {
+    return isFullscreen ? 'contain' : 'cover';
+  }
+
+  function getDocumentFullscreenElement(targetDocument = null) {
+    const doc = targetDocument && typeof targetDocument === 'object'
+      ? targetDocument
+      : (typeof document !== 'undefined' ? document : null);
+    if (!doc) return null;
+    return doc.fullscreenElement || doc.webkitFullscreenElement || null;
+  }
+
+  function applyDraftCardVideoFullscreenPresentation(video, targetDocument = null) {
+    if (!video || typeof video !== 'object') return false;
+    const isFullscreen = getDocumentFullscreenElement(targetDocument || video.ownerDocument || null) === video;
+    if (video.style) {
+      video.style.objectFit = getDraftCardVideoObjectFit(isFullscreen);
+      video.style.background = isFullscreen ? '#000' : '';
+    }
+    return isFullscreen;
+  }
+
   function findSettledDraftMatchForPending(pendingDraft, drafts) {
     if (!pendingDraft || typeof pendingDraft !== 'object' || !Array.isArray(drafts)) return null;
     const pendingKeys = new Set(
@@ -652,6 +674,16 @@
 
   const UV_DRAFTS_GRID_MIN_COLUMN_WIDTH = 240;
   const UV_DRAFTS_GRID_GAP = 14;
+  const UV_DRAFTS_BATCH_SIZE = 50; // Render 50 cards at a time
+
+  function getUVDraftsViewportRerenderTargetCount(totalDraftCount, renderedCount) {
+    const total = Math.max(0, Math.floor(Number(totalDraftCount) || 0));
+    const rendered = Math.max(0, Math.floor(Number(renderedCount) || 0));
+    return Math.max(
+      Math.min(UV_DRAFTS_BATCH_SIZE, total),
+      Math.min(rendered, total)
+    );
+  }
 
   function shouldGroupLandscapeDraftCard(drafts, index) {
     if (!Array.isArray(drafts) || !Number.isInteger(index) || index < 0 || index >= drafts.length) {
@@ -2088,10 +2120,6 @@
   let uvDraftsSearchQuery = '';
   let uvDraftsData = []; // Current loaded drafts
   let uvDraftsInitialLoadComplete = false;
-
-  // Virtual scrolling state
-  const UV_DRAFTS_BATCH_SIZE = 50; // Render 50 cards at a time
-
   // Video playback state - once user clicks play, enable hover-to-play
   let uvDraftsVideoInteracted = false;
   let uvDraftsCurrentlyPlayingVideo = null;
@@ -5286,6 +5314,7 @@
       // Video element (hidden by default, shown on hover)
       // NOTE: Don't set src here to avoid memory issues with 500+ drafts
       const video = document.createElement('video');
+      video.className = 'uvd-thumb-video';
       video.dataset.src = draft.preview_url || ''; // Store for lazy loading
       video.playsInline = true;
       video.preload = 'none';
@@ -5301,6 +5330,13 @@
         transition: 'opacity 0.2s ease',
         zIndex: '1',
       });
+      applyDraftCardVideoFullscreenPresentation(video);
+      const syncVideoFullscreenPresentation = () => {
+        applyDraftCardVideoFullscreenPresentation(video);
+      };
+      video.addEventListener('fullscreenchange', syncVideoFullscreenPresentation);
+      video.addEventListener('webkitbeginfullscreen', syncVideoFullscreenPresentation);
+      video.addEventListener('webkitendfullscreen', syncVideoFullscreenPresentation);
       thumbContainer.appendChild(video);
 
       // Play button overlay
@@ -5715,8 +5751,7 @@
       hideBtn.innerHTML = draft.hidden ? icons.eyeClosed : icons.eyeOpen;
       hideBtn.title = draft.hidden ? 'Unhide' : 'Hide';
       await uvDBPut(UV_DRAFTS_STORES.drafts, draft);
-      renderUVDraftsGrid();
-      restoreUVDraftsScrollAnchor(anchor);
+      rerenderUVDraftsGridPreservingViewport(anchor);
       updateUVDraftsStats();
     });
     hideBtn.disabled = isPendingDraft;
@@ -5741,12 +5776,13 @@
           headers: deleteHeaders,
         });
         if (res.ok) {
+          const anchor = captureUVDraftsScrollAnchor([draft.id]);
           await uvDBDelete(UV_DRAFTS_STORES.drafts, draft.id);
           await deleteScheduledPostsForDraft(draft.id);
           uvDraftsData = removeDraftById(uvDraftsData, draft.id);
           uvDraftsJustSeenIds.delete(draft.id);
           removeBookmark(draft.id);
-          renderUVDraftsGrid();
+          rerenderUVDraftsGridPreservingViewport(anchor);
           updateUVDraftsStats();
         } else {
           alert('Failed to delete draft');
@@ -5964,21 +6000,25 @@
       card.style.transform = '';
       card.style.boxShadow = '';
       if (video) {
-        video.pause();
-        video.currentTime = 0;
-        video.style.opacity = '0';
-        video.controls = false;
-        if (uvDraftsCurrentlyPlayingVideo === video) {
-          uvDraftsCurrentlyPlayingVideo = null;
-          uvDraftsCurrentlyPlayingDraftId = null;
-        }
-      }
-      if (playBtn) {
+        setTimeout(() => {
+          if (applyDraftCardVideoFullscreenPresentation(video)) return;
+          video.pause();
+          video.currentTime = 0;
+          video.style.opacity = '0';
+          video.controls = false;
+          if (uvDraftsCurrentlyPlayingVideo === video) {
+            uvDraftsCurrentlyPlayingVideo = null;
+            uvDraftsCurrentlyPlayingDraftId = null;
+          }
+          if (playBtn) {
+            playBtn.style.display = 'flex';
+          }
+        }, 0);
+      } else if (playBtn) {
         playBtn.style.display = 'flex';
       }
     });
 
-    // Track full video playthrough - mark as read on server and locally (only for non-violations)
     if (video) {
       video.addEventListener('ended', () => {
         if (!uvDraftsJustSeenIds.has(draft.id) && isDraftUnreadState(draft)) {
@@ -6106,6 +6146,32 @@
     updateLoadMoreIndicator();
   }
 
+  function rerenderUVDraftsGridPreservingViewport(anchor = null) {
+    if (!uvDraftsGridEl) return;
+    uvDraftsFilteredCache = getRenderableUVDrafts();
+    if (uvDraftsFilteredCache.length === 0) {
+      renderUVDraftsGrid();
+      return;
+    }
+
+    const preservedAnchor = anchor || captureUVDraftsScrollAnchor();
+    const targetCount = getUVDraftsViewportRerenderTargetCount(uvDraftsFilteredCache.length, uvDraftsRenderedCount);
+    const maxLandscapeColumns = getLandscapeRunGridColumnCapacity(uvDraftsGridEl);
+    uvDraftsLastGridColumnCapacity = maxLandscapeColumns;
+    const end = extendDraftRenderEndToRowBoundary(
+      uvDraftsFilteredCache,
+      targetCount,
+      maxLandscapeColumns
+    );
+
+    uvDraftsGridEl.innerHTML = '';
+    uvDraftsRenderedCount = 0;
+    appendCardsToGrid(0, end, { maxLandscapeColumns });
+    setupUVDraftsInfiniteScroll();
+    restoreUVDraftsScrollAnchor(preservedAnchor);
+    restoreUVDraftsPlaybackState();
+  }
+
   function rerenderUVDraftsGridForGeometryChange() {
     if (!uvDraftsGridEl || !uvDraftsPageEl || uvDraftsPageEl.style.display === 'none') return;
     uvDraftsFilteredCache = getRenderableUVDrafts();
@@ -6115,10 +6181,7 @@
     }
 
     const scrollTop = uvDraftsPageEl.scrollTop;
-    const targetCount = Math.max(
-      Math.min(UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length),
-      Math.min(uvDraftsRenderedCount, uvDraftsFilteredCache.length)
-    );
+    const targetCount = getUVDraftsViewportRerenderTargetCount(uvDraftsFilteredCache.length, uvDraftsRenderedCount);
     const maxLandscapeColumns = getLandscapeRunGridColumnCapacity(uvDraftsGridEl);
     uvDraftsLastGridColumnCapacity = maxLandscapeColumns;
     const end = extendDraftRenderEndToRowBoundary(
@@ -6903,6 +6966,7 @@
       .uvd-card.is-violation { background: #3a2020; }
       .uvd-card.is-processing-error { background: #1f273b; border-color: rgba(125,164,255,0.5); }
       .uvd-thumb-link { display:block; text-decoration:none; color:inherit; }
+      .uvd-thumb-video:fullscreen, .uvd-thumb-video:-webkit-full-screen { width: 100vw !important; height: 100vh !important; object-fit: contain !important; background: #000 !important; }
       .uvd-info { padding: 10px; }
       .uvd-prompt { font-size: 13px; font-weight: 500; color: var(--uvd-text); line-height: 1.3; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-decoration: none; }
       .uvd-prompt:hover { color: #d9e7ff; }
@@ -7314,9 +7378,12 @@
       normalizeDraftOrientationValue,
       extractDraftDimensions,
       resolveDraftOrientationValue,
+      getDraftCardVideoObjectFit,
+      applyDraftCardVideoFullscreenPresentation,
       getDraftOrientationForLayout,
       getDraftCardPaddingTop,
       getDraftCardLayoutStyle,
+      getUVDraftsViewportRerenderTargetCount,
       shouldGroupLandscapeDraftCard,
       getLandscapeRunChunkPlan,
       planLandscapeRunChunks,
