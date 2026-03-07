@@ -624,3 +624,17 @@ test('resolvePendingPollState removes completion placeholders when the finished 
   assert.deepEqual(state.visibleDrafts, []);
   assert.equal(state.requiresTopRefresh, false);
 });
+
+test('resolvePendingPollState does not synthesize a new completion card for a dropped id that was never visible', () => {
+  const state = resolvePendingPollState(
+    [],
+    new Set(['gen_hidden_drop_1']),
+    [],
+    []
+  );
+
+  assert.deepEqual(state.droppedIds, ['gen_hidden_drop_1']);
+  assert.deepEqual(Array.from(state.visibleIds), []);
+  assert.deepEqual(state.visibleDrafts, []);
+  assert.equal(state.requiresTopRefresh, true);
+});

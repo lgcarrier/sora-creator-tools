@@ -111,7 +111,10 @@
       }
     }
     for (const droppedId of droppedIds) {
-      maybePushSettlingDraft(priorById.get(droppedId) || { id: droppedId });
+      const priorVisibleDraft = priorById.get(droppedId);
+      if (priorVisibleDraft) {
+        maybePushSettlingDraft(priorVisibleDraft);
+      }
     }
 
     const visibleDrafts = mergePendingDraftStatesById(nextPending, settlingDrafts);
@@ -1531,8 +1534,9 @@
   }
 
   // Sync remaining drafts in background starting from cursor
-  async function syncRemainingDrafts(startCursor, onProgress, runId = uvDraftsInitRunId, startOrder = 0, syncedIds = null, maxPages = Infinity) {
+  async function syncRemainingDrafts(startCursor, onProgress, runId = uvDraftsInitRunId, startOrder = 0, syncedIds = null, maxPages = Infinity, options = {}) {
     const isStaleRun = () => runId !== uvDraftsInitRunId;
+    const suppressUiRender = options?.suppressUiRender === true;
     let cursor = startCursor;
     let pageNum = 1;
     let syncSucceeded = true;
@@ -1595,10 +1599,12 @@
           pageNum++;
           if (onProgress) onProgress(uvDraftsData.length, pageNum);
 
-          if (hadUpdates && uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') {
+          if (!suppressUiRender && hadUpdates && uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') {
             renderUVDraftsSyncUpdate();
           }
-          updateUVDraftsStats();
+          if (!suppressUiRender) {
+            updateUVDraftsStats();
+          }
         }
 
         // Trust the cursor, don't cut off based on count
@@ -1640,8 +1646,10 @@
               for (const incoming of incomingById2.values()) mergedData2.push(incoming);
               uvDraftsData = mergedData2;
               uvDraftsAwaitingMoreResults = false;
-              if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') renderUVDraftsSyncUpdate();
-              updateUVDraftsStats();
+              if (!suppressUiRender && uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') renderUVDraftsSyncUpdate();
+              if (!suppressUiRender) {
+                updateUVDraftsStats();
+              }
             }
           }
         }
@@ -4635,6 +4643,7 @@
     uvDraftsTopRefreshInFlight = (async () => {
       const runId = uvDraftsInitRunId;
       const isStaleRun = () => runId !== uvDraftsInitRunId;
+      const suppressUiRender = reason === 'pending_dropped';
       const fullSyncIds = new Set();
       setUVDraftsSyncUiState({ syncing: true, processed: uvDraftsData.length, page: 1 });
       const firstBatch = await fetchFirstUVDrafts(30);
@@ -4655,12 +4664,20 @@
       await uvDBPutAll(UV_DRAFTS_STORES.drafts, transformed);
       if (isStaleRun()) return;
       uvDraftsData = mergeDraftListById(transformed, uvDraftsData);
-      if (isUVDraftsPageVisible()) {
+      if (!suppressUiRender && isUVDraftsPageVisible()) {
         renderUVDraftsGrid();
         updateUVDraftsStats();
       }
       if (firstBatch.cursor) {
-        const syncSucceeded = await syncRemainingDrafts(firstBatch.cursor, null, runId, firstBatch.items.length, fullSyncIds, 3);
+        const syncSucceeded = await syncRemainingDrafts(
+          firstBatch.cursor,
+          null,
+          runId,
+          firstBatch.items.length,
+          fullSyncIds,
+          3,
+          { suppressUiRender }
+        );
         if (!syncSucceeded || isStaleRun()) return;
       }
     })()
@@ -4745,12 +4762,9 @@
       uvDraftsPendingIds = refreshedPendingState.visibleIds;
       uvDraftsPendingData = refreshedPendingState.visibleDrafts;
 
-      if ((refreshIdsChanged || refreshDataChanged) && isUVDraftsPageVisible()) {
-        if (refreshIdsChanged) {
-          renderUVDraftsGrid(true);
-        } else {
-          updatePendingCardsInPlace(uvDraftsPendingData);
-        }
+      if (isUVDraftsPageVisible()) {
+        renderUVDraftsGrid(true);
+        updateUVDraftsStats();
       }
     }
   }
@@ -5078,17 +5092,7 @@
         violationPlaceholder.appendChild(promptText);
       }
 
-      if (isPendingDraft) {
-        const helpText = document.createElement('div');
-        helpText.textContent = 'This draft is still in progress.';
-        Object.assign(helpText.style, {
-          color: '#9eb8ff',
-          fontSize: '10px',
-          lineHeight: '1.35',
-          marginTop: '8px',
-        });
-        violationPlaceholder.appendChild(helpText);
-      } else if (isProcessingError) {
+      if (isProcessingError) {
         const helpText = document.createElement('div');
         helpText.textContent = 'Try Retry or Use as Composer Source to adjust prompt/settings.';
         Object.assign(helpText.style, {
