@@ -433,6 +433,7 @@
   const isProfile = () => location.pathname.startsWith('/profile');
   const isPost = () => /^\/p\/s_[A-Za-z0-9]+/i.test(location.pathname);
   const isDraftDetail = () => location.pathname === '/d' || location.pathname.startsWith('/d/');
+  const isDraftEditor = () => location.pathname === '/de' || location.pathname.startsWith('/de/');
   const isUVDrafts = () => location.pathname === '/creatortools' || location.pathname.startsWith('/creatortools');
 
   const isTopFeed = () => {
@@ -446,7 +447,14 @@
 
   const isFilterHiddenPage = () => {
     const p = location.pathname;
-    return p.startsWith('/storyboard') || p.startsWith('/drafts') || p.startsWith('/d/') || p.startsWith('/p/') || p.startsWith('/e/');
+    return p.startsWith('/storyboard')
+      || p.startsWith('/drafts')
+      || p === '/d'
+      || p.startsWith('/d/')
+      || p === '/de'
+      || p.startsWith('/de/')
+      || p.startsWith('/p/')
+      || p.startsWith('/e/');
   };
 
   const isDrafts = () => location.pathname.startsWith('/drafts');
@@ -5054,7 +5062,7 @@ async function renderAnalyzeTable(force = false) {
   }
 
   function toggleAnalyzeMode() {
-    if (isDrafts()) return; // Don't allow Analyze mode on Drafts page
+    if (isDrafts() || isDraftEditor()) return; // Don't allow Analyze mode on drafts/editor pages
     if (analyzeActive) exitAnalyzeMode();
     else enterAnalyzeMode();
   }
