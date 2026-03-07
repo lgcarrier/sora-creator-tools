@@ -8,6 +8,7 @@ const {
   resolveComposerModelValue,
   buildPublicPostPayload,
   extractPublishedPost,
+  resolveDraftPostData,
   applyPublishedPostToDraftData,
   extractRemixTargetPostId,
   extractPublishedPostGenerationId,
@@ -20,6 +21,7 @@ const {
   extractPersistedComposerPromptValue,
   resolvePreferredComposerPromptValue,
   filterDraftsByWorkspace,
+  isDraftVisibleInBookmarkedFilter,
   slugifyWorkspaceName,
   getWorkspaceUrlSlug,
   findWorkspaceIdByUrlSlug,
@@ -43,6 +45,7 @@ const {
   extendLandscapeRunRenderEnd,
   isGenerationDraftId,
   resolvePendingPollState,
+  buildPendingCompletionHandoffPlan,
   extractErrorMessage,
 } = createUVDraftsPageModule.__test;
 
@@ -124,6 +127,34 @@ test('applyPublishedPostToDraftData marks drafts public and clears scheduled sta
   assert.equal('scheduled_post_at' in updated, false);
   assert.equal('scheduled_post_status' in updated, false);
   assert.equal('scheduled_post_caption' in updated, false);
+});
+
+test('resolveDraftPostData unwraps nested draft post payloads so shared drafts keep their post link', () => {
+  const resolved = resolveDraftPostData({
+    post_visibility: 'unlisted',
+    post: {
+      post: {
+        id: 's_69a61668303c8191885cdaae108cf702',
+        permalink: 'https://sora.chatgpt.com/p/s_69a61668303c8191885cdaae108cf702',
+        posted_to_public: false,
+        share_ref: 'share_ref_123',
+        permissions: { share_setting: 'public' },
+      },
+    },
+  });
+
+  assert.equal(resolved.postId, 's_69a61668303c8191885cdaae108cf702');
+  assert.equal(resolved.postPermalink, 'https://sora.chatgpt.com/p/s_69a61668303c8191885cdaae108cf702');
+  assert.equal(resolved.postVisibility, 'unlisted');
+  assert.equal(resolved.postedToPublic, false);
+  assert.deepEqual(resolved.postMeta, {
+    id: 's_69a61668303c8191885cdaae108cf702',
+    permalink: 'https://sora.chatgpt.com/p/s_69a61668303c8191885cdaae108cf702',
+    visibility: 'unlisted',
+    posted_to_public: false,
+    share_ref: 'share_ref_123',
+    share_setting: 'public',
+  });
 });
 
 test('extractRemixTargetPostId prefers nested published remix targets from draft payloads', () => {
@@ -271,6 +302,32 @@ test('workspace draft filtering scopes stats and grid data to the active workspa
   assert.deepEqual(
     filterDraftsByWorkspace(drafts, '').map((draft) => draft.id),
     ['d1', 'd2', 'd3', 'd4']
+  );
+});
+
+test('bookmarked filter excludes hidden drafts even when they are bookmarked or newly seen', () => {
+  const bookmarks = new Set(['draft_hidden_bookmark', 'draft_visible_bookmark']);
+  const justSeen = new Set(['draft_hidden_seen', 'draft_visible_seen']);
+
+  assert.equal(
+    isDraftVisibleInBookmarkedFilter({ id: 'draft_hidden_bookmark', hidden: true }, bookmarks, justSeen),
+    false
+  );
+  assert.equal(
+    isDraftVisibleInBookmarkedFilter({ id: 'draft_hidden_seen', hidden: true, is_read: false }, bookmarks, justSeen),
+    false
+  );
+  assert.equal(
+    isDraftVisibleInBookmarkedFilter({ id: 'draft_visible_bookmark', hidden: false }, bookmarks, justSeen),
+    true
+  );
+  assert.equal(
+    isDraftVisibleInBookmarkedFilter({ id: 'draft_visible_seen', hidden: false, is_read: false }, bookmarks, justSeen),
+    true
+  );
+  assert.equal(
+    isDraftVisibleInBookmarkedFilter({ id: 'draft_visible_new', hidden: false, is_read: false }, bookmarks, justSeen, true),
+    true
   );
 });
 
@@ -637,4 +694,22 @@ test('resolvePendingPollState does not synthesize a new completion card for a dr
   assert.deepEqual(Array.from(state.visibleIds), []);
   assert.deepEqual(state.visibleDrafts, []);
   assert.equal(state.requiresTopRefresh, true);
+});
+
+test('buildPendingCompletionHandoffPlan only replaces visible pending cards that now have real draft matches', () => {
+  const handoffs = buildPendingCompletionHandoffPlan(
+    [
+      { id: 'gen_visible_1', task_id: 'task_visible_1', pending_completion_waiting: true },
+      { id: 'gen_still_pending', task_id: 'task_still_pending', pending_completion_waiting: true },
+    ],
+    new Set(['gen_still_pending']),
+    [
+      { id: 'gen_real_1', task_id: 'task_visible_1', prompt: 'finished draft' },
+      { id: 'gen_other', task_id: 'task_other', prompt: 'other draft' },
+    ]
+  );
+
+  assert.deepEqual(handoffs.map((item) => [item.pendingId, item.settledId]), [
+    ['gen_visible_1', 'gen_real_1'],
+  ]);
 });

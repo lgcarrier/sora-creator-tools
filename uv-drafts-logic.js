@@ -256,8 +256,28 @@
     return false;
   }
 
+  function getDraftPostRecord(draft) {
+    const data = draft || {};
+    const post = data.post && typeof data.post === 'object' ? data.post : null;
+    if (post && typeof post.post === 'object') return post.post;
+    return post;
+  }
+
+  function getDraftPublishedPostId(draft) {
+    const data = draft || {};
+    const post = getDraftPostRecord(data);
+    return String(
+      data.post_id ||
+      data.post_meta?.id ||
+      post?.id ||
+      ''
+    ).trim();
+  }
+
   function isDraftUnread(draft) {
-    return !isDraftAlwaysOld(draft) && draft && draft.is_read === false;
+    if (isDraftAlwaysOld(draft)) return false;
+    if (getDraftPublishedPostId(draft).startsWith('s_')) return false;
+    return !!draft && draft.is_read === false;
   }
 
   function looksLikePendingV2Task(item) {
@@ -424,7 +444,7 @@
       if (isPublicVisibility(postMeta.visibility)) return true;
     }
 
-    const post = data.post && typeof data.post === 'object' ? data.post : null;
+    const post = getDraftPostRecord(data);
     if (post) {
       if (post.posted_to_public === true) return true;
       if (isPublicVisibility(post.visibility)) return true;
@@ -450,7 +470,7 @@
   function getDraftPostUrl(draft, origin) {
     const data = draft || {};
     const postMeta = data.post_meta && typeof data.post_meta === 'object' ? data.post_meta : null;
-    const post = data.post && typeof data.post === 'object' ? data.post : null;
+    const post = getDraftPostRecord(data);
 
     const direct = normalizeSoraPostUrl(
       data.post_permalink || postMeta?.permalink || post?.permalink || '',

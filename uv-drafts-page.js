@@ -55,21 +55,50 @@
     return next;
   }
 
-  function isPendingDraftSettledInCollection(drafts, pendingDraft) {
-    if (!Array.isArray(drafts) || !pendingDraft || typeof pendingDraft !== 'object') return false;
+  function findSettledDraftMatchForPending(pendingDraft, drafts) {
+    if (!pendingDraft || typeof pendingDraft !== 'object' || !Array.isArray(drafts)) return null;
     const pendingKeys = new Set(
       [pendingDraft.id, pendingDraft.task_id]
         .map((value) => String(value || '').trim())
         .filter(Boolean)
     );
-    if (pendingKeys.size === 0) return false;
-    return drafts.some((draft) => {
+    if (pendingKeys.size === 0) return null;
+    return drafts.find((draft) => {
       const draftKeys = [
         String(draft?.id || '').trim(),
         String(draft?.task_id || '').trim(),
       ].filter(Boolean);
       return draftKeys.some((key) => pendingKeys.has(key));
-    });
+    }) || null;
+  }
+
+  function isPendingDraftSettledInCollection(drafts, pendingDraft) {
+    return !!findSettledDraftMatchForPending(pendingDraft, drafts);
+  }
+
+  function buildPendingCompletionHandoffPlan(previousVisibleDrafts, nextVisibleIds, existingDrafts) {
+    const priorVisible = Array.isArray(previousVisibleDrafts) ? previousVisibleDrafts : [];
+    const nextIds = nextVisibleIds instanceof Set
+      ? nextVisibleIds
+      : new Set(
+        (Array.isArray(nextVisibleIds) ? nextVisibleIds : [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      );
+    const handoffs = [];
+    for (const pendingDraft of priorVisible) {
+      const pendingId = String(pendingDraft?.id || '').trim();
+      if (!pendingId || nextIds.has(pendingId)) continue;
+      const settledDraft = findSettledDraftMatchForPending(pendingDraft, existingDrafts);
+      if (!settledDraft) continue;
+      handoffs.push({
+        pendingId,
+        settledId: String(settledDraft?.id || '').trim(),
+        pendingDraft,
+        settledDraft,
+      });
+    }
+    return handoffs;
   }
 
   function resolvePendingPollState(previousVisibleDrafts, previousEndpointIds, nextEndpointDrafts, existingDrafts, pendingLogic = null) {
@@ -223,6 +252,99 @@
     delete next.scheduled_post_status;
     delete next.scheduled_post_caption;
     return next;
+  }
+
+  function pickFirstDraftPostValue(...candidates) {
+    for (const candidate of candidates) {
+      if (candidate == null) continue;
+      if (typeof candidate === 'string') {
+        const trimmed = candidate.trim();
+        if (trimmed) return trimmed;
+        continue;
+      }
+      return candidate;
+    }
+    return null;
+  }
+
+  function pickFirstDraftPostBoolean(...candidates) {
+    for (const candidate of candidates) {
+      if (typeof candidate === 'boolean') return candidate;
+    }
+    return null;
+  }
+
+  function resolveDraftPostData(apiDraft, existingData = {}) {
+    const draftData = apiDraft && typeof apiDraft === 'object' ? apiDraft : {};
+    const priorData = existingData && typeof existingData === 'object' ? existingData : {};
+    const existingPostMeta = priorData.post_meta && typeof priorData.post_meta === 'object'
+      ? priorData.post_meta
+      : null;
+    const post = extractPublishedPost(draftData.post);
+    const postId = pickFirstDraftPostValue(
+      draftData.post_id,
+      post?.id,
+      priorData.post_id,
+      existingPostMeta?.id
+    );
+    const postPermalink = pickFirstDraftPostValue(
+      draftData.post_permalink,
+      draftData.permalink,
+      post?.permalink,
+      priorData.post_permalink,
+      existingPostMeta?.permalink
+    );
+    const postVisibility = pickFirstDraftPostValue(
+      draftData.post_visibility,
+      post?.visibility,
+      priorData.post_visibility,
+      existingPostMeta?.visibility
+    );
+    const postedToPublic = pickFirstDraftPostBoolean(
+      draftData.posted_to_public,
+      post?.posted_to_public,
+      priorData.posted_to_public,
+      existingPostMeta?.posted_to_public
+    );
+    const shareRef = pickFirstDraftPostValue(
+      draftData.share_ref,
+      post?.share_ref,
+      existingPostMeta?.share_ref
+    );
+    const shareSetting = pickFirstDraftPostValue(
+      post?.permissions?.share_setting,
+      draftData.share_setting,
+      existingPostMeta?.share_setting
+    );
+
+    let postMeta = existingPostMeta ? { ...existingPostMeta } : null;
+    if (
+      postId ||
+      postPermalink ||
+      postVisibility ||
+      typeof postedToPublic === 'boolean' ||
+      shareRef ||
+      shareSetting
+    ) {
+      postMeta = {
+        ...(postMeta || {}),
+        id: postId || null,
+        permalink: postPermalink || null,
+        visibility: postVisibility || null,
+        posted_to_public: postedToPublic === true,
+        share_ref: shareRef || null,
+        share_setting: shareSetting || null,
+      };
+    }
+
+    return {
+      post,
+      postId: postId || null,
+      postPermalink: postPermalink || null,
+      postVisibility: postVisibility || null,
+      postedToPublic,
+      postMeta,
+    };
   }
 
   function extractRemixTargetPostId(apiDraft, existingData = {}) {
@@ -937,6 +1059,15 @@
     return slug ? `/creatortools/${encodeURIComponent(slug)}` : '/creatortools';
   }
 
+  function isDraftVisibleInBookmarkedFilter(draft, bookmarks, justSeenIds, isUnread = false) {
+    if (!draft || draft.hidden || draft.is_unsynced === true) return false;
+    const draftId = String(draft?.id || '').trim();
+    const bookmarkSet = bookmarks instanceof Set ? bookmarks : new Set();
+    const seenSet = justSeenIds instanceof Set ? justSeenIds : new Set();
+    const justSeen = !!draftId && seenSet.has(draftId);
+    return (!!draftId && bookmarkSet.has(draftId)) || (!!isUnread && !justSeen) || justSeen;
+  }
+
   function createSoraUVDraftsPageModule(deps = {}) {
     let capturedAuthToken = null;
     let modelOverride = null;
@@ -1138,11 +1269,14 @@
       if (uvDraftsLogic && typeof uvDraftsLogic.isDraftPubliclyPosted === 'function') {
         return !!uvDraftsLogic.isDraftPubliclyPosted(draft);
       }
+      const post = extractPublishedPost(draft?.post);
       const visibility = String(draft?.post_visibility || '').toLowerCase();
       if (visibility === 'public') return true;
       if (draft?.posted_to_public === true) return true;
       if (draft?.post_meta?.posted_to_public === true) return true;
       if (String(draft?.post_meta?.visibility || '').toLowerCase() === 'public') return true;
+      if (post?.posted_to_public === true) return true;
+      if (String(post?.visibility || '').toLowerCase() === 'public') return true;
       return false;
     }
 
@@ -1150,7 +1284,10 @@
       if (uvDraftsLogic && typeof uvDraftsLogic.getDraftPostUrl === 'function') {
         return uvDraftsLogic.getDraftPostUrl(draft, 'https://sora.chatgpt.com');
       }
-      const postId = String(draft?.post_id || '').trim();
+      const post = extractPublishedPost(draft?.post);
+      const permalink = String(draft?.post_permalink || post?.permalink || '').trim();
+      if (permalink) return permalink;
+      const postId = String(draft?.post_id || draft?.post_meta?.id || post?.id || '').trim();
       if (!postId) return '';
       return `https://sora.chatgpt.com/p/${encodeURIComponent(postId)}`;
     }
@@ -1267,11 +1404,21 @@
       return localResult;
     }
 
+    function getDraftPublishedPostId(draft) {
+      return String(
+        draft?.post_id ||
+        draft?.post_meta?.id ||
+        extractPublishedPost(draft?.post)?.id ||
+        ''
+      ).trim();
+    }
+
     function isDraftUnreadState(draft) {
       if (isNoDateDraft(draft)) return false;
       if (uvDraftsLogic && typeof uvDraftsLogic.isDraftUnread === 'function') {
         return !!uvDraftsLogic.isDraftUnread(draft);
       }
+      if (getDraftPublishedPostId(draft).startsWith('s_')) return false;
       return draft?.is_read === false;
     }
 
@@ -1702,10 +1849,13 @@
       thumbnail_url: thumbnailUrl,
       preview_url: previewUrl,
     });
-    const post = apiDraft.post && typeof apiDraft.post === 'object' ? apiDraft.post : null;
-    const existingPostMeta = existingData.post_meta && typeof existingData.post_meta === 'object'
-      ? existingData.post_meta
-      : null;
+    const {
+      postId,
+      postPermalink,
+      postVisibility,
+      postedToPublic,
+      postMeta,
+    } = resolveDraftPostData(apiDraft, existingData);
     const { width, height } = extractDraftDimensions(apiDraft, existingData);
     const orientation = resolveDraftOrientationValue(apiDraft, existingData, { width, height });
     const apiCreatedAt = Number(apiDraft.created_at);
@@ -1757,25 +1907,11 @@
       storyboard_id: apiDraft.storyboard_id || apiDraft.creation_config?.storyboard_id || '',
       remix_target_draft_id: apiDraft.creation_config?.remix_target_id || existingData.remix_target_draft_id || null,
       remix_target_post_id: extractRemixTargetPostId(apiDraft, existingData),
-      post_visibility: apiDraft.post_visibility || null,
-      post_id: post?.id || existingData.post_id || null,
-      post_permalink: post?.permalink || existingData.post_permalink || null,
-      posted_to_public:
-        typeof post?.posted_to_public === 'boolean'
-          ? post.posted_to_public
-          : typeof existingData.posted_to_public === 'boolean'
-            ? existingData.posted_to_public
-            : null,
-      post_meta: post
-        ? {
-            id: post.id || null,
-            permalink: post.permalink || null,
-            visibility: post.visibility || null,
-            posted_to_public: post.posted_to_public === true,
-            share_ref: post.share_ref || null,
-            share_setting: post.permissions?.share_setting || null,
-          }
-        : existingPostMeta,
+      post_visibility: postVisibility,
+      post_id: postId,
+      post_permalink: postPermalink,
+      posted_to_public: postedToPublic,
+      post_meta: postMeta,
       tags: apiDraft.tags || [],
       cameo_profiles: apiDraft.creation_config?.cameo_profiles || [],
       task_id: apiDraft.task_id || '',
@@ -4757,13 +4893,29 @@
         refreshedPendingState.visibleDrafts,
         refreshedPendingState.visibleIds
       );
+      const completionHandoffs = buildPendingCompletionHandoffPlan(
+        previousRefreshPendingDrafts,
+        refreshedPendingState.visibleIds,
+        uvDraftsData
+      );
 
       uvDraftsPendingEndpointIds = refreshedPendingState.endpointIds;
       uvDraftsPendingIds = refreshedPendingState.visibleIds;
       uvDraftsPendingData = refreshedPendingState.visibleDrafts;
 
       if (isUVDraftsPageVisible()) {
-        renderUVDraftsGrid(true);
+        const handoffApplied = completionHandoffs.length > 0
+          ? applyPendingCompletionHandoffsInPlace(completionHandoffs)
+          : false;
+        if (!handoffApplied && (refreshIdsChanged || refreshDataChanged)) {
+          if (refreshIdsChanged) {
+            renderUVDraftsGrid(true);
+          } else {
+            updatePendingCardsInPlace(uvDraftsPendingData);
+          }
+        } else if (refreshDataChanged) {
+          updatePendingCardsInPlace(uvDraftsPendingData);
+        }
         updateUVDraftsStats();
       }
     }
@@ -4876,11 +5028,7 @@
     }
 
     if (uvDraftsFilterState === 'bookmarked') {
-      filtered = filtered.filter(d => {
-        const isNew = d?.is_unsynced !== true && isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id);
-        const justSeen = d?.is_unsynced !== true && uvDraftsJustSeenIds.has(d.id);
-        return bookmarks.has(d.id) || isNew || justSeen;
-      });
+      filtered = filtered.filter((d) => isDraftVisibleInBookmarkedFilter(d, bookmarks, uvDraftsJustSeenIds, isDraftUnreadState(d)));
     } else if (uvDraftsFilterState === 'hidden') {
       filtered = filtered.filter(d => d?.is_unsynced !== true && d.hidden);
     } else if (uvDraftsFilterState === 'violations') {
@@ -5542,11 +5690,13 @@
 
     // Hide button
     const hideBtn = createActionBtn(draft.hidden ? icons.eyeClosed : icons.eyeOpen, draft.hidden ? 'Unhide' : 'Hide', async () => {
+      const anchor = captureUVDraftsScrollAnchor([draft.id]);
       draft.hidden = !draft.hidden;
       hideBtn.innerHTML = draft.hidden ? icons.eyeClosed : icons.eyeOpen;
       hideBtn.title = draft.hidden ? 'Unhide' : 'Hide';
       await uvDBPut(UV_DRAFTS_STORES.drafts, draft);
       renderUVDraftsGrid();
+      restoreUVDraftsScrollAnchor(anchor);
       updateUVDraftsStats();
     });
     hideBtn.disabled = isPendingDraft;
@@ -6062,6 +6212,72 @@
         ring.innerHTML = buildPendingRingMarkup(pctNorm);
       }
     }
+  }
+
+  function captureUVDraftsScrollAnchor(excludedDraftIds = null) {
+    if (!uvDraftsPageEl || !uvDraftsGridEl) return null;
+    const excluded = excludedDraftIds instanceof Set
+      ? excludedDraftIds
+      : new Set(
+        (Array.isArray(excludedDraftIds) ? excludedDraftIds : [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      );
+    const pageRect = uvDraftsPageEl.getBoundingClientRect();
+    const cards = Array.from(uvDraftsGridEl.querySelectorAll('[data-draft-id]'));
+    for (const card of cards) {
+      const cardId = String(card?.dataset?.draftId || '').trim();
+      if (cardId && excluded.has(cardId)) continue;
+      const rect = card.getBoundingClientRect();
+      if (rect.bottom > pageRect.top && rect.top < pageRect.bottom) {
+        return {
+          draftId: cardId,
+          top: rect.top - pageRect.top,
+        };
+      }
+    }
+    return {
+      scrollTop: uvDraftsPageEl.scrollTop,
+    };
+  }
+
+  function restoreUVDraftsScrollAnchor(anchor) {
+    if (!anchor || !uvDraftsPageEl || !uvDraftsGridEl) return;
+    if (anchor.draftId) {
+      const anchorCard = uvDraftsGridEl.querySelector(`[data-draft-id="${CSS.escape(anchor.draftId)}"]`);
+      if (anchorCard) {
+        const pageRect = uvDraftsPageEl.getBoundingClientRect();
+        const rect = anchorCard.getBoundingClientRect();
+        const nextScrollTop = uvDraftsPageEl.scrollTop + ((rect.top - pageRect.top) - Number(anchor.top || 0));
+        const maxScrollTop = Math.max(0, uvDraftsPageEl.scrollHeight - uvDraftsPageEl.clientHeight);
+        uvDraftsPageEl.scrollTop = Math.max(0, Math.min(nextScrollTop, maxScrollTop));
+        return;
+      }
+    }
+    if (Number.isFinite(Number(anchor.scrollTop))) {
+      const maxScrollTop = Math.max(0, uvDraftsPageEl.scrollHeight - uvDraftsPageEl.clientHeight);
+      uvDraftsPageEl.scrollTop = Math.max(0, Math.min(Number(anchor.scrollTop), maxScrollTop));
+    }
+  }
+
+  function applyPendingCompletionHandoffsInPlace(handoffs) {
+    if (!uvDraftsGridEl || !uvDraftsPageEl) return false;
+    const planned = Array.isArray(handoffs) ? handoffs.filter((handoff) => handoff?.pendingId && handoff?.settledDraft) : [];
+    if (planned.length === 0) return false;
+    const anchor = captureUVDraftsScrollAnchor(planned.map((handoff) => handoff.pendingId));
+    let replacedCount = 0;
+    for (const handoff of planned) {
+      const pendingCard = uvDraftsGridEl.querySelector(`[data-draft-id="${CSS.escape(handoff.pendingId)}"]`);
+      if (!pendingCard || !pendingCard.parentNode) continue;
+      const settledCard = createUVDraftCard(handoff.settledDraft);
+      pendingCard.replaceWith(settledCard);
+      replacedCount += 1;
+    }
+    if (replacedCount > 0) {
+      restoreUVDraftsScrollAnchor(anchor);
+      restoreUVDraftsPlaybackState();
+    }
+    return replacedCount > 0;
   }
 
   // Full grid rebuild — clears everything and renders from scratch.
@@ -7058,6 +7274,7 @@
       resolveComposerModelValue,
       buildPublicPostPayload,
       extractPublishedPost,
+      resolveDraftPostData,
       applyPublishedPostToDraftData,
       extractRemixTargetPostId,
       extractPublishedPostGenerationId,
@@ -7070,6 +7287,7 @@
       extractPersistedComposerPromptValue,
       resolvePreferredComposerPromptValue,
       filterDraftsByWorkspace,
+      isDraftVisibleInBookmarkedFilter,
       slugifyWorkspaceName,
       getWorkspaceUrlSlug,
       findWorkspaceIdByUrlSlug,
@@ -7093,6 +7311,7 @@
       extendLandscapeRunRenderEnd,
       isGenerationDraftId,
       resolvePendingPollState,
+      buildPendingCompletionHandoffPlan,
       extractErrorMessage,
     };
   }
