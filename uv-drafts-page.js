@@ -255,6 +255,315 @@
     return normalizedSize;
   }
 
+  function normalizeDraftOrientationValue(value) {
+    const normalized = typeof value === 'string'
+      ? value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+      : '';
+    if (!normalized) return '';
+    if (normalized === 'portrait' || normalized.startsWith('portrait_')) return 'portrait';
+    if (normalized === 'landscape' || normalized.startsWith('landscape_')) return 'landscape';
+    return '';
+  }
+
+  function extractDraftDimensions(draft, fallbackDraft = null) {
+    const widthCandidates = [
+      draft?.width,
+      draft?.draft?.width,
+      draft?.generation?.width,
+      draft?.asset?.width,
+      draft?.creation_config?.width,
+      fallbackDraft?.width,
+    ];
+    const heightCandidates = [
+      draft?.height,
+      draft?.draft?.height,
+      draft?.generation?.height,
+      draft?.asset?.height,
+      draft?.creation_config?.height,
+      fallbackDraft?.height,
+    ];
+    const width = widthCandidates.map(Number).find((value) => Number.isFinite(value) && value > 0) || 0;
+    const height = heightCandidates.map(Number).find((value) => Number.isFinite(value) && value > 0) || 0;
+    return { width, height };
+  }
+
+  function resolveDraftOrientationValue(draft, fallbackDraft = null, dimensions = null) {
+    const explicitOrientation = normalizeDraftOrientationValue(draft?.orientation)
+      || normalizeDraftOrientationValue(draft?.creation_config?.orientation)
+      || normalizeDraftOrientationValue(fallbackDraft?.orientation)
+      || normalizeDraftOrientationValue(fallbackDraft?.creation_config?.orientation);
+    if (explicitOrientation) return explicitOrientation;
+    const resolvedDimensions = dimensions && typeof dimensions === 'object'
+      ? dimensions
+      : extractDraftDimensions(draft, fallbackDraft);
+    if (resolvedDimensions.width > 0 && resolvedDimensions.height > 0) {
+      return resolvedDimensions.width > resolvedDimensions.height ? 'landscape' : 'portrait';
+    }
+    return '';
+  }
+
+  function getDraftOrientationForLayout(draft) {
+    return resolveDraftOrientationValue(draft);
+  }
+
+  function getDraftLayoutStateBlob(draft) {
+    if (!draft || typeof draft !== 'object') return '';
+    const fields = [
+      draft.kind,
+      draft.type,
+      draft.status,
+      draft.state,
+      draft.reason,
+      draft.failure_reason,
+      draft.moderation_reason,
+      draft.user_error_message,
+      draft.message,
+      draft.pending_status,
+      draft.pending_task_status,
+      draft.error,
+      draft.detail,
+    ];
+    const parts = [];
+    for (const field of fields) {
+      if (typeof field === 'string') {
+        const trimmed = field.trim();
+        if (trimmed) parts.push(trimmed.toLowerCase());
+        continue;
+      }
+      if (field && typeof field === 'object') {
+        try {
+          const serialized = JSON.stringify(field);
+          if (serialized && serialized !== '{}') parts.push(serialized.toLowerCase());
+        } catch {}
+      }
+    }
+    return parts.join(' ');
+  }
+
+  function isForcedFullHeightDraftCard(draft) {
+    const statusBlob = getDraftLayoutStateBlob(draft);
+    return draft?.is_pending === true
+      || /\bpending\b/.test(statusBlob)
+      || statusBlob.includes('content_violation')
+      || statusBlob.includes('context_violation')
+      || statusBlob.includes('policy_violation')
+      || statusBlob.includes('moderation_violation')
+      || statusBlob.includes('safety_violation')
+      || statusBlob.includes('policy blocked')
+      || statusBlob.includes('processing_error')
+      || statusBlob.includes('processing_failed')
+      || statusBlob.includes('generation_error');
+  }
+
+  function getDraftOrientationForGrouping(draft) {
+    if (isForcedFullHeightDraftCard(draft)) return 'portrait';
+    return getDraftOrientationForLayout(draft);
+  }
+
+  function getDraftCardPaddingTop(draft, usePlaceholderThumb = false) {
+    if (usePlaceholderThumb) return '177.78%';
+    const draftOrientation = getDraftOrientationForLayout(draft);
+    if (draftOrientation === 'landscape') return '56.25%';
+    if (draftOrientation === 'portrait') return '177.78%';
+    return Number(draft?.height) > Number(draft?.width) ? '177.78%' : '56.25%';
+  }
+
+  function getDraftCardLayoutStyle(draft, usePlaceholderThumb = false) {
+    return {
+      alignSelf: 'start',
+      paddingTop: getDraftCardPaddingTop(draft, usePlaceholderThumb),
+    };
+  }
+
+  const UV_DRAFTS_GRID_MIN_COLUMN_WIDTH = 240;
+  const UV_DRAFTS_GRID_GAP = 14;
+
+  function shouldGroupLandscapeDraftCard(drafts, index) {
+    if (!Array.isArray(drafts) || !Number.isInteger(index) || index < 0 || index >= drafts.length) {
+      return false;
+    }
+    if (getDraftOrientationForGrouping(drafts[index]) !== 'landscape') return false;
+    return getDraftOrientationForGrouping(drafts[index - 1]) === 'landscape'
+      || getDraftOrientationForGrouping(drafts[index + 1]) === 'landscape';
+  }
+
+  function getLandscapeRunStartIndex(drafts, index) {
+    if (!Array.isArray(drafts) || !Number.isInteger(index) || index < 0 || index >= drafts.length) return -1;
+    if (getDraftOrientationForGrouping(drafts[index]) !== 'landscape') return -1;
+    let start = index;
+    while (start > 0 && getDraftOrientationForGrouping(drafts[start - 1]) === 'landscape') {
+      start -= 1;
+    }
+    return start;
+  }
+
+  function getLandscapeRunEndIndex(drafts, index) {
+    if (!Array.isArray(drafts) || !Number.isInteger(index) || index < 0 || index >= drafts.length) return -1;
+    if (getDraftOrientationForGrouping(drafts[index]) !== 'landscape') return -1;
+    let end = index + 1;
+    while (end < drafts.length && getDraftOrientationForGrouping(drafts[end]) === 'landscape') {
+      end += 1;
+    }
+    return end;
+  }
+
+  function getLandscapeRunGridColumnCapacity(gridEl) {
+    const targetGridEl = gridEl && typeof gridEl === 'object' ? gridEl : null;
+    const width = Number(targetGridEl?.clientWidth)
+      || Number(targetGridEl?.getBoundingClientRect?.().width)
+      || 0;
+    if (!Number.isFinite(width) || width <= 0) return 4;
+    const capacity = Math.floor((width + UV_DRAFTS_GRID_GAP) / (UV_DRAFTS_GRID_MIN_COLUMN_WIDTH + UV_DRAFTS_GRID_GAP));
+    return Math.max(1, capacity);
+  }
+
+  function getLandscapeRunChunkSize(maxColumns) {
+    const normalizedMaxColumns = Math.max(1, Math.floor(Number(maxColumns) || 0));
+    return normalizedMaxColumns * 2;
+  }
+
+  function getLandscapeRunColumnSpan(chunkLength, maxColumns) {
+    if (!Number.isFinite(chunkLength) || chunkLength <= 1) return 1;
+    const normalizedMaxColumns = Math.max(1, Math.floor(Number(maxColumns) || 0));
+    return Math.min(normalizedMaxColumns, Math.max(2, Math.floor(chunkLength)));
+  }
+
+  function getLandscapeRunChunkPlan(remainingRunLength, maxColumns, currentRowFill = 0, options = {}) {
+    const normalizedRunLength = Math.max(0, Math.floor(Number(remainingRunLength) || 0));
+    const normalizedMaxColumns = Math.max(1, Math.floor(Number(maxColumns) || 0));
+    const normalizedRowFill = Math.max(0, Math.floor(Number(currentRowFill) || 0)) % normalizedMaxColumns;
+    const availableColumns = normalizedRowFill > 0
+      ? Math.max(1, normalizedMaxColumns - normalizedRowFill)
+      : normalizedMaxColumns;
+    if (normalizedRunLength <= 1) {
+      return {
+        columnSpan: 1,
+        chunkLength: normalizedRunLength,
+      };
+    }
+    const chunkLength = Math.min(normalizedRunLength, availableColumns * 2);
+    const columnSpan = Math.min(availableColumns, Math.max(1, Math.ceil(chunkLength / 2)));
+    return {
+      columnSpan,
+      chunkLength,
+    };
+  }
+
+  function planLandscapeRunChunks(runLength, maxColumns, currentRowFill = 0) {
+    const normalizedRunLength = Math.max(0, Math.floor(Number(runLength) || 0));
+    const normalizedMaxColumns = Math.max(1, Math.floor(Number(maxColumns) || 0));
+    let remaining = normalizedRunLength;
+    let rowFill = Math.max(0, Math.floor(Number(currentRowFill) || 0)) % normalizedMaxColumns;
+    const chunks = [];
+    while (remaining > 0) {
+      const chunk = getLandscapeRunChunkPlan(remaining, normalizedMaxColumns, rowFill);
+      if (!chunk || !Number.isFinite(chunk.chunkLength) || chunk.chunkLength <= 0) break;
+      chunks.push(chunk);
+      remaining -= chunk.chunkLength;
+      rowFill = (rowFill + chunk.columnSpan) % normalizedMaxColumns;
+    }
+    return chunks;
+  }
+
+  function planDraftGridRows(drafts, maxColumns) {
+    if (!Array.isArray(drafts) || drafts.length === 0) return [];
+    const normalizedMaxColumns = Math.max(1, Math.floor(Number(maxColumns) || 0));
+    const rows = [];
+    let index = 0;
+
+    while (index < drafts.length) {
+      const row = [];
+      let slotsRemaining = normalizedMaxColumns;
+
+      while (index < drafts.length && slotsRemaining > 0) {
+        if (shouldGroupLandscapeDraftCard(drafts, index)) {
+          const runEnd = getLandscapeRunEndIndex(drafts, index);
+          const remainingRunLength = runEnd > index ? (runEnd - index) : 1;
+          const { columnSpan, chunkLength } = getLandscapeRunChunkPlan(remainingRunLength, normalizedMaxColumns, normalizedMaxColumns - slotsRemaining);
+          const rowDrafts = drafts.slice(index, index + chunkLength);
+          row.push({
+            kind: 'landscape-run',
+            span: columnSpan,
+            draftIds: rowDrafts.map((draft) => draft?.id).filter(Boolean),
+          });
+          index += chunkLength;
+          slotsRemaining -= columnSpan;
+          continue;
+        }
+
+        const draft = drafts[index];
+        row.push({
+          kind: 'card',
+          span: 1,
+          draftIds: draft?.id ? [draft.id] : [],
+        });
+        index += 1;
+        slotsRemaining -= 1;
+      }
+
+      if (row.length > 0) rows.push(row);
+    }
+
+    return rows;
+  }
+
+  function getDraftCountForGridRows(rows, rowCount = rows.length) {
+    if (!Array.isArray(rows) || rowCount <= 0) return 0;
+    return rows
+      .slice(0, rowCount)
+      .reduce((total, row) => total + row.reduce((rowTotal, item) => rowTotal + (Array.isArray(item?.draftIds) ? item.draftIds.length : 0), 0), 0);
+  }
+
+  function extendDraftRenderEndToRowBoundary(drafts, targetEnd, maxColumns) {
+    if (!Array.isArray(drafts) || drafts.length === 0) return 0;
+    const normalizedTargetEnd = Math.max(0, Math.min(Math.floor(Number(targetEnd) || 0), drafts.length));
+    if (normalizedTargetEnd <= 0) return 0;
+    const rows = planDraftGridRows(drafts, maxColumns);
+    let consumed = 0;
+    for (const row of rows) {
+      consumed += row.reduce((rowTotal, item) => rowTotal + (Array.isArray(item?.draftIds) ? item.draftIds.length : 0), 0);
+      if (consumed >= normalizedTargetEnd) return consumed;
+    }
+    return drafts.length;
+  }
+
+  function getRenderedGridRowFillCount(gridEl, maxColumns) {
+    if (!gridEl || !Number.isFinite(maxColumns) || maxColumns <= 0) return 0;
+    const children = Array.isArray(gridEl.children) ? gridEl.children : Array.from(gridEl.children || []);
+    let fill = 0;
+    for (const child of children) {
+      const className = String(child?.className || '');
+      if (className.includes('uv-drafts-load-more') || className.includes('uvd-empty-state') || className.includes('uv-drafts-loading')) {
+        continue;
+      }
+      const gridColumnValue = String(child?.style?.gridColumn || '');
+      const match = /span\s+(\d+)/i.exec(gridColumnValue);
+      const span = match ? Math.max(1, Number(match[1]) || 1) : 1;
+      fill = (fill + span) % maxColumns;
+    }
+    return fill;
+  }
+
+  function extendLandscapeRunRenderEnd(drafts, end, maxLandscapeColumns = 4) {
+    if (!Array.isArray(drafts) || !Number.isInteger(end)) return 0;
+    let nextEnd = Math.max(0, Math.min(end, drafts.length));
+    if (nextEnd <= 0 || nextEnd >= drafts.length) return nextEnd;
+    if (
+      getDraftOrientationForGrouping(drafts[nextEnd - 1]) === 'landscape' &&
+      getDraftOrientationForGrouping(drafts[nextEnd]) === 'landscape'
+    ) {
+      const runStart = getLandscapeRunStartIndex(drafts, nextEnd - 1);
+      const runEnd = getLandscapeRunEndIndex(drafts, nextEnd - 1);
+      if (runStart >= 0) {
+        const chunkSize = getLandscapeRunChunkSize(maxLandscapeColumns);
+        const runOffset = nextEnd - runStart;
+        const nextChunkMultiple = Math.ceil(runOffset / chunkSize) * chunkSize;
+        nextEnd = Math.min(runStart + nextChunkMultiple, runEnd >= 0 ? runEnd : drafts.length);
+      }
+    }
+    return nextEnd;
+  }
+
   function isGenerationDraftId(value) {
     const normalized = typeof value === 'string' ? value.trim() : '';
     return /^gen_/i.test(normalized);
@@ -1040,6 +1349,8 @@
     const existingPostMeta = existingData.post_meta && typeof existingData.post_meta === 'object'
       ? existingData.post_meta
       : null;
+    const { width, height } = extractDraftDimensions(apiDraft, existingData);
+    const orientation = resolveDraftOrientationValue(apiDraft, existingData, { width, height });
     const apiCreatedAt = Number(apiDraft.created_at);
     const existingCreatedAt = Number(existingData.created_at);
     const resolvedCreatedAt = Number.isFinite(apiCreatedAt) && apiCreatedAt > 0
@@ -1077,8 +1388,8 @@
       created_at: noDate ? null : resolvedCreatedAt,
       no_date_order: noDate ? noDateOrder : null,
       api_order: apiOrder,
-      width: apiDraft.width || 0,
-      height: apiDraft.height || 0,
+      width,
+      height,
       duration_seconds: durationSeconds,
       thumbnail_url: thumbnailUrl,
       preview_url: previewUrl,
@@ -1114,7 +1425,7 @@
       generation_type: apiDraft.generation_type || 'video_gen',
       model: apiDraft.model || apiDraft.creation_config?.model || null,
       resolution: apiDraft.resolution || apiDraft.creation_config?.resolution || null,
-      orientation: apiDraft.creation_config?.orientation || (apiDraft.width > apiDraft.height ? 'landscape' : 'portrait'),
+      orientation,
       n_frames: apiDraft.creation_config?.n_frames || nFrames || 0,
       style: apiDraft.creation_config?.style || null,
       seed: apiDraft.creation_config?.seed || null,
@@ -4122,9 +4433,13 @@
     const usePlaceholderThumb = isSpecialError || isPendingDraft;
     const isNew = isDraftUnreadState(draft) && !uvDraftsJustSeenIds.has(draft.id);
     const draftUrl = `https://sora.chatgpt.com/d/${encodeURIComponent(draft.id)}`;
+    const draftOrientation = getDraftOrientationForLayout(draft);
+    const draftCardLayoutStyle = getDraftCardLayoutStyle(draft, usePlaceholderThumb);
 
     const card = document.createElement('div');
     card.className = 'uv-draft-card uvd-card';
+    card.style.alignSelf = draftCardLayoutStyle.alignSelf;
+    if (draftOrientation) card.dataset.orientation = draftOrientation;
     if (isContentViolation || isContextViolation) card.classList.add('is-violation');
     if (isProcessingError) card.classList.add('is-processing-error');
     card.dataset.draftId = draft.id;
@@ -4173,7 +4488,7 @@
     Object.assign(thumbContainer.style, {
       position: 'relative',
       width: '100%',
-      paddingTop: draft.height > draft.width ? '177.78%' : '56.25%', // 9:16 or 16:9
+      paddingTop: draftCardLayoutStyle.paddingTop,
       background: isPendingDraft
         ? '#182435'
         : (isContentViolation || isContextViolation ? '#2a1515' : (isProcessingError ? '#1b2235' : '#1a1a1a')),
@@ -4988,15 +5303,47 @@
 
   // Append cards from uvDraftsFilteredCache[start..end) to the grid.
   // Never touches existing DOM — just creates and appends new cards.
-  function appendCardsToGrid(start, end) {
+  function appendCardsToGrid(start, end, options = {}) {
     if (!uvDraftsGridEl || start >= end) return;
     const loadMore = uvDraftsGridEl.querySelector('.uv-drafts-load-more');
     if (loadMore) loadMore.remove();
     clearUVDraftsEmptyState();
     hideUVDraftsLoadingIndicator();
     const fragment = document.createDocumentFragment();
-    for (let i = start; i < end; i++) {
-      fragment.appendChild(createUVDraftCard(uvDraftsFilteredCache[i]));
+    const maxLandscapeColumns = Math.max(1, Math.floor(Number(options.maxLandscapeColumns) || getLandscapeRunGridColumnCapacity(uvDraftsGridEl)));
+    const draftSlice = uvDraftsFilteredCache.slice(start, end);
+    const plannedRows = planDraftGridRows(draftSlice, maxLandscapeColumns);
+    let draftOffset = 0;
+
+    for (const row of plannedRows) {
+      const rowEl = document.createElement('div');
+      rowEl.className = 'uvd-grid-row';
+      rowEl.style.gridTemplateColumns = `repeat(${maxLandscapeColumns}, minmax(0, 1fr))`;
+
+      for (const item of row) {
+        const itemDraftCount = Array.isArray(item?.draftIds) ? item.draftIds.length : 0;
+        const itemDrafts = draftSlice.slice(draftOffset, draftOffset + itemDraftCount);
+        draftOffset += itemDraftCount;
+
+        if (item.kind === 'landscape-run' && itemDrafts.length > 1) {
+          const landscapeRunEl = document.createElement('div');
+          landscapeRunEl.className = 'uvd-landscape-run-grid';
+          landscapeRunEl.style.gridColumn = `span ${item.span}`;
+          landscapeRunEl.style.gridTemplateColumns = `repeat(${item.span}, minmax(0, 1fr))`;
+          landscapeRunEl.style.alignSelf = 'start';
+          for (const itemDraft of itemDrafts) {
+            landscapeRunEl.appendChild(createUVDraftCard(itemDraft));
+          }
+          rowEl.appendChild(landscapeRunEl);
+          continue;
+        }
+
+        if (itemDrafts[0]) {
+          rowEl.appendChild(createUVDraftCard(itemDrafts[0]));
+        }
+      }
+
+      if (rowEl.children.length > 0) fragment.appendChild(rowEl);
     }
     uvDraftsGridEl.appendChild(fragment);
     uvDraftsRenderedCount = end;
@@ -5009,8 +5356,13 @@
     uvDraftsFilteredCache = getRenderableUVDrafts();
     if (uvDraftsFilteredCache.length <= uvDraftsRenderedCount) return;
     // Only append one batch beyond what's rendered — infinite scroll handles the rest
-    const end = Math.min(uvDraftsRenderedCount + UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length);
-    appendCardsToGrid(uvDraftsRenderedCount, end);
+    const maxLandscapeColumns = getLandscapeRunGridColumnCapacity(uvDraftsGridEl);
+    const end = extendDraftRenderEndToRowBoundary(
+      uvDraftsFilteredCache,
+      Math.min(uvDraftsRenderedCount + UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length),
+      maxLandscapeColumns
+    );
+    appendCardsToGrid(uvDraftsRenderedCount, end, { maxLandscapeColumns });
   }
 
   // Update only the status/progress text and ring on pending cards without rebuilding the grid.
@@ -5065,10 +5417,15 @@
       return;
     }
 
-    const end = resetScroll
-      ? Math.min(UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length)
-      : Math.min(Math.max(uvDraftsRenderedCount, UV_DRAFTS_BATCH_SIZE), uvDraftsFilteredCache.length);
-    appendCardsToGrid(uvDraftsRenderedCount, end);
+    const maxLandscapeColumns = getLandscapeRunGridColumnCapacity(uvDraftsGridEl);
+    const end = extendDraftRenderEndToRowBoundary(
+      uvDraftsFilteredCache,
+      resetScroll
+        ? Math.min(UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length)
+        : Math.min(Math.max(uvDraftsRenderedCount, UV_DRAFTS_BATCH_SIZE), uvDraftsFilteredCache.length),
+      maxLandscapeColumns
+    );
+    appendCardsToGrid(uvDraftsRenderedCount, end, { maxLandscapeColumns });
     setupUVDraftsInfiniteScroll();
 
     // Restore video playback if a video was playing before the re-render
@@ -5096,8 +5453,13 @@
   // Infinite scroll: append next batch.
   function renderMoreUVDrafts() {
     if (!uvDraftsGridEl || uvDraftsRenderedCount >= uvDraftsFilteredCache.length) return;
-    const end = Math.min(uvDraftsRenderedCount + UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length);
-    appendCardsToGrid(uvDraftsRenderedCount, end);
+    const maxLandscapeColumns = getLandscapeRunGridColumnCapacity(uvDraftsGridEl);
+    const end = extendDraftRenderEndToRowBoundary(
+      uvDraftsFilteredCache,
+      Math.min(uvDraftsRenderedCount + UV_DRAFTS_BATCH_SIZE, uvDraftsFilteredCache.length),
+      maxLandscapeColumns
+    );
+    appendCardsToGrid(uvDraftsRenderedCount, end, { maxLandscapeColumns });
   }
 
   function updateLoadMoreIndicator() {
@@ -5592,6 +5954,8 @@
       .uvd-modal-btn.is-primary { background: #1f8d51; border-color: #1f8d51; color: #f8fffc; }
       .uvd-modal-btn.is-primary:hover:not(:disabled) { background: #23a15d; border-color: #23a15d; }
       .uvd-card { position: relative; overflow: hidden; cursor: pointer; border: 1px solid var(--uvd-border); background: var(--token-bg-surface-primary, #1f222a); box-shadow: 0 12px 32px rgba(0,0,0,0.3); border-radius: 14px; transition: transform 0.15s ease, box-shadow 0.15s ease; }
+      .uvd-grid-row { display:grid; gap: 14px; align-items: start; }
+      .uvd-landscape-run-grid { display:grid; grid-template-columns: repeat(var(--uvd-landscape-run-cols, 2), minmax(0, 1fr)); gap: 14px; align-content: start; }
       .uvd-card.is-violation { background: #3a2020; }
       .uvd-card.is-processing-error { background: #1f273b; border-color: rgba(125,164,255,0.5); }
       .uvd-thumb-link { display:block; text-decoration:none; color:inherit; }
@@ -5609,11 +5973,11 @@
       .uvd-action-pill[data-tone="success"] { background: #1f8d51; border-color: #1f8d51; }
       .uvd-action-pill[data-tone="info"] { background: #215ba6; border-color: #215ba6; }
       .uvd-action-pill:disabled { opacity: .42; cursor:not-allowed; color: var(--uvd-text-dim); background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.08); pointer-events: none; }
-      .uv-drafts-loading, .uvd-empty-state, .uv-drafts-load-more { grid-column: 1 / -1; text-align: center; color: var(--uvd-subtext); }
+      .uv-drafts-loading, .uvd-empty-state, .uv-drafts-load-more { width: 100%; text-align: center; color: var(--uvd-subtext); }
       .uv-drafts-loading { display:flex; align-items:center; justify-content:center; padding: 42px 18px; font-size: 16px; }
       .uvd-empty-state { padding: 60px 20px; font-size: 16px; }
       .uv-drafts-load-more { padding: 20px; font-size: 14px; }
-      .uv-drafts-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+      .uv-drafts-grid { display:flex; flex-direction:column; gap: 14px; }
       @media (max-width: 1380px) {
         .uvd-shell { padding-left: 396px; }
         .uvd-composer { width: 332px; padding: 20px 14px 22px; }
@@ -5626,6 +5990,8 @@
         .uvd-composer { position: static; width: 100%; border: 1px solid var(--uvd-border); border-radius: 16px; margin-bottom: 16px; }
         .uvd-title-wrap h1 { font-size: 36px; }
         .uvd-compose-actions { grid-template-columns: 1fr; }
+        .uvd-grid-row { grid-template-columns: 1fr !important; }
+        .uvd-landscape-run-grid { grid-column: auto; grid-template-columns: 1fr !important; }
         .uvd-actions-row { grid-template-columns: repeat(4, minmax(0, 1fr)); }
         .uvd-field-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
@@ -5962,6 +6328,18 @@
       buildComposerSourceFromPublishedPost,
       isLargeComposerSizeAllowed,
       normalizeComposerSizeForModel,
+      normalizeDraftOrientationValue,
+      extractDraftDimensions,
+      resolveDraftOrientationValue,
+      getDraftOrientationForLayout,
+      getDraftCardPaddingTop,
+      getDraftCardLayoutStyle,
+      shouldGroupLandscapeDraftCard,
+      getLandscapeRunChunkPlan,
+      planLandscapeRunChunks,
+      planDraftGridRows,
+      extendDraftRenderEndToRowBoundary,
+      extendLandscapeRunRenderEnd,
       isGenerationDraftId,
       extractErrorMessage,
     };

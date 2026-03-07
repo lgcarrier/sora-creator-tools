@@ -14,6 +14,18 @@ const {
   buildComposerSourceFromPublishedPost,
   isLargeComposerSizeAllowed,
   normalizeComposerSizeForModel,
+  normalizeDraftOrientationValue,
+  extractDraftDimensions,
+  resolveDraftOrientationValue,
+  getDraftOrientationForLayout,
+  getDraftCardPaddingTop,
+  getDraftCardLayoutStyle,
+  shouldGroupLandscapeDraftCard,
+  getLandscapeRunChunkPlan,
+  planLandscapeRunChunks,
+  planDraftGridRows,
+  extendDraftRenderEndToRowBoundary,
+  extendLandscapeRunRenderEnd,
   isGenerationDraftId,
   extractErrorMessage,
 } = createUVDraftsPageModule.__test;
@@ -160,6 +172,232 @@ test('large size is restricted to Sora 2 Pro unless ultra mode is enabled', () =
   assert.equal(normalizeComposerSizeForModel('large', 'sy_ore', false), 'large');
   assert.equal(normalizeComposerSizeForModel('large', 'sy_8', false), 'small');
   assert.equal(normalizeComposerSizeForModel('large', 'sy_8', true), 'large');
+});
+
+test('landscape cards group only inside consecutive landscape runs', () => {
+  const drafts = [
+    { id: 'l1', orientation: 'landscape' },
+    { id: 'l2', width: 1280, height: 720 },
+    { id: 'l3', orientation: 'landscape_16_9' },
+    { id: 'l4', orientation: 'landscape' },
+    { id: 'l5', orientation: 'landscape' },
+    { id: 'p1', orientation: 'portrait' },
+    { id: 'l6', orientation: 'landscape' },
+    { id: 'p2', width: 720, height: 1280 },
+  ];
+
+  assert.equal(getDraftOrientationForLayout(drafts[0]), 'landscape');
+  assert.equal(getDraftOrientationForLayout(drafts[1]), 'landscape');
+  assert.equal(getDraftOrientationForLayout(drafts[7]), 'portrait');
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 0), true);
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 1), true);
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 4), true);
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 5), false);
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 6), false);
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 7), false);
+  assert.equal(extendLandscapeRunRenderEnd(drafts, 1, 4), 5);
+  assert.equal(extendLandscapeRunRenderEnd(drafts, 3, 4), 5);
+  assert.equal(extendLandscapeRunRenderEnd(drafts, 3, 2), 4);
+  assert.equal(extendLandscapeRunRenderEnd(drafts, 5, 4), 5);
+});
+
+test('blocked landscape drafts stay full height and break landscape runs', () => {
+  const drafts = [
+    { id: 'blocked', orientation: 'landscape', status: 'content_violation', reason: 'Policy blocked' },
+    { id: 'l1', orientation: 'landscape' },
+    { id: 'l2', orientation: 'landscape' },
+    { id: 'l3', orientation: 'landscape' },
+    { id: 'l4', orientation: 'landscape' },
+    { id: 'l5', orientation: 'landscape' },
+    { id: 'l6', orientation: 'landscape' },
+    { id: 'p1', orientation: 'portrait' },
+  ];
+
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 0), false);
+  assert.equal(shouldGroupLandscapeDraftCard(drafts, 1), true);
+  assert.deepEqual(
+    planDraftGridRows(drafts, 5),
+    [
+      [
+        { kind: 'card', span: 1, draftIds: ['blocked'] },
+        { kind: 'landscape-run', span: 3, draftIds: ['l1', 'l2', 'l3', 'l4', 'l5', 'l6'] },
+        { kind: 'card', span: 1, draftIds: ['p1'] },
+      ],
+    ]
+  );
+});
+
+test('multiple blocked landscape drafts do not collapse into a half-height run', () => {
+  const drafts = [
+    { id: 'blocked1', orientation: 'landscape', status: 'content_violation', reason: 'Policy blocked' },
+    { id: 'blocked2', orientation: 'landscape', status: 'content_violation', reason: 'Policy blocked' },
+    { id: 'l1', orientation: 'landscape' },
+    { id: 'l2', orientation: 'landscape' },
+    { id: 'p1', orientation: 'portrait' },
+  ];
+
+  assert.deepEqual(
+    planDraftGridRows(drafts, 5),
+    [
+      [
+        { kind: 'card', span: 1, draftIds: ['blocked1'] },
+        { kind: 'card', span: 1, draftIds: ['blocked2'] },
+        { kind: 'landscape-run', span: 1, draftIds: ['l1', 'l2'] },
+        { kind: 'card', span: 1, draftIds: ['p1'] },
+      ],
+    ]
+  );
+});
+
+test('draft card padding uses normalized orientation while placeholders stay full height', () => {
+  assert.equal(getDraftCardPaddingTop({ orientation: 'landscape' }), '56.25%');
+  assert.equal(getDraftCardPaddingTop({ width: 1280, height: 720 }), '56.25%');
+  assert.equal(getDraftCardPaddingTop({ orientation: 'portrait' }), '177.78%');
+  assert.equal(getDraftCardPaddingTop({ orientation: 'landscape' }, true), '177.78%');
+});
+
+test('draft card layout keeps cards top-aligned while portraits stay full height', () => {
+  assert.deepEqual(getDraftCardLayoutStyle({ orientation: 'portrait' }), {
+    alignSelf: 'start',
+    paddingTop: '177.78%',
+  });
+  assert.deepEqual(getDraftCardLayoutStyle({ orientation: 'landscape' }), {
+    alignSelf: 'start',
+    paddingTop: '56.25%',
+  });
+  assert.deepEqual(getDraftCardLayoutStyle({ orientation: 'landscape' }, true), {
+    alignSelf: 'start',
+    paddingTop: '177.78%',
+  });
+});
+
+test('landscape run planner packs multiple items as half-height pairs by column', () => {
+  assert.deepEqual(
+    getLandscapeRunChunkPlan(4, 4, 0),
+    { columnSpan: 2, chunkLength: 4 }
+  );
+  assert.deepEqual(
+    getLandscapeRunChunkPlan(5, 4, 0),
+    { columnSpan: 3, chunkLength: 5 }
+  );
+  assert.deepEqual(
+    getLandscapeRunChunkPlan(3, 4, 2),
+    { columnSpan: 2, chunkLength: 3 }
+  );
+  assert.deepEqual(
+    getLandscapeRunChunkPlan(2, 4, 2),
+    { columnSpan: 1, chunkLength: 2 }
+  );
+  assert.deepEqual(
+    getLandscapeRunChunkPlan(2, 4, 3),
+    { columnSpan: 1, chunkLength: 2 }
+  );
+});
+
+test('landscape run chunk sequences avoid multi-slot holes and keep portrait-sized columns stable', () => {
+  assert.deepEqual(
+    planLandscapeRunChunks(10, 6, 2),
+    [
+      { columnSpan: 4, chunkLength: 8 },
+      { columnSpan: 1, chunkLength: 2 },
+    ]
+  );
+
+  for (let maxColumns = 2; maxColumns <= 6; maxColumns += 1) {
+    for (let rowFill = 0; rowFill < maxColumns; rowFill += 1) {
+      for (let runLength = 1; runLength <= 24; runLength += 1) {
+        const chunks = planLandscapeRunChunks(runLength, maxColumns, rowFill);
+        const totalChunkLength = chunks.reduce((sum, chunk) => sum + chunk.chunkLength, 0);
+        assert.equal(totalChunkLength, runLength);
+
+        let localRowFill = rowFill;
+        for (const chunk of chunks) {
+          const availableColumns = localRowFill > 0 ? (maxColumns - localRowFill) : maxColumns;
+          assert.ok(chunk.columnSpan >= 1 && chunk.columnSpan <= availableColumns);
+          assert.ok(chunk.chunkLength >= 1 && chunk.chunkLength <= chunk.columnSpan * 2);
+          assert.ok((chunk.columnSpan * 2) - chunk.chunkLength <= 1);
+          localRowFill = (localRowFill + chunk.columnSpan) % maxColumns;
+        }
+      }
+    }
+  }
+});
+
+test('row planner keeps a trailing portrait in the same full-height row after a completed landscape block', () => {
+  const drafts = [
+    { id: 'p-left', orientation: 'portrait' },
+    { id: 'l1', orientation: 'landscape' },
+    { id: 'l2', orientation: 'landscape' },
+    { id: 'l3', orientation: 'landscape' },
+    { id: 'l4', orientation: 'landscape' },
+    { id: 'l5', orientation: 'landscape' },
+    { id: 'l6', orientation: 'landscape' },
+    { id: 'p-right', orientation: 'portrait' },
+  ];
+
+  assert.deepEqual(
+    planDraftGridRows(drafts, 5),
+    [
+      [
+        { kind: 'card', span: 1, draftIds: ['p-left'] },
+        { kind: 'landscape-run', span: 3, draftIds: ['l1', 'l2', 'l3', 'l4', 'l5', 'l6'] },
+        { kind: 'card', span: 1, draftIds: ['p-right'] },
+      ],
+    ]
+  );
+});
+
+test('row planner uses all remaining row slots before wrapping a long landscape run', () => {
+  const drafts = [
+    { id: 'p-left', orientation: 'portrait' },
+    { id: 'l1', orientation: 'landscape' },
+    { id: 'l2', orientation: 'landscape' },
+    { id: 'l3', orientation: 'landscape' },
+    { id: 'l4', orientation: 'landscape' },
+    { id: 'l5', orientation: 'landscape' },
+    { id: 'l6', orientation: 'landscape' },
+    { id: 'l7', orientation: 'landscape' },
+    { id: 'l8', orientation: 'landscape' },
+    { id: 'l9', orientation: 'landscape' },
+    { id: 'l10', orientation: 'landscape' },
+  ];
+
+  assert.deepEqual(
+    planDraftGridRows(drafts, 5),
+    [
+      [
+        { kind: 'card', span: 1, draftIds: ['p-left'] },
+        { kind: 'landscape-run', span: 4, draftIds: ['l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7', 'l8'] },
+      ],
+      [
+        { kind: 'landscape-run', span: 1, draftIds: ['l9', 'l10'] },
+      ],
+    ]
+  );
+
+  assert.equal(extendDraftRenderEndToRowBoundary(drafts, 6, 5), 9);
+});
+
+test('partial draft updates preserve existing landscape dimensions and orientation', () => {
+  const existingDraft = {
+    id: 'gen_landscape_1',
+    width: 1280,
+    height: 720,
+    orientation: 'landscape',
+    preview_url: 'https://videos.openai.com/existing.mp4',
+    thumbnail_url: 'https://videos.openai.com/existing.jpg',
+  };
+
+  const partialDraft = {
+    id: 'gen_landscape_1',
+    prompt: 'same draft, partial payload',
+    creation_config: {},
+  };
+
+  assert.equal(normalizeDraftOrientationValue('landscape_16_9'), 'landscape');
+  assert.equal(normalizeDraftOrientationValue('portrait-9-16'), 'portrait');
+  assert.deepEqual(extractDraftDimensions(partialDraft, existingDraft), { width: 1280, height: 720 });
+  assert.equal(resolveDraftOrientationValue(partialDraft, existingDraft), 'landscape');
 });
 
 test('extractErrorMessage prefers nested backend message fields over object stringification', () => {

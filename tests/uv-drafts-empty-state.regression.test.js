@@ -29,6 +29,7 @@ function buildRenderHarness() {
         this.children = [];
         this.parentNode = null;
         this._innerHTML = '';
+        this.clientWidth = 1200;
       }
 
       appendChild(child) {
@@ -143,6 +144,50 @@ function buildRenderHarness() {
       return card;
     }
 
+    function shouldGroupLandscapeDraftCard() {
+      return false;
+    }
+
+    function getLandscapeRunEndIndex() {
+      return -1;
+    }
+
+    function getLandscapeRunGridColumnCapacity() {
+      return 4;
+    }
+
+    function getLandscapeRunChunkSize(maxColumns) {
+      return Math.max(2, Math.floor(Number(maxColumns) || 0)) * 2;
+    }
+
+    function getLandscapeRunColumnSpan() {
+      return 2;
+    }
+
+    function extendLandscapeRunRenderEnd(drafts, end) {
+      return Math.max(0, Math.min(Number(end) || 0, Array.isArray(drafts) ? drafts.length : 0));
+    }
+
+    function planDraftGridRows(drafts, maxColumns) {
+      if (!Array.isArray(drafts) || drafts.length === 0) return [];
+      const cols = Math.max(1, Math.floor(Number(maxColumns) || 0));
+      const rows = [];
+      for (let index = 0; index < drafts.length; index += cols) {
+        rows.push(
+          drafts.slice(index, index + cols).map((draft) => ({
+            kind: 'card',
+            span: 1,
+            draftIds: [String(draft.id || '')],
+          }))
+        );
+      }
+      return rows;
+    }
+
+    function extendDraftRenderEndToRowBoundary(drafts, end) {
+      return Math.max(0, Math.min(Number(end) || 0, Array.isArray(drafts) ? drafts.length : 0));
+    }
+
     function updateLoadMoreIndicator() {}
     function setupUVDraftsInfiniteScroll() {}
 
@@ -167,7 +212,7 @@ function buildRenderHarness() {
       loadingText: uvDraftsLoadingEl.textContent || '',
       renderedCount: uvDraftsRenderedCount,
       childClasses: uvDraftsGridEl.children.map((child) => child.className || ''),
-      childDraftIds: uvDraftsGridEl.children.map((child) => child.dataset?.draftId || ''),
+      childDraftIds: uvDraftsGridEl.children.flatMap((child) => (child.children || []).map((grandChild) => grandChild.dataset?.draftId || '')),
       emptyText: uvDraftsGridEl.querySelector('.uvd-empty-state')?.textContent || null,
     });
   `;
@@ -224,6 +269,6 @@ test('renderUVDraftsSyncUpdate removes stale empty state before appending real d
 
   assert.equal(snapshot.emptyText, null);
   assert.equal(snapshot.loadingDisplay, 'none');
-  assert.deepEqual(Array.from(snapshot.childClasses), ['uv-draft-card']);
+  assert.deepEqual(Array.from(snapshot.childClasses), ['uvd-grid-row']);
   assert.deepEqual(Array.from(snapshot.childDraftIds), ['draft_1']);
 });
