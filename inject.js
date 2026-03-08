@@ -4548,6 +4548,7 @@
       justifyContent: 'center',
       alignItems: 'center',
     });
+    bar._buttonRow = buttonRow;
 
     // prefs
     let prefs = getPrefs();
@@ -9678,6 +9679,108 @@ async function renderAnalyzeTable(force = false) {
     // Preserve the filter when navigating between Explore and Post pages,
     // since Sora often changes the URL without actually changing the underlying feed state.
     return (a === 'explore' || a === 'post') && (b === 'explore' || b === 'post');
+  }
+
+  function findTopRightActivityButton() {
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const maxTop = Math.min(180, Math.max(100, Math.round(vh * 0.35)));
+    const minLeft = Math.round(vw * 0.45);
+    const candidates = Array.from(document.querySelectorAll('button[aria-label="Activity"]'))
+      .filter((btn) => !(controlBar && controlBar.contains(btn)))
+      .map((btn) => ({ btn, rect: btn.getBoundingClientRect() }))
+      .filter(({ rect }) => (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.top >= -20 &&
+        rect.top <= maxTop &&
+        rect.left >= minLeft
+      ))
+      .sort((a, b) => (b.rect.right - a.rect.right) || (a.rect.top - b.rect.top));
+    return candidates[0]?.btn || null;
+  }
+
+  function undockActivityButton(bar) {
+    if (!bar) return;
+    const state = bar._activityDockState;
+    if (!state) return;
+    const node = state.node;
+    const parent = state.originalParent;
+    const nextSibling = state.originalNextSibling;
+    if (node && state.nodeMarginLeft != null) node.style.marginLeft = state.nodeMarginLeft;
+    if (node && state.nodeMarginRight != null) node.style.marginRight = state.nodeMarginRight;
+    if (node && parent && parent.isConnected) {
+      if (nextSibling && nextSibling.parentNode === parent) parent.insertBefore(node, nextSibling);
+      else parent.appendChild(node);
+    }
+    if (state.nativeContainer && state.nativeContainer.isConnected) {
+      state.nativeContainer.style.display = state.nativeDisplay || '';
+    }
+    if (bar._activityDockSlot) {
+      bar._activityDockSlot.style.display = 'none';
+    }
+    bar._activityDockState = null;
+  }
+
+  function dockActivityButton(bar) {
+    if (!bar) return;
+    const buttonRow = bar._buttonRow;
+    if (!buttonRow) return;
+
+    const existingState = bar._activityDockState;
+    if (existingState?.node && bar._activityDockSlot && bar._activityDockSlot.contains(existingState.node)) {
+      bar._activityDockSlot.style.display = 'flex';
+      return;
+    }
+
+    const activityBtn = findTopRightActivityButton();
+    if (!activityBtn) {
+      undockActivityButton(bar);
+      return;
+    }
+
+    const dockSlot = bar._activityDockSlot || (() => {
+      const slot = document.createElement('div');
+      slot.className = 'sora-uv-activity-dock';
+      Object.assign(slot.style, {
+        display: 'none',
+        alignItems: 'center',
+        marginLeft: '-5px',
+      });
+      buttonRow.appendChild(slot);
+      bar._activityDockSlot = slot;
+      return slot;
+    })();
+
+    const moveNode = activityBtn.closest('.pointer-events-auto') || activityBtn;
+    const nativeContainer = moveNode.closest('.pointer-events-none.fixed') || moveNode.closest('.fixed');
+    if (!moveNode.parentNode) return;
+    const nodeMarginLeft = moveNode.style.marginLeft;
+    const nodeMarginRight = moveNode.style.marginRight;
+    undockActivityButton(bar);
+    bar._activityDockState = {
+      node: moveNode,
+      originalParent: moveNode.parentNode,
+      originalNextSibling: moveNode.nextSibling,
+      nativeContainer,
+      nativeDisplay: nativeContainer ? nativeContainer.style.display : '',
+      nodeMarginLeft,
+      nodeMarginRight,
+    };
+    moveNode.style.marginLeft = '0';
+    moveNode.style.marginRight = '0';
+    dockSlot.appendChild(moveNode);
+    dockSlot.style.display = 'flex';
+    if (nativeContainer) nativeContainer.style.display = 'none';
+  }
+
+  function syncActivityButtonDocking(bar, shouldDock) {
+    if (!bar) return;
+    if (!shouldDock) {
+      undockActivityButton(bar);
+      return;
+    }
+    dockActivityButton(bar);
   }
 
   function updateControlsVisibility() {
