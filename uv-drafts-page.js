@@ -6614,13 +6614,9 @@
     const processed = Number.isFinite(uvDraftsSyncUiState.processed)
       ? Math.max(0, Math.floor(uvDraftsSyncUiState.processed))
       : Math.max(0, Math.floor(uvDraftsData.length || 0));
-    const page = Number.isFinite(uvDraftsSyncUiState.page)
-      ? Math.max(0, Math.floor(uvDraftsSyncUiState.page))
-      : 0;
 
     if (uvDraftsSyncUiState.syncing) {
-      const pageSuffix = page > 0 ? ` • p${page}` : '';
-      uvDraftsSyncButtonEl.textContent = `↻ Syncing ${processed}${pageSuffix}`;
+      uvDraftsSyncButtonEl.textContent = `↻ Syncing ${processed}`;
       uvDraftsSyncButtonEl.disabled = true;
       return;
     }
