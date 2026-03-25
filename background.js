@@ -1,3 +1,7 @@
+try {
+  importScripts('uv-backup-logic.js');
+} catch {}
+
 /* Open full dashboard page when the action icon is clicked */
 chrome.action.onClicked.addListener(() => {
   openOrFocusDashboard(() => {});
@@ -31,6 +35,42 @@ const HARVEST_DB_NAME = 'SCT_HARVEST_DB_V1';
 const HARVEST_DB_VERSION = 1;
 const HARVEST_STORE = 'records';
 const HARVEST_META_STORE = 'meta';
+const BACKUP_DB_NAME = 'SCT_BACKUP_DB_V1';
+const BACKUP_DB_VERSION = 1;
+const BACKUP_RUNS_STORE = 'runs';
+const BACKUP_ITEMS_STORE = 'items';
+const BACKUP_ORIGIN = 'https://sora.chatgpt.com';
+const BACKUP_DEFAULT_FEED_LIMIT = 20;
+const BACKUP_DEFAULT_DRAFT_LIMIT = 50;
+const BACKUP_URL_REFRESH_MAX_AGE_MS = 30 * 60 * 1000;
+const BACKUP_DOWNLOAD_FOLDER = 'Sora Backup';
+const BACKUP_FETCH_MAX_ATTEMPTS = 4;
+const BACKUP_FETCH_RETRY_BASE_MS = 1500;
+const BACKUP_FETCH_RETRY_MAX_MS = 15000;
+
+const backupLogic = globalThis.SoraUVBackupLogic || {};
+const {
+  DEFAULT_BACKUP_SCOPES = { ownDrafts: true, ownPosts: true, castInPosts: true, castInDrafts: true },
+  normalizeBackupScopes = (value) => value || DEFAULT_BACKUP_SCOPES,
+  normalizeBackupHeaders = (value) => value || {},
+  buildBackupRunId = () => `backup_${Date.now()}`,
+  buildBackupRunStamp = () => new Date().toISOString().replace(/[:.]/g, '-'),
+  makeBackupItemKey = (runId, kind, id) => `${runId}:${kind}:${id}`,
+  normalizeCurrentUser = (value) => value || { handle: '', id: '' },
+  extractOwnerIdentity = (value) => value || { handle: '', id: '' },
+  sameOwnerIdentity = () => false,
+  shouldExcludeAppearanceOwner = () => false,
+  parseTimestampMs = (value) => Number(value) || 0,
+  inferFileExtension = () => 'mp4',
+  isSignedUrlFresh = () => true,
+  pickBackupMediaSource = () => null,
+  normalizeRunStatus = (value) => value || 'idle',
+  normalizeItemStatus = (value) => value || 'queued',
+  isTerminalRunStatus = () => false,
+  applyBackupStatusTransition = (counts) => counts,
+  createEmptyBackupCounts = () => ({ discovered: 0, queued: 0, downloading: 0, done: 0, skipped: 0, failed: 0 }),
+  cloneBackupCounts = (counts) => ({ ...(counts || {}) }),
+} = backupLogic;
 
 // Debug toggles
 const DEBUG = { storage: false, thumbs: false };
@@ -56,6 +96,10 @@ let coldWriteTimer = null;
 
 let isFlushing = false;
 let needsFlush = false;
+let backupDbPromise = null;
+let backupRunLoopPromise = null;
+const backupRunInterrupts = new Map();
+const backupRunSaveQueues = new Map();
 
 function isPlainObject(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -429,6 +473,41 @@ function sanitizeMetricsRequest(message) {
     postId,
     windowHours: null,
     snapshotMode: normalizeSnapshotMode(message?.snapshotMode),
+  };
+}
+
+function sanitizeBackupHeadersForRequest(value) {
+  const headers = normalizeBackupHeaders(value);
+  if (!headers || typeof headers !== 'object') return {};
+  const out = {};
+  const auth = sanitizeString(headers.Authorization, 4096);
+  const device = sanitizeString(headers['OAI-Device-Id'], 256);
+  const language = sanitizeString(headers['OAI-Language'], 64);
+  if (auth) out.Authorization = auth;
+  if (device) out['OAI-Device-Id'] = device;
+  if (language) out['OAI-Language'] = language;
+  return out;
+}
+
+function sanitizeBackupPayload(action, payload) {
+  const raw = isPlainObject(payload) ? payload : {};
+  const runId = sanitizeIdToken(raw.runId);
+  if (action === 'backup_start') {
+    return {
+      scopes: normalizeBackupScopes(raw.scopes),
+      headers: sanitizeBackupHeadersForRequest(raw.headers),
+    };
+  }
+  if (action === 'backup_manifest_request') {
+    const format = sanitizeString(raw.format, 24);
+    return {
+      runId: runId || null,
+      format: format || 'manifest',
+    };
+  }
+  return {
+    runId: runId || null,
+    headers: sanitizeBackupHeadersForRequest(raw.headers),
   };
 }
 
@@ -1193,6 +1272,1047 @@ async function flushHarvest() {
   }
 }
 
+function openBackupDB() {
+  if (backupDbPromise) return backupDbPromise;
+  backupDbPromise = new Promise((resolve, reject) => {
+    try {
+      const request = indexedDB.open(BACKUP_DB_NAME, BACKUP_DB_VERSION);
+      request.onerror = () => reject(request.error || new Error('Failed to open backup DB'));
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(BACKUP_RUNS_STORE)) {
+          const runsStore = db.createObjectStore(BACKUP_RUNS_STORE, { keyPath: 'id' });
+          runsStore.createIndex('updated_at', 'updated_at', { unique: false });
+          runsStore.createIndex('status', 'status', { unique: false });
+        }
+        if (!db.objectStoreNames.contains(BACKUP_ITEMS_STORE)) {
+          const itemsStore = db.createObjectStore(BACKUP_ITEMS_STORE, { keyPath: 'item_key' });
+          itemsStore.createIndex('run_id', 'run_id', { unique: false });
+          itemsStore.createIndex('run_id_order', ['run_id', 'order'], { unique: false });
+          itemsStore.createIndex('download_id', 'download_id', { unique: false });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+    } catch (err) {
+      reject(err);
+    }
+  });
+  return backupDbPromise;
+}
+
+async function backupDbGet(storeName, key) {
+  const db = await openBackupDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error(`backup get failed for ${storeName}`));
+  });
+}
+
+async function backupDbPut(storeName, value) {
+  const db = await openBackupDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value);
+    tx.oncomplete = () => resolve(value);
+    tx.onerror = () => reject(tx.error || new Error(`backup put failed for ${storeName}`));
+    tx.onabort = () => reject(tx.error || new Error(`backup put aborted for ${storeName}`));
+  });
+}
+
+async function backupDbPutMany(storeName, values) {
+  const items = Array.isArray(values) ? values.filter(Boolean) : [];
+  if (!items.length) return;
+  const db = await openBackupDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    for (const value of items) store.put(value);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error(`backup putMany failed for ${storeName}`));
+    tx.onabort = () => reject(tx.error || new Error(`backup putMany aborted for ${storeName}`));
+  });
+}
+
+async function backupDbGetAllRuns() {
+  const db = await openBackupDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BACKUP_RUNS_STORE, 'readonly');
+    const req = tx.objectStore(BACKUP_RUNS_STORE).getAll();
+    req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
+    req.onerror = () => reject(req.error || new Error('backup getAll runs failed'));
+  });
+}
+
+async function backupDbGetLatestRun() {
+  const runs = await backupDbGetAllRuns();
+  if (!runs.length) return null;
+  return runs
+    .slice()
+    .sort((left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0))[0] || null;
+}
+
+async function backupDbGetRunItems(runId) {
+  const db = await openBackupDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BACKUP_ITEMS_STORE, 'readonly');
+    const idx = tx.objectStore(BACKUP_ITEMS_STORE).index('run_id');
+    const req = idx.getAll(IDBKeyRange.only(String(runId || '')));
+    req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
+    req.onerror = () => reject(req.error || new Error('backup get run items failed'));
+  });
+}
+
+async function backupDbGetItemByDownloadId(downloadId) {
+  const db = await openBackupDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BACKUP_ITEMS_STORE, 'readonly');
+    const idx = tx.objectStore(BACKUP_ITEMS_STORE).index('download_id');
+    const req = idx.getAll(IDBKeyRange.only(Number(downloadId) || 0));
+    req.onsuccess = () => {
+      const out = Array.isArray(req.result) ? req.result : [];
+      resolve(out[0] || null);
+    };
+    req.onerror = () => reject(req.error || new Error('backup get by download id failed'));
+  });
+}
+
+function cloneBackupBucketCounts(raw) {
+  const source = isPlainObject(raw) ? raw : {};
+  return {
+    ownDrafts: Number(source.ownDrafts) || 0,
+    ownPosts: Number(source.ownPosts) || 0,
+    castInPosts: Number(source.castInPosts) || 0,
+    castInDrafts: Number(source.castInDrafts) || 0,
+  };
+}
+
+function summarizeBackupRunForClient(run) {
+  if (!isPlainObject(run)) return null;
+  return {
+    id: run.id || '',
+    status: normalizeRunStatus(run.status),
+    scopes: normalizeBackupScopes(run.scopes),
+    counts: cloneBackupCounts(run.counts),
+    bucket_counts: cloneBackupBucketCounts(run.bucket_counts),
+    current_user: normalizeCurrentUser(run.current_user),
+    run_stamp: sanitizeString(run.run_stamp, 64) || '',
+    created_at: Number(run.created_at) || 0,
+    updated_at: Number(run.updated_at) || 0,
+    started_at: Number(run.started_at) || 0,
+    completed_at: Number(run.completed_at) || 0,
+    paused_at: Number(run.paused_at) || 0,
+    cancelled_at: Number(run.cancelled_at) || 0,
+    active_item_key: sanitizeString(run.active_item_key, 256) || '',
+    last_error: sanitizeString(run.last_error, 1024) || '',
+    summary_text: sanitizeString(run.summary_text, 1024) || '',
+  };
+}
+
+async function sendBackupPageFetchToTab(tabId, payload) {
+  const numericTabId = Number(tabId) || 0;
+  if (!numericTabId) return { ok: false, status: 0, error: 'backup_page_fetch_missing_tab' };
+  return new Promise((resolve) => {
+    try {
+      chrome.tabs.sendMessage(
+        numericTabId,
+        { action: 'backup_page_fetch', payload },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            resolve({
+              ok: false,
+              status: 0,
+              error: sanitizeString(chrome.runtime.lastError.message, 512) || 'backup_page_fetch_runtime_error',
+            });
+            return;
+          }
+          resolve(response || { ok: false, status: 0, error: 'backup_page_fetch_empty' });
+        }
+      );
+    } catch (err) {
+      resolve({
+        ok: false,
+        status: 0,
+        error: sanitizeString(err?.message || String(err), 512) || 'backup_page_fetch_send_failed',
+      });
+    }
+  });
+}
+
+async function getBackupFetchTabIds(preferredTabId) {
+  const preferred = Number(preferredTabId) || 0;
+  const ordered = [];
+  if (preferred > 0) ordered.push(preferred);
+  try {
+    const tabs = await chrome.tabs.query({ url: `${BACKUP_ORIGIN}/*` });
+    for (const tab of Array.isArray(tabs) ? tabs : []) {
+      const tabId = Number(tab?.id) || 0;
+      if (!tabId || ordered.includes(tabId)) continue;
+      ordered.push(tabId);
+    }
+  } catch {}
+  return ordered;
+}
+
+async function performBackupPageFetch(run, pathname, params = {}, overrideHeaders = {}) {
+  const payload = {
+    pathname,
+    params,
+    headers: buildBackupHeaders(run, overrideHeaders),
+  };
+  const tabIds = await getBackupFetchTabIds(run?.page_tab_id);
+  let lastResponse = { ok: false, status: 0, error: 'backup_page_fetch_unavailable' };
+  for (const tabId of tabIds) {
+    const response = await sendBackupPageFetchToTab(tabId, payload);
+    lastResponse = response || lastResponse;
+    if ((response?.ok === true) || Number(response?.status) > 0) {
+      if (Number(tabId) > 0 && Number(run?.page_tab_id) !== Number(tabId)) {
+        run = await syncBackupRunPageTabId(run, tabId);
+      }
+      return response;
+    }
+  }
+  return lastResponse;
+}
+
+async function broadcastBackupRunEvent(event) {
+  try {
+    const tabs = await chrome.tabs.query({ url: `${BACKUP_ORIGIN}/*` });
+    for (const tab of Array.isArray(tabs) ? tabs : []) {
+      if (tab?.id == null) continue;
+      try {
+        chrome.tabs.sendMessage(tab.id, { action: 'backup_run_event', event });
+      } catch {}
+    }
+  } catch {}
+}
+
+async function saveBackupRun(run, eventType = 'status') {
+  return enqueueBackupRunSave(run?.id, async () => {
+    const existing = run?.id ? await backupDbGet(BACKUP_RUNS_STORE, run.id).catch(() => null) : null;
+    const rawIncomingInterrupt = (
+      run &&
+      typeof run === 'object' &&
+      Object.prototype.hasOwnProperty.call(run, 'interrupt_status') &&
+      typeof run.interrupt_status === 'string'
+    ) ? run.interrupt_status.trim().toLowerCase() : null;
+    const incomingInterrupt = normalizeRunStatus(rawIncomingInterrupt);
+    const wantsInterruptClear = rawIncomingInterrupt === '' && normalizeRunStatus(run?.status) === 'running';
+    const hasIncomingInterrupt = !!(
+      run &&
+      typeof run === 'object' &&
+      Object.prototype.hasOwnProperty.call(run, 'interrupt_status') &&
+      (
+        incomingInterrupt === 'paused' ||
+        incomingInterrupt === 'cancelled' ||
+        wantsInterruptClear
+      )
+    );
+    const existingInterrupt = normalizeRunStatus(existing?.interrupt_status);
+    const liveInterrupt = normalizeRunStatus(backupRunInterrupts.get(String(run?.id || '')) || '');
+    const effectiveInterrupt = hasIncomingInterrupt
+      ? ((incomingInterrupt === 'paused' || incomingInterrupt === 'cancelled') ? incomingInterrupt : '')
+      : (
+        (liveInterrupt === 'paused' || liveInterrupt === 'cancelled')
+          ? liveInterrupt
+          : ((existingInterrupt === 'paused' || existingInterrupt === 'cancelled') ? existingInterrupt : '')
+      );
+
+    const next = {
+      ...(existing || {}),
+      ...run,
+      status: normalizeRunStatus(run.status),
+      interrupt_status: effectiveInterrupt,
+      counts: cloneBackupCounts(run.counts),
+      bucket_counts: cloneBackupBucketCounts(run.bucket_counts),
+      updated_at: Date.now(),
+    };
+
+    if (!hasIncomingInterrupt && (effectiveInterrupt === 'paused' || effectiveInterrupt === 'cancelled')) {
+      next.status = effectiveInterrupt;
+      if (effectiveInterrupt === 'paused') {
+        next.paused_at = Number(existing?.paused_at) || Number(run?.paused_at) || Date.now();
+        next.summary_text = (existingInterrupt === 'paused' ? sanitizeString(existing?.summary_text, 1024) : null) || 'Paused.';
+      } else {
+        next.cancelled_at = Number(existing?.cancelled_at) || Number(run?.cancelled_at) || Date.now();
+        next.active_download_id = 0;
+        next.active_item_key = '';
+        next.summary_text = (existingInterrupt === 'cancelled' ? sanitizeString(existing?.summary_text, 1024) : null) || 'Backup cancelled.';
+      }
+    }
+
+    await backupDbPut(BACKUP_RUNS_STORE, next);
+    await broadcastBackupRunEvent({ type: eventType, run: summarizeBackupRunForClient(next) });
+    return next;
+  });
+}
+
+function enqueueBackupRunSave(runId, task) {
+  const key = String(runId || '');
+  const previous = backupRunSaveQueues.get(key) || Promise.resolve();
+  const current = previous
+    .catch(() => {})
+    .then(() => task());
+  backupRunSaveQueues.set(key, current);
+  current.finally(() => {
+    if (backupRunSaveQueues.get(key) === current) {
+      backupRunSaveQueues.delete(key);
+    }
+  });
+  return current;
+}
+
+async function syncBackupRunPageTabId(run, tabId) {
+  const nextTabId = Number(tabId) || 0;
+  if (!run?.id || !nextTabId) return run;
+  const latest = await backupDbGet(BACKUP_RUNS_STORE, run.id).catch(() => null);
+  if (!latest) return run;
+  const next = await saveBackupRun({
+    ...latest,
+    page_tab_id: nextTabId,
+  }, 'status');
+  if (next) {
+    run.page_tab_id = Number(next.page_tab_id) || nextTabId;
+    run.status = next.status;
+    run.interrupt_status = next.interrupt_status;
+    run.cancelled_at = Number(next.cancelled_at) || 0;
+    run.paused_at = Number(next.paused_at) || 0;
+    run.summary_text = next.summary_text || run.summary_text || '';
+  }
+  return next || run;
+}
+
+function buildBackupHeaders(run, overrideHeaders = {}) {
+  const headers = {
+    Accept: 'application/json',
+    'Cache-Control': 'no-cache',
+    ...normalizeBackupHeaders(run?.headers),
+    ...normalizeBackupHeaders(overrideHeaders),
+  };
+  if (!headers.Authorization) throw new Error('backup_missing_auth_header');
+  return headers;
+}
+
+function buildBackupUrl(pathname, params = {}) {
+  const url = new URL(pathname, BACKUP_ORIGIN);
+  for (const [key, value] of Object.entries(params)) {
+    if (value == null || value === '') continue;
+    url.searchParams.set(key, String(value));
+  }
+  return url.toString();
+}
+
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+function parseRetryAfterMs(value) {
+  const raw = sanitizeString(value, 128);
+  if (!raw) return 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.max(0, Math.floor(seconds * 1000));
+  const dateMs = parseTimestampMs(raw);
+  if (!dateMs) return 0;
+  return Math.max(0, dateMs - Date.now());
+}
+
+function shouldRetryBackupStatus(status) {
+  const numeric = Number(status) || 0;
+  return numeric === 408 || numeric === 425 || numeric === 429 || numeric === 500 || numeric === 502 || numeric === 503 || numeric === 504;
+}
+
+function getBackupRetryDelayMs(response, attempt) {
+  const retryAfterMs = parseRetryAfterMs(response?.headers?.get?.('Retry-After'));
+  if (retryAfterMs > 0) return Math.min(BACKUP_FETCH_RETRY_MAX_MS, retryAfterMs);
+  const backoffMs = BACKUP_FETCH_RETRY_BASE_MS * Math.pow(2, Math.max(0, Number(attempt) - 1));
+  const jitterMs = Math.floor(Math.random() * 350);
+  return Math.min(BACKUP_FETCH_RETRY_MAX_MS, backoffMs + jitterMs);
+}
+
+async function backupFetchJson(run, pathname, params = {}, overrideHeaders = {}, options = {}) {
+  const maxAttempts = Math.max(1, Number(options.maxAttempts) || BACKUP_FETCH_MAX_ATTEMPTS);
+  let lastStatus = 0;
+  let lastError = '';
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await performBackupPageFetch(run, pathname, params, overrideHeaders);
+    if (response?.ok) return response.json || {};
+    lastStatus = Number(response?.status) || 0;
+    lastError = sanitizeString(response?.error, 512) || '';
+    if (attempt >= maxAttempts || !shouldRetryBackupStatus(lastStatus)) break;
+    await waitMs(getBackupRetryDelayMs({ headers: { get: () => null } }, attempt));
+  }
+  if (lastStatus > 0) throw new Error(`backup_http_${lastStatus}`);
+  throw new Error(lastError || 'backup_page_fetch_failed');
+}
+
+function extractItemsFromPayload(payload) {
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.data?.items)) return payload.data.items;
+  if (Array.isArray(payload?.drafts)) return payload.drafts;
+  if (Array.isArray(payload?.data?.drafts)) return payload.data.drafts;
+  return [];
+}
+
+function extractCursorFromPayload(payload) {
+  const cursor = payload?.next_cursor ?? payload?.cursor ?? payload?.data?.next_cursor ?? payload?.data?.cursor ?? null;
+  return cursor == null || cursor === '' ? null : String(cursor);
+}
+
+function getBackupItemId(kind, item) {
+  if (!isPlainObject(item)) return '';
+  if (String(kind) === 'draft') {
+    return sanitizeIdToken(item.id || item.generation_id || item.draft_id) || '';
+  }
+  const post = item.post && typeof item.post === 'object' ? item.post : item;
+  return sanitizeIdToken(post.id || item.id || post.post_id) || '';
+}
+
+function pickPrompt(detail, item) {
+  const detailPost = detail?.post && typeof detail.post === 'object' ? detail.post : detail;
+  const listPost = item?.post && typeof item.post === 'object' ? item.post : item;
+  const values = [
+    detailPost?.creation_config?.prompt,
+    detailPost?.prompt,
+    detailPost?.caption,
+    detailPost?.text,
+    detail?.creation_config?.prompt,
+    item?.creation_config?.prompt,
+    listPost?.prompt,
+    listPost?.caption,
+    listPost?.text,
+    item?.prompt,
+  ];
+  for (const value of values) {
+    const next = sanitizeString(value, 4096);
+    if (next) return next;
+  }
+  return '';
+}
+
+function pickPromptSource(detail, item) {
+  const detailPost = detail?.post && typeof detail.post === 'object' ? detail.post : detail;
+  if (sanitizeString(detailPost?.creation_config?.prompt, 4096)) return 'creation_config';
+  if (sanitizeString(detailPost?.prompt, 4096)) return 'detail';
+  if (sanitizeString(detailPost?.caption, 4096) || sanitizeString(detailPost?.text, 4096)) return 'inline';
+  const listPost = item?.post && typeof item.post === 'object' ? item.post : item;
+  if (sanitizeString(item?.creation_config?.prompt, 4096)) return 'creation_config';
+  if (sanitizeString(listPost?.caption, 4096) || sanitizeString(listPost?.text, 4096) || sanitizeString(item?.prompt, 4096)) return 'inline';
+  return '';
+}
+
+function pickTitle(detail, item) {
+  const detailPost = detail?.post && typeof detail.post === 'object' ? detail.post : detail;
+  const listPost = item?.post && typeof item.post === 'object' ? item.post : item;
+  return (
+    sanitizeString(detailPost?.title, 512) ||
+    sanitizeString(detail?.title, 512) ||
+    sanitizeString(listPost?.title, 512) ||
+    sanitizeString(item?.title, 512) ||
+    ''
+  );
+}
+
+function collectBackupCastNames(detail, item) {
+  const candidates = [];
+  const pushAll = (values) => {
+    if (!Array.isArray(values)) return;
+    for (const value of values) {
+      if (candidates.length >= MAX_HARVEST_CAST_NAMES) break;
+      const next = sanitizeString(typeof value === 'string' ? value : (value?.username || value?.handle || value?.name), 80);
+      if (!next || candidates.includes(next)) continue;
+      candidates.push(next);
+    }
+  };
+  const detailPost = detail?.post && typeof detail.post === 'object' ? detail.post : detail;
+  const listPost = item?.post && typeof item.post === 'object' ? item.post : item;
+  pushAll(detailPost?.cameo_usernames);
+  pushAll(detail?.cameos);
+  pushAll(detail?.cameo_profiles);
+  pushAll(listPost?.cameo_usernames);
+  pushAll(item?.cameos);
+  pushAll(item?.cameo_profiles);
+  return candidates;
+}
+
+function resolveBackupDimensionsAndDuration(kind, detail, item) {
+  const root = detail?.post && typeof detail.post === 'object'
+    ? detail.post
+    : (detail?.draft && typeof detail.draft === 'object' ? detail.draft : detail);
+  const fallback = item?.post && typeof item.post === 'object' ? item.post : item;
+  const cfg = root?.creation_config && typeof root.creation_config === 'object'
+    ? root.creation_config
+    : (fallback?.creation_config && typeof fallback.creation_config === 'object' ? fallback.creation_config : {});
+  const attachment = Array.isArray(root?.attachments) && root.attachments.length
+    ? root.attachments[0]
+    : (Array.isArray(fallback?.attachments) && fallback.attachments.length ? fallback.attachments[0] : null);
+  const width = sanitizeNumber(cfg.width ?? root?.width ?? attachment?.width ?? fallback?.width, 1, 20000);
+  const height = sanitizeNumber(cfg.height ?? root?.height ?? attachment?.height ?? fallback?.height, 1, 20000);
+  let duration = sanitizeNumber(root?.duration_s ?? detail?.duration_s ?? fallback?.duration_s, 0, 60 * 60 * 10);
+  if (duration == null) {
+    const fps = sanitizeNumber(cfg.fps ?? root?.fps ?? fallback?.fps, 1, 120) || 30;
+    const nFrames = sanitizeNumber(
+      cfg.n_frames ??
+      root?.n_frames ??
+      root?.video_metadata?.n_frames ??
+      attachment?.n_frames ??
+      fallback?.n_frames,
+      1,
+      1000000
+    );
+    if (nFrames != null && fps > 0) duration = nFrames / fps;
+  }
+  return {
+    width: width != null ? width : null,
+    height: height != null ? height : null,
+    duration_s: duration != null ? duration : null,
+  };
+}
+
+function buildBackupFilename(run, bucket, id, ext) {
+  const safeExt = sanitizeString(ext, 16) || 'mp4';
+  return `${BACKUP_DOWNLOAD_FOLDER}/${run.run_stamp}/${bucket}/${id}.${safeExt}`;
+}
+
+function buildBackupDetailPath(kind, id) {
+  if (kind === 'draft') return `/backend/project_y/profile/drafts/v2/${encodeURIComponent(id)}`;
+  return `/backend/project_y/post/${encodeURIComponent(id)}`;
+}
+
+function buildBackupPermalink(kind, id) {
+  return kind === 'draft'
+    ? `${BACKUP_ORIGIN}/d/${encodeURIComponent(id)}`
+    : `${BACKUP_ORIGIN}/p/${encodeURIComponent(id)}`;
+}
+
+function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
+  const id = getBackupItemId(kind, detail) || getBackupItemId(kind, listItem);
+  if (!id) return null;
+  const owner = extractOwnerIdentity(detail || listItem);
+  const prompt = pickPrompt(detail, listItem);
+  const promptSource = pickPromptSource(detail, listItem);
+  const title = pickTitle(detail, listItem);
+  const createdAt = detail?.created_at ?? detail?.post?.created_at ?? listItem?.created_at ?? listItem?.post?.created_at ?? null;
+  const postedAt = detail?.posted_at ?? detail?.post?.posted_at ?? listItem?.posted_at ?? listItem?.post?.posted_at ?? null;
+  const updatedAt = detail?.updated_at ?? detail?.post?.updated_at ?? listItem?.updated_at ?? listItem?.post?.updated_at ?? null;
+  const dims = resolveBackupDimensionsAndDuration(kind, detail, listItem);
+  const castNames = collectBackupCastNames(detail, listItem);
+  const media = pickBackupMediaSource(kind, detail || listItem);
+  const itemKey = makeBackupItemKey(run.id, kind, id);
+  const nextStatus = 'queued';
+  const mediaExt = media?.ext || 'mp4';
+  return {
+    item_key: itemKey,
+    run_id: run.id,
+    order: Number.isFinite(Number(order)) ? Math.floor(Number(order)) : 0,
+    bucket,
+    kind,
+    id,
+    status: nextStatus,
+    attempts: 0,
+    download_id: 0,
+    owner_handle: owner.handle || '',
+    owner_id: owner.id || '',
+    prompt,
+    prompt_source: promptSource,
+    title,
+    created_at: typeof createdAt === 'string' ? createdAt : (createdAt ?? null),
+    posted_at: typeof postedAt === 'string' ? postedAt : (postedAt ?? null),
+    updated_at: typeof updatedAt === 'string' ? updatedAt : (updatedAt ?? null),
+    width: dims.width,
+    height: dims.height,
+    duration_s: dims.duration_s,
+    cast_names: castNames,
+    cameos: castNames,
+    detail_url: `${BACKUP_ORIGIN}${buildBackupDetailPath(kind, id)}`,
+    post_permalink: buildBackupPermalink(kind, id),
+    media_url: media?.url || '',
+    media_variant: media?.variant || '',
+    media_ext: mediaExt,
+    media_key_path: media?.keyPath || '',
+    filename: buildBackupFilename(run, bucket, id, mediaExt),
+    url_refreshed_at: media?.url ? Date.now() : 0,
+    last_error: '',
+  };
+}
+
+function hasResolvedBackupOwner(raw) {
+  const owner = normalizeCurrentUser(raw);
+  return !!(owner.handle || owner.id);
+}
+
+function shouldFetchDiscoveryDetail(bucket, owner) {
+  if (!bucket || !bucket.key) return false;
+  if (bucket.key === 'castInDrafts') return !hasResolvedBackupOwner(owner);
+  if (bucket.key === 'castInPosts') return !hasResolvedBackupOwner(owner);
+  return false;
+}
+
+function createBackupRunRecord(scopes, headers, pageTabId = 0) {
+  const createdAt = Date.now();
+  return {
+    id: buildBackupRunId(createdAt),
+    status: 'discovering',
+    interrupt_status: '',
+    scopes: normalizeBackupScopes(scopes),
+    headers: normalizeBackupHeaders(headers),
+    counts: createEmptyBackupCounts(),
+    bucket_counts: cloneBackupBucketCounts(),
+    created_at: createdAt,
+    updated_at: createdAt,
+    started_at: createdAt,
+    completed_at: 0,
+    paused_at: 0,
+    cancelled_at: 0,
+    current_user: { handle: '', id: '' },
+    run_stamp: buildBackupRunStamp(createdAt),
+    page_tab_id: Number(pageTabId) || 0,
+    active_download_id: 0,
+    active_item_key: '',
+    last_error: '',
+    summary_text: 'Starting discovery…',
+  };
+}
+
+async function resolveCurrentBackupUser(run, cachedOwnPostsPage = null) {
+  try {
+    const json = await backupFetchJson(run, '/backend/project_y/v2/me');
+    const user = normalizeCurrentUser(json);
+    if (user.handle || user.id) return user;
+  } catch {}
+  const items = extractItemsFromPayload(cachedOwnPostsPage);
+  if (items.length) {
+    const owner = extractOwnerIdentity(items[0]);
+    if (owner.handle || owner.id) return owner;
+  }
+  return { handle: '', id: '' };
+}
+
+async function fetchBackupDetail(run, kind, id) {
+  const pathname = buildBackupDetailPath(kind, id);
+  return backupFetchJson(run, pathname);
+}
+
+async function updateBackupRunStatus(runId, updater, eventType = 'status') {
+  const run = await backupDbGet(BACKUP_RUNS_STORE, runId);
+  if (!run) return null;
+  const next = typeof updater === 'function' ? updater({ ...run }) : { ...run, ...(updater || {}) };
+  return saveBackupRun(next, eventType);
+}
+
+async function transitionBackupItem(run, item, nextStatus, overrides = {}, eventType = 'status') {
+  const prevStatus = normalizeItemStatus(item.status);
+  const targetStatus = normalizeItemStatus(nextStatus);
+  const nextItem = {
+    ...item,
+    ...overrides,
+    status: targetStatus,
+  };
+  await backupDbPut(BACKUP_ITEMS_STORE, nextItem);
+  const nextRun = await updateBackupRunStatus(run.id, (draft) => {
+    draft.counts = applyBackupStatusTransition(draft.counts, prevStatus, targetStatus);
+    if (targetStatus === 'downloading') draft.active_item_key = nextItem.item_key;
+    if (targetStatus === 'done' || targetStatus === 'failed' || targetStatus === 'skipped') {
+      draft.active_item_key = draft.active_item_key === nextItem.item_key ? '' : draft.active_item_key;
+    }
+    if (targetStatus === 'failed' && nextItem.last_error) draft.last_error = nextItem.last_error;
+    return draft;
+  }, eventType);
+  return { run: nextRun, item: nextItem };
+}
+
+function shouldInterruptBackupDiscovery(run) {
+  const status = normalizeRunStatus(run?.status);
+  return status === 'paused' || status === 'cancelled' || isTerminalRunStatus(status);
+}
+
+function getBackupRunInterruptStatus(runId) {
+  return normalizeRunStatus(backupRunInterrupts.get(String(runId || '')) || '');
+}
+
+function markBackupRunInterrupted(runId, status) {
+  const normalized = normalizeRunStatus(status);
+  if (normalized === 'paused' || normalized === 'cancelled') {
+    backupRunInterrupts.set(String(runId || ''), normalized);
+  } else {
+    backupRunInterrupts.delete(String(runId || ''));
+  }
+}
+
+function isBackupRunInterrupted(runId) {
+  const status = getBackupRunInterruptStatus(runId);
+  return status === 'paused' || status === 'cancelled';
+}
+
+async function saveBackupDiscoveryProgress(run, eventType = 'status') {
+  if (isBackupRunInterrupted(run.id)) {
+    return (await backupDbGet(BACKUP_RUNS_STORE, run.id)) || run;
+  }
+  const next = await updateBackupRunStatus(run.id, (draft) => {
+    if (isBackupRunInterrupted(run.id)) return draft;
+    if (shouldInterruptBackupDiscovery(draft)) return draft;
+    return {
+      ...draft,
+      status: normalizeRunStatus(run.status),
+      counts: cloneBackupCounts(run.counts),
+      bucket_counts: cloneBackupBucketCounts(run.bucket_counts),
+      current_user: normalizeCurrentUser(run.current_user),
+      completed_at: Number(run.completed_at) || 0,
+      last_error: sanitizeString(run.last_error, 1024) || '',
+      summary_text: sanitizeString(run.summary_text, 1024) || '',
+    };
+  }, eventType);
+  return next || run;
+}
+
+function getSelectedBackupBuckets(scopes) {
+  const normalized = normalizeBackupScopes(scopes);
+  const buckets = [];
+  if (normalized.ownDrafts) buckets.push({ key: 'ownDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: BACKUP_DEFAULT_DRAFT_LIMIT });
+  if (normalized.ownPosts) buckets.push({ key: 'ownPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: BACKUP_DEFAULT_FEED_LIMIT, extraParams: { cut: 'nf2' } });
+  if (normalized.castInPosts) buckets.push({ key: 'castInPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: BACKUP_DEFAULT_FEED_LIMIT, extraParams: { cut: 'appearances' } });
+  if (normalized.castInDrafts) buckets.push({ key: 'castInDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/cameos', limit: BACKUP_DEFAULT_DRAFT_LIMIT });
+  return buckets;
+}
+
+async function discoverBackupRun(run) {
+  const buckets = getSelectedBackupBuckets(run.scopes);
+  const seenKeys = new Set();
+  let order = 0;
+  let ownPostsFirstPage = null;
+
+  for (const bucket of buckets) {
+    if (isBackupRunInterrupted(run.id)) return (await backupDbGet(BACKUP_RUNS_STORE, run.id)) || run;
+    run.summary_text = `Discovering ${bucket.key}…`;
+    run = await saveBackupDiscoveryProgress(run, 'status');
+    if (shouldInterruptBackupDiscovery(run)) return run;
+    let cursor = null;
+    let page = 0;
+    do {
+      if (isBackupRunInterrupted(run.id)) return (await backupDbGet(BACKUP_RUNS_STORE, run.id)) || run;
+      const latest = await backupDbGet(BACKUP_RUNS_STORE, run.id);
+      if (shouldInterruptBackupDiscovery(latest)) return latest;
+      const params = { limit: bucket.limit, cursor, ...(bucket.extraParams || {}) };
+      const json = await backupFetchJson(run, bucket.pathname, params);
+      if (!ownPostsFirstPage && bucket.key === 'ownPosts') ownPostsFirstPage = json;
+      if (!(run.current_user?.handle || run.current_user?.id)) {
+        run.current_user = await resolveCurrentBackupUser(run, ownPostsFirstPage);
+        run = await saveBackupDiscoveryProgress(run, 'status');
+        if (shouldInterruptBackupDiscovery(run)) return run;
+      }
+      const items = extractItemsFromPayload(json);
+      for (const item of items) {
+        if (isBackupRunInterrupted(run.id)) return (await backupDbGet(BACKUP_RUNS_STORE, run.id)) || run;
+        const latestRun = await backupDbGet(BACKUP_RUNS_STORE, run.id);
+        if (shouldInterruptBackupDiscovery(latestRun)) return latestRun;
+        const id = getBackupItemId(bucket.kind, item);
+        if (!id) continue;
+        const dedupeKey = `${bucket.kind}:${id}`;
+        if (seenKeys.has(dedupeKey)) continue;
+        seenKeys.add(dedupeKey);
+        let detail = null;
+        let owner = extractOwnerIdentity(item);
+        if (shouldFetchDiscoveryDetail(bucket, owner)) {
+          detail = await fetchBackupDetail(run, bucket.kind, id);
+          owner = extractOwnerIdentity(detail || item);
+        }
+        if ((bucket.key === 'castInPosts' || bucket.key === 'castInDrafts') && shouldExcludeAppearanceOwner(owner, run.current_user)) {
+          continue;
+        }
+        const backupItem = buildBackupManifestItem(run, bucket.key, bucket.kind, item, detail, order);
+        if (!backupItem) continue;
+        await backupDbPut(BACKUP_ITEMS_STORE, backupItem);
+        run.counts.discovered += 1;
+        run.bucket_counts[bucket.key] = (Number(run.bucket_counts[bucket.key]) || 0) + 1;
+        run.counts = applyBackupStatusTransition(run.counts, null, backupItem.status);
+        order += 1;
+        if (backupItem.status === 'skipped' && backupItem.last_error) run.last_error = backupItem.last_error;
+      }
+      page += 1;
+      run.summary_text = `Discovering ${bucket.key}: page ${page}, accepted ${run.counts.discovered}`;
+      run = await saveBackupDiscoveryProgress(run, 'status');
+      if (shouldInterruptBackupDiscovery(run)) return run;
+      const nextCursor = extractCursorFromPayload(json);
+      cursor = nextCursor && items.length ? nextCursor : null;
+    } while (cursor);
+  }
+
+  run.status = run.counts.queued > 0 ? 'running' : 'completed';
+  run.summary_text = run.counts.queued > 0
+    ? `Discovery complete. ${run.counts.queued} files queued.`
+    : 'Discovery complete. No downloadable media found.';
+  if (run.status === 'completed') run.completed_at = Date.now();
+  return saveBackupDiscoveryProgress(run, 'status');
+}
+
+async function refreshBackupItemMedia(run, item) {
+  if (!item?.detail_url) return item;
+  const freshEnough = item.media_url &&
+    isSignedUrlFresh(item.media_url, item.url_refreshed_at || 0, Date.now()) &&
+    ((Date.now() - Number(item.url_refreshed_at || 0)) < BACKUP_URL_REFRESH_MAX_AGE_MS);
+  if (freshEnough) return item;
+
+  const detailPath = item.detail_url.startsWith(BACKUP_ORIGIN)
+    ? item.detail_url.slice(BACKUP_ORIGIN.length)
+    : item.detail_url;
+  const detail = await backupFetchJson(run, detailPath);
+  const media = pickBackupMediaSource(item.kind, detail);
+  if (!media?.url) {
+    const failed = {
+      ...item,
+      media_url: '',
+      media_variant: '',
+      media_ext: 'mp4',
+      url_refreshed_at: 0,
+      last_error: 'refresh_missing_media_url',
+    };
+    await backupDbPut(BACKUP_ITEMS_STORE, failed);
+    return failed;
+  }
+  const next = {
+    ...item,
+    owner_handle: item.owner_handle || extractOwnerIdentity(detail).handle || '',
+    owner_id: item.owner_id || extractOwnerIdentity(detail).id || '',
+    prompt: item.prompt || pickPrompt(detail, null),
+    prompt_source: item.prompt_source || pickPromptSource(detail, null),
+    title: item.title || pickTitle(detail, null),
+    media_url: media.url,
+    media_variant: media.variant,
+    media_ext: media.ext || inferFileExtension(media.url, media.mimeType),
+    media_key_path: media.keyPath || '',
+    filename: buildBackupFilename(run, item.bucket, item.id, media.ext || 'mp4'),
+    url_refreshed_at: Date.now(),
+    last_error: '',
+  };
+  await backupDbPut(BACKUP_ITEMS_STORE, next);
+  return next;
+}
+
+async function finalizeBackupRunIfIdle(runId) {
+  const run = await backupDbGet(BACKUP_RUNS_STORE, runId);
+  if (!run) return null;
+  if (normalizeRunStatus(run.status) === 'paused' || normalizeRunStatus(run.status) === 'cancelled') return run;
+  const items = await backupDbGetRunItems(runId);
+  const hasQueued = items.some((item) => normalizeItemStatus(item.status) === 'queued');
+  const hasDownloading = items.some((item) => normalizeItemStatus(item.status) === 'downloading');
+  if (hasQueued || hasDownloading) return run;
+  run.status = 'completed';
+  run.completed_at = Date.now();
+  run.active_download_id = 0;
+  run.active_item_key = '';
+  run.summary_text = `Backup complete. ${run.counts.done} downloaded, ${run.counts.failed} failed, ${run.counts.skipped} skipped.`;
+  return saveBackupRun(run, 'status');
+}
+
+async function processNextBackupQueue(runId) {
+  const run = await backupDbGet(BACKUP_RUNS_STORE, runId);
+  if (!run) return null;
+  const status = normalizeRunStatus(run.status);
+  if (status === 'paused' || status === 'cancelled' || isTerminalRunStatus(status)) return run;
+  if (Number(run.active_download_id) > 0) return run;
+  const items = await backupDbGetRunItems(runId);
+  const nextItem = items
+    .filter((item) => normalizeItemStatus(item.status) === 'queued')
+    .sort((left, right) => (Number(left.order) || 0) - (Number(right.order) || 0))[0] || null;
+  if (!nextItem) return finalizeBackupRunIfIdle(runId);
+
+  let item = await refreshBackupItemMedia(run, nextItem);
+  if (!item.media_url) {
+    await transitionBackupItem(run, item, 'failed', { last_error: item.last_error || 'missing_media_url' }, 'item');
+    return processNextBackupQueue(runId);
+  }
+
+  const target = await transitionBackupItem(run, item, 'downloading', {
+    attempts: (Number(item.attempts) || 0) + 1,
+    last_error: '',
+  }, 'item');
+  item = target.item;
+  const updatedRun = target.run;
+
+  try {
+    const downloadId = await chrome.downloads.download({
+      url: item.media_url,
+      filename: item.filename,
+      saveAs: false,
+      conflictAction: 'uniquify',
+    });
+    item = {
+      ...item,
+      download_id: Number(downloadId) || 0,
+    };
+    await backupDbPut(BACKUP_ITEMS_STORE, item);
+    updatedRun.active_download_id = Number(downloadId) || 0;
+    updatedRun.active_item_key = item.item_key;
+    updatedRun.summary_text = `Downloading ${item.id}…`;
+    await saveBackupRun(updatedRun, 'status');
+    return updatedRun;
+  } catch (err) {
+    const message = sanitizeString(err?.message || String(err), 1024) || 'download_start_failed';
+    await transitionBackupItem(updatedRun, item, 'failed', { download_id: 0, last_error: message }, 'item');
+    return processNextBackupQueue(runId);
+  }
+}
+
+function queueBackupRunProcessing(runId) {
+  if (backupRunLoopPromise) return backupRunLoopPromise;
+  backupRunLoopPromise = (async () => {
+    try {
+      return await processNextBackupQueue(runId);
+    } finally {
+      backupRunLoopPromise = null;
+    }
+  })();
+  return backupRunLoopPromise;
+}
+
+async function handleBackupStart(payload, pageTabId = 0) {
+  const latest = await backupDbGetLatestRun();
+  if (latest && !isTerminalRunStatus(latest.status)) {
+    return { ok: false, error: 'backup_run_in_progress', run: summarizeBackupRunForClient(latest) };
+  }
+  const run = createBackupRunRecord(payload?.scopes || DEFAULT_BACKUP_SCOPES, payload?.headers || {}, pageTabId);
+  markBackupRunInterrupted(run.id, '');
+  await backupDbPut(BACKUP_RUNS_STORE, run);
+  await broadcastBackupRunEvent({ type: 'status', run: summarizeBackupRunForClient(run) });
+  (async () => {
+    try {
+      const discoveredRun = await discoverBackupRun(run);
+      if (normalizeRunStatus(discoveredRun?.status) === 'running') {
+        queueBackupRunProcessing(discoveredRun.id);
+      }
+    } catch (err) {
+      const failed = await updateBackupRunStatus(run.id, (draft) => ({
+        ...draft,
+        status: 'failed',
+        completed_at: Date.now(),
+        last_error: sanitizeString(err?.message || String(err), 1024) || 'backup_discovery_failed',
+        summary_text: 'Backup discovery failed.',
+        active_download_id: 0,
+        active_item_key: '',
+      }), 'status');
+      return failed;
+    }
+  })().catch(() => {});
+  return { ok: true, run: summarizeBackupRunForClient(run) };
+}
+
+async function handleBackupPause(payload) {
+  const run = payload?.runId ? await backupDbGet(BACKUP_RUNS_STORE, payload.runId) : await backupDbGetLatestRun();
+  if (!run) return { ok: false, error: 'backup_run_not_found' };
+  markBackupRunInterrupted(run.id, 'paused');
+  run.status = 'paused';
+  run.interrupt_status = 'paused';
+  run.paused_at = Date.now();
+  run.summary_text = run.active_download_id ? 'Pause requested. The current download will finish first.' : 'Paused.';
+  const next = await saveBackupRun(run, 'status');
+  return { ok: true, run: summarizeBackupRunForClient(next) };
+}
+
+async function handleBackupResume(payload) {
+  const run = payload?.runId ? await backupDbGet(BACKUP_RUNS_STORE, payload.runId) : await backupDbGetLatestRun();
+  if (!run) return { ok: false, error: 'backup_run_not_found' };
+  markBackupRunInterrupted(run.id, '');
+  run.status = 'running';
+  run.interrupt_status = '';
+  run.paused_at = 0;
+  if (payload?.headers && Object.keys(payload.headers).length) {
+    run.headers = { ...normalizeBackupHeaders(run.headers), ...normalizeBackupHeaders(payload.headers) };
+  }
+  run.summary_text = 'Resuming backup…';
+  const next = await saveBackupRun(run, 'status');
+  queueBackupRunProcessing(next.id);
+  return { ok: true, run: summarizeBackupRunForClient(next) };
+}
+
+async function handleBackupCancel(payload) {
+  const run = payload?.runId ? await backupDbGet(BACKUP_RUNS_STORE, payload.runId) : await backupDbGetLatestRun();
+  if (!run) return { ok: false, error: 'backup_run_not_found' };
+  markBackupRunInterrupted(run.id, 'cancelled');
+  run.status = 'cancelled';
+  run.interrupt_status = 'cancelled';
+  run.cancelled_at = Date.now();
+  run.summary_text = 'Backup cancelled.';
+  const downloadId = Number(run.active_download_id) || 0;
+  if (downloadId > 0) {
+    try { await chrome.downloads.cancel(downloadId); } catch {}
+  }
+  run.active_download_id = 0;
+  run.active_item_key = '';
+  const next = await saveBackupRun(run, 'status');
+  return { ok: true, run: summarizeBackupRunForClient(next) };
+}
+
+async function handleBackupStatusRequest(payload) {
+  const run = payload?.runId ? await backupDbGet(BACKUP_RUNS_STORE, payload.runId) : await backupDbGetLatestRun();
+  return { ok: true, run: summarizeBackupRunForClient(run) };
+}
+
+function buildBackupManifestLine(item) {
+  return {
+    item_key: item.item_key,
+    run_id: item.run_id,
+    bucket: item.bucket,
+    kind: item.kind,
+    id: item.id,
+    owner_handle: item.owner_handle || '',
+    owner_id: item.owner_id || '',
+    title: item.title || '',
+    prompt: item.prompt || '',
+    prompt_source: item.prompt_source || '',
+    created_at: item.created_at || '',
+    posted_at: item.posted_at || '',
+    updated_at: item.updated_at || '',
+    width: item.width ?? '',
+    height: item.height ?? '',
+    duration_s: item.duration_s ?? '',
+    post_permalink: item.post_permalink || '',
+    detail_url: item.detail_url || '',
+    cast_names: Array.isArray(item.cast_names) ? item.cast_names : [],
+    cameos: Array.isArray(item.cameos) ? item.cameos : [],
+    media_url: item.media_url || '',
+    media_variant: item.media_variant || '',
+    media_ext: item.media_ext || '',
+    filename: item.filename || '',
+    status: item.status || '',
+    attempts: Number(item.attempts) || 0,
+    url_refreshed_at: Number(item.url_refreshed_at) || 0,
+    last_error: item.last_error || '',
+  };
+}
+
+async function handleBackupManifestRequest(payload) {
+  const run = payload?.runId ? await backupDbGet(BACKUP_RUNS_STORE, payload.runId) : await backupDbGetLatestRun();
+  if (!run) return { ok: false, error: 'backup_run_not_found' };
+  const items = await backupDbGetRunItems(run.id);
+  const format = sanitizeString(payload?.format, 24) || 'manifest';
+  if (format === 'summary') {
+    return {
+      ok: true,
+      filename: `sora_backup_summary_${run.run_stamp}.json`,
+      mimeType: 'application/json;charset=utf-8;',
+      text: JSON.stringify({
+        run: summarizeBackupRunForClient(run),
+        items_total: items.length,
+      }, null, 2),
+    };
+  }
+  if (format === 'failures') {
+    const failures = items.filter((item) => normalizeItemStatus(item.status) === 'failed' || normalizeItemStatus(item.status) === 'skipped');
+    return {
+      ok: true,
+      filename: `sora_backup_failures_${run.run_stamp}.jsonl`,
+      mimeType: 'application/x-ndjson;charset=utf-8;',
+      text: failures.map((item) => JSON.stringify(buildBackupManifestLine(item))).join('\n'),
+    };
+  }
+  return {
+    ok: true,
+    filename: `sora_backup_manifest_${run.run_stamp}.jsonl`,
+    mimeType: 'application/x-ndjson;charset=utf-8;',
+    text: items.map((item) => JSON.stringify(buildBackupManifestLine(item))).join('\n'),
+  };
+}
+
 /* ─── Message handlers ─── */
 
 function openOrFocusDashboard(sendResponse) {
@@ -1216,6 +2336,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!isTrustedSender(sender)) {
     if (message.action === 'metrics_request') {
       sendResponse({ metrics: { users: {} }, metricsUpdatedAt: 0 });
+    } else if (message.action.startsWith('backup_')) {
+      sendResponse({ ok: false, error: 'untrusted_sender' });
     }
     return false;
   }
@@ -1260,7 +2382,133 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
     return true; // async response
   }
+
+  if (message.action === 'backup_start') {
+    const payload = sanitizeBackupPayload(message.action, message.payload);
+    (async () => {
+      try {
+        sendResponse(await handleBackupStart(payload, sender?.tab?.id || 0));
+      } catch (err) {
+        sendResponse({ ok: false, error: sanitizeString(err?.message || String(err), 1024) || 'backup_start_failed' });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'backup_pause') {
+    const payload = sanitizeBackupPayload(message.action, message.payload);
+    (async () => {
+      try {
+        sendResponse(await handleBackupPause(payload));
+      } catch (err) {
+        sendResponse({ ok: false, error: sanitizeString(err?.message || String(err), 1024) || 'backup_pause_failed' });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'backup_resume') {
+    const payload = sanitizeBackupPayload(message.action, message.payload);
+    (async () => {
+      try {
+        sendResponse(await handleBackupResume(payload));
+      } catch (err) {
+        sendResponse({ ok: false, error: sanitizeString(err?.message || String(err), 1024) || 'backup_resume_failed' });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'backup_cancel') {
+    const payload = sanitizeBackupPayload(message.action, message.payload);
+    (async () => {
+      try {
+        sendResponse(await handleBackupCancel(payload));
+      } catch (err) {
+        sendResponse({ ok: false, error: sanitizeString(err?.message || String(err), 1024) || 'backup_cancel_failed' });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'backup_status_request') {
+    const payload = sanitizeBackupPayload(message.action, message.payload);
+    (async () => {
+      try {
+        sendResponse(await handleBackupStatusRequest(payload));
+      } catch (err) {
+        sendResponse({ ok: false, error: sanitizeString(err?.message || String(err), 1024) || 'backup_status_failed' });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'backup_manifest_request') {
+    const payload = sanitizeBackupPayload(message.action, message.payload);
+    (async () => {
+      try {
+        sendResponse(await handleBackupManifestRequest(payload));
+      } catch (err) {
+        sendResponse({ ok: false, error: sanitizeString(err?.message || String(err), 1024) || 'backup_manifest_failed' });
+      }
+    })();
+    return true;
+  }
   return false;
+});
+
+chrome.downloads.onChanged.addListener((delta) => {
+  const downloadId = Number(delta?.id) || 0;
+  if (!downloadId) return;
+  (async () => {
+    const item = await backupDbGetItemByDownloadId(downloadId);
+    if (!item) return;
+    const run = await backupDbGet(BACKUP_RUNS_STORE, item.run_id);
+    if (!run) return;
+
+    if (delta.state?.current === 'complete') {
+      let finalFilename = item.filename || '';
+      try {
+        const matches = await chrome.downloads.search({ id: downloadId });
+        if (Array.isArray(matches) && matches[0]?.filename) finalFilename = matches[0].filename;
+      } catch {}
+      const result = await transitionBackupItem(run, item, 'done', {
+        download_id: downloadId,
+        filename: finalFilename,
+        last_error: '',
+      }, 'item');
+      const nextRun = {
+        ...result.run,
+        active_download_id: result.run.active_download_id === downloadId ? 0 : result.run.active_download_id,
+        active_item_key: result.run.active_item_key === item.item_key ? '' : result.run.active_item_key,
+        summary_text: `Downloaded ${result.item.id}.`,
+      };
+      await saveBackupRun(nextRun, 'status');
+      if (normalizeRunStatus(nextRun.status) !== 'paused' && normalizeRunStatus(nextRun.status) !== 'cancelled') {
+        queueBackupRunProcessing(nextRun.id);
+      }
+      return;
+    }
+
+    if (delta.state?.current === 'interrupted') {
+      const errorText = sanitizeString(delta.error?.current || 'download_interrupted', 1024) || 'download_interrupted';
+      const result = await transitionBackupItem(run, item, 'failed', {
+        download_id: downloadId,
+        last_error: errorText,
+      }, 'item');
+      const nextRun = {
+        ...result.run,
+        active_download_id: result.run.active_download_id === downloadId ? 0 : result.run.active_download_id,
+        active_item_key: result.run.active_item_key === item.item_key ? '' : result.run.active_item_key,
+        last_error: errorText,
+        summary_text: `Download failed for ${result.item.id}.`,
+      };
+      await saveBackupRun(nextRun, 'status');
+      if (normalizeRunStatus(nextRun.status) !== 'paused' && normalizeRunStatus(nextRun.status) !== 'cancelled') {
+        queueBackupRunProcessing(nextRun.id);
+      }
+    }
+  })().catch(() => {});
 });
 
 /* ─── Storage change listener (catches external writes like dashboard purge) ─── */

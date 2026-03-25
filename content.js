@@ -17,6 +17,16 @@
   const MAX_CAMEO_USERNAMES = 32;
   const MAX_HARVEST_BATCH_ITEMS = 250;
   const MAX_HARVEST_CAST_NAMES = 32;
+  const MAX_BACKUP_FETCH_PARAMS = 20;
+  const BACKUP_PAGE_FETCH_TIMEOUT_MS = 30000;
+  const BACKUP_ACTIONS = new Set([
+    'backup_start',
+    'backup_pause',
+    'backup_resume',
+    'backup_cancel',
+    'backup_status_request',
+    'backup_manifest_request',
+  ]);
 
   function sanitizeString(value, maxLen = MAX_STR_LEN) {
     if (typeof value !== 'string') return null;
@@ -286,6 +296,85 @@
     return out;
   }
 
+  function sanitizeBackupHeaders(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const headers = {};
+    const auth = sanitizeString(raw.Authorization || raw.authorization, MAX_STR_LEN);
+    const deviceId = sanitizeString(raw['OAI-Device-Id'] || raw['oai-device-id'], 256);
+    const language = sanitizeString(raw['OAI-Language'] || raw['oai-language'], 64);
+    if (auth) headers.Authorization = auth;
+    if (deviceId) headers['OAI-Device-Id'] = deviceId;
+    if (language) headers['OAI-Language'] = language;
+    return Object.keys(headers).length ? headers : null;
+  }
+
+  function sanitizeBackupScopes(raw) {
+    const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    return {
+      ownDrafts: source.ownDrafts !== false,
+      ownPosts: source.ownPosts !== false,
+      castInPosts: source.castInPosts !== false,
+      castInDrafts: source.castInDrafts !== false,
+    };
+  }
+
+  function sanitizeBackupPayload(action, raw) {
+    const payload = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const runId = sanitizeIdToken(payload.runId, MAX_ID_LEN);
+    if (action === 'backup_start') {
+      return {
+        scopes: sanitizeBackupScopes(payload.scopes),
+        headers: sanitizeBackupHeaders(payload.headers) || {},
+      };
+    }
+    if (action === 'backup_manifest_request') {
+      const format = sanitizeString(payload.format, 24);
+      return {
+        runId: runId || null,
+        format: format || 'manifest',
+      };
+    }
+    return {
+      runId: runId || null,
+      headers: sanitizeBackupHeaders(payload.headers) || {},
+    };
+  }
+
+  function sanitizeBackupPathname(value) {
+    const pathname = sanitizeString(value, MAX_URL_LEN);
+    if (!pathname || !pathname.startsWith('/backend/')) return null;
+    if (/[\s\\]/.test(pathname)) return null;
+    return pathname;
+  }
+
+  function sanitizeBackupQueryParams(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const out = {};
+    let count = 0;
+    for (const [key, value] of Object.entries(raw)) {
+      if (count >= MAX_BACKUP_FETCH_PARAMS) break;
+      if (value == null || value === '') continue;
+      const paramKey = sanitizeString(key, 64);
+      if (!paramKey) continue;
+      const paramValue = sanitizeString(String(value), MAX_URL_LEN);
+      if (paramValue == null) continue;
+      out[paramKey] = paramValue;
+      count += 1;
+    }
+    return out;
+  }
+
+  function sanitizeBackupPageFetchPayload(raw) {
+    const payload = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const pathname = sanitizeBackupPathname(payload.pathname);
+    if (!pathname) return null;
+    return {
+      pathname,
+      params: sanitizeBackupQueryParams(payload.params),
+      headers: sanitizeBackupHeaders(payload.headers) || {},
+    };
+  }
+
   function sanitizeRequestId(value) {
     const s = sanitizeString(value, MAX_REQUEST_ID_LEN);
     if (!s) return null;
@@ -314,6 +403,35 @@
       );
     } catch {}
   }
+
+  const pendingBackupPageFetches = new Map();
+  let backupPageFetchSeq = 0;
+
+  function nextBackupPageFetchId() {
+    backupPageFetchSeq += 1;
+    return `backup_page_fetch_${Date.now()}_${backupPageFetchSeq}`;
+  }
+
+  function requestPageBackupFetch(payload) {
+    return new Promise((resolve, reject) => {
+      const req = nextBackupPageFetchId();
+      const timerId = setTimeout(() => {
+        pendingBackupPageFetches.delete(req);
+        reject(new Error('backup_page_fetch_timeout'));
+      }, BACKUP_PAGE_FETCH_TIMEOUT_MS);
+      pendingBackupPageFetches.set(req, { resolve, reject, timerId });
+      try {
+        window.postMessage(
+          { __sora_uv__: true, type: 'backup_page_fetch_request', req, payload },
+          PAGE_ORIGIN
+        );
+      } catch (err) {
+        clearTimeout(timerId);
+        pendingBackupPageFetches.delete(req);
+        reject(err);
+      }
+    });
+  }
   function writeUltraModeToLocalStorage(enabled) {
     try {
       localStorage.setItem(ULTRA_MODE_KEY, JSON.stringify({ enabled: !!enabled, setAt: Date.now() }));
@@ -332,13 +450,6 @@
   }
 
   syncUltraModePreference();
-  // Listen for ultra mode changes broadcast from background (avoids chrome.storage.onChanged
-  // which would serialize the full metrics blob to every content script on every flush).
-  try {
-    chrome.runtime.onMessage.addListener((message) => {
-      if (message?.action === 'ultra_mode_changed') syncUltraModePreference();
-    });
-  } catch {}
 
   function injectPageScript(filename, next) {
     try {
@@ -398,11 +509,13 @@
     if (uvDraftsScriptsInjecting) return;
     uvDraftsScriptsInjecting = true;
     injectPageScript('uv-drafts-logic.js', () => {
-      injectPageScript('uv-drafts-page.js', () => {
-        uvDraftsScriptsInjected = true;
-        uvDraftsScriptsInjecting = false;
-        announceUVDraftsScriptsReady();
-        flushUVDraftsReadyCallbacks();
+      injectPageScript('uv-backup-logic.js', () => {
+        injectPageScript('uv-drafts-page.js', () => {
+          uvDraftsScriptsInjected = true;
+          uvDraftsScriptsInjecting = false;
+          announceUVDraftsScriptsReady();
+          flushUVDraftsReadyCallbacks();
+        });
       });
     });
   }
@@ -530,5 +643,99 @@
     try {
       chrome.runtime.sendMessage({ action: 'harvest_batch', items });
     } catch {}
+  });
+
+  // Relay Creator Tools backup requests to the background service worker.
+  window.addEventListener('message', function(ev) {
+    if (ev?.source !== window) return;
+    const d = ev?.data;
+    if (!d || d.__sora_uv__ !== true || d.type !== 'backup_request') return;
+    const req = sanitizeRequestId(d.req);
+    const action = sanitizeString(d.action, 64);
+    if (!req || !action || !BACKUP_ACTIONS.has(action)) return;
+    const payload = sanitizeBackupPayload(action, d.payload);
+    try {
+      chrome.runtime.sendMessage({ action, payload }, (response) => {
+        try {
+          window.postMessage(
+            {
+              __sora_uv__: true,
+              type: 'backup_response',
+              req,
+              action,
+              response: response || null,
+              hadRuntimeError: !!chrome.runtime.lastError,
+            },
+            PAGE_ORIGIN
+          );
+        } catch {}
+      });
+    } catch {
+      try {
+        window.postMessage(
+          {
+            __sora_uv__: true,
+            type: 'backup_response',
+            req,
+            action,
+            response: null,
+            hadRuntimeError: true,
+          },
+          PAGE_ORIGIN
+        );
+      } catch {}
+    }
+  });
+
+  // Relay background backup status pushes back into the page context.
+  try {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message?.action === 'ultra_mode_changed') {
+        syncUltraModePreference();
+        return false;
+      }
+      if (message?.action === 'backup_page_fetch') {
+        const payload = sanitizeBackupPageFetchPayload(message.payload);
+        if (!payload) {
+          try {
+            sendResponse({ ok: false, error: 'invalid_backup_page_fetch' });
+          } catch {}
+          return false;
+        }
+        requestPageBackupFetch(payload)
+          .then((response) => {
+            try {
+              sendResponse(response || { ok: false, error: 'backup_page_fetch_empty' });
+            } catch {}
+          })
+          .catch((err) => {
+            try {
+              sendResponse({ ok: false, error: sanitizeString(err?.message || String(err), MAX_STR_LEN) || 'backup_page_fetch_failed' });
+            } catch {}
+          });
+        return true;
+      }
+      if (message?.action !== 'backup_run_event') return false;
+      try {
+        window.postMessage(
+          { __sora_uv__: true, type: 'backup_run_event', event: message.event || null },
+          PAGE_ORIGIN
+        );
+      } catch {}
+      return false;
+    });
+  } catch {}
+
+  window.addEventListener('message', function(ev) {
+    if (ev?.source !== window) return;
+    const d = ev?.data;
+    if (!d || d.__sora_uv__ !== true || d.type !== 'backup_page_fetch_response') return;
+    const req = sanitizeRequestId(d.req);
+    if (!req) return;
+    const pending = pendingBackupPageFetches.get(req);
+    if (!pending) return;
+    pendingBackupPageFetches.delete(req);
+    clearTimeout(pending.timerId);
+    pending.resolve(d.response || { ok: false, error: 'backup_page_fetch_empty' });
   });
 })();

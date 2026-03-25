@@ -14,7 +14,7 @@ Chrome extension for `https://sora.chatgpt.com/*` that adds four major product s
 
 - Feed and post overlays for views, interaction ratios, remix signals, heat, duration, and creator metadata
 - Runtime controls for filtering, Gather, Analyze, Harvest, and native Drafts queue bridging
-- **Creator Tools**, an extension-owned advanced drafts workflow at `/creatortools`
+- **Creator Tools**, an extension-owned advanced drafts and backup workflow at `/creatortools`
 - A local analytics dashboard at `dashboard.html` with metrics, compare mode, and a Harvest record browser
 
 Creator Tools is the canonical name for the advanced drafts surface, mounted at `/creatortools`.
@@ -43,7 +43,7 @@ Unofficial community extension. Not affiliated with, endorsed by, or sponsored b
 
 - **Feed + post overlays**: adds inline metrics and metadata on Explore, Profile, Post, and Draft detail surfaces so you can see what is performing without opening the dashboard.
 - **Runtime controls**: adds filter, Gather, Analyze, and Harvest controls directly on Sora pages, plus a queue bridge on native `/drafts`.
-- **Creator Tools (`/creatortools`)**: adds a dedicated extension-owned drafting workspace with local caching, workspaces, batch prompt queues, scheduling, and fast draft actions.
+- **Creator Tools (`/creatortools`)**: adds a dedicated extension-owned drafting workspace with local caching, workspaces, batch prompt queues, scheduling, bulk backup/export, and fast draft actions.
 - **Dashboard (`dashboard.html`)**: provides on-device analytics, compare mode, multiple chart families, Harvest browsing, import/export utilities, and purge tooling.
 
 ## Detailed Features
@@ -234,6 +234,27 @@ Creator Tools is the extension-owned advanced drafts workflow. It is loaded lazi
 - Hide / unhide
 - Open remix source when available
 
+#### Bulk backup and manifest export
+
+- Creator Tools includes a **Backup** panel for long-running local exports of your Sora media.
+- Supported backup scopes:
+  - own drafts
+  - own posts
+  - cast-in posts not owned by the current user
+  - drafts featuring the current user but owned by someone else
+- Discovery is API-first and resumable:
+  - Creator Tools captures the authenticated Sora request headers already present in the page session
+  - the background service worker paginates the Sora endpoints and persists run/item state in IndexedDB
+  - downloads are handed off to Chrome Downloads so large backups can continue without keeping the page in the foreground
+- Export behavior:
+  - prefers explicit source / no-watermark media when Sora exposes it
+  - falls back to the best available downloadable media and records which media variant was used
+  - saves files into `Sora Backup/<run-stamp>/<bucket>/<id>.<ext>`
+- Run control and exports:
+  - start, pause, resume, cancel, and refresh run status from Creator Tools
+  - export `manifest.jsonl`, `summary.json`, and `failures.jsonl` for any run
+  - reconnect to the latest run after a page refresh using the background-owned backup database
+
 #### Scheduling
 
 - Scheduled posts are persisted in IndexedDB.
@@ -337,6 +358,7 @@ The dashboard is an extension page, not a Sora route. It is opened from the exte
 - **Content bridge**: [content.js](./content.js)
 - **Injected page scripts**: [api.js](./api.js) and [inject.js](./inject.js)
 - **Creator Tools modules**: [uv-drafts-logic.js](./uv-drafts-logic.js) and [uv-drafts-page.js](./uv-drafts-page.js)
+- **Creator Tools backup logic**: [uv-backup-logic.js](./uv-backup-logic.js)
 - **Background service worker**: [background.js](./background.js)
 - **Dashboard UI**: [dashboard.html](./dashboard.html), [dashboard.js](./dashboard.js), [dashboard.css](./dashboard.css), [theme.js](./theme.js)
 
@@ -355,9 +377,9 @@ The dashboard is an extension page, not a Sora route. It is opened from the exte
 
 ### Manifest + Runtime Responsibilities
 
-- `content.js` injects page scripts on Sora pages and lazy-loads the Creator Tools modules only when the route matches the Creator Tools surface.
+- `content.js` injects page scripts on Sora pages, relays Creator Tools backup requests, and lazy-loads the Creator Tools modules only when the route matches the Creator Tools surface.
 - `inject.js` handles page-context interception, overlay rendering, runtime controls, Harvest capture, dashboard button injection, and Creator Tools navigation helpers.
-- `background.js` is the single writer for metrics state and Harvest state. Page scripts and content scripts send sanitized batches to it; the service worker owns persistence and merge behavior.
+- `background.js` is the single writer for metrics state, Harvest state, and backup run state. Page scripts and content scripts send sanitized batches to it; the service worker owns persistence, merge behavior, and long-running download orchestration.
 - `dashboard.js` reads the local datasets and renders the analytics UI, including metrics mode, compare mode, and Harvest mode.
 
 ### Data Flow (High Level)
@@ -368,7 +390,8 @@ The dashboard is an extension page, not a Sora route. It is opened from the exte
 4. `background.js` sanitizes and merges incoming batches, then persists them as the canonical local state.
 5. Metrics hot state stays in `chrome.storage.local`, while large historical or record-oriented datasets are split into cold storage layers.
 6. Creator Tools reads its own local IndexedDB cache, merges in live drafts/pending responses, and persists UI state in `localStorage`.
-7. `dashboard.js` hydrates metrics and Harvest data from local storage backends, then renders charts, compare views, and export utilities.
+7. Creator Tools backup runs page authenticated Sora endpoints through the content/background bridge, persist backup runs/items in IndexedDB, and stream downloads through Chrome Downloads.
+8. `dashboard.js` hydrates metrics and Harvest data from local storage backends, then renders charts, compare views, and export utilities.
 
 Cross-context notes:
 
@@ -399,6 +422,10 @@ Cross-context notes:
     - `scheduled_posts`
     - `seen_drafts`
     - `sync_state`
+  - Backup database: `SCT_BACKUP_DB_V1`
+  - Backup stores:
+    - `runs`
+    - `items`
   - Harvest database: `SCT_HARVEST_DB_V1`
 
 Metrics storage details:
@@ -480,16 +507,16 @@ rm -f release.zip && zip -r release.zip manifest.json *.js *.html *.css icons im
 
 ### Local data implications
 
-- Metrics, Harvest records, Creator Tools cache, workspaces, scheduled posts, and preferences are local to the browser profile.
+- Metrics, Harvest records, Creator Tools cache, backup runs/items, workspaces, scheduled posts, and preferences are local to the browser profile.
 - Clearing extension storage or site storage removes captured history and cached draft state.
 - Reloading the extension does not automatically clear local datasets.
 
 ## Testing Status
 
-Current repository test suite (Node built-in test runner), verified on March 7, 2026:
+Current repository test suite (Node built-in test runner), verified on March 25, 2026:
 
-- `202` tests total
-- `163` passing
+- `221` tests total
+- `182` passing
 - `39` skipped
 - `0` failing
 
@@ -498,7 +525,7 @@ Current automated coverage primarily targets:
 - dashboard regressions and storage hydration
 - Harvest sanitization and export logic
 - injected routing and content guards
-- Creator Tools shared logic, queue state, and route regressions
+- Creator Tools shared logic, queue state, route regressions, and backup flow sanitization
 
 ## Project Layout
 
@@ -508,18 +535,20 @@ Current automated coverage primarily targets:
 - [api.js](./api.js): composer/network interception helpers and request override support
 - [uv-drafts-page.js](./uv-drafts-page.js): Creator Tools page module for the `/creatortools` virtual route
 - [uv-drafts-logic.js](./uv-drafts-logic.js): shared pure logic for Creator Tools runtime behavior and tests
-- [background.js](./background.js): metrics persistence, Harvest persistence, local merge logic, and dashboard-tab coordination
+- [uv-backup-logic.js](./uv-backup-logic.js): shared pure logic for backup media selection, run normalization, and backup panel state
+- [background.js](./background.js): metrics persistence, Harvest persistence, backup persistence/download orchestration, local merge logic, and dashboard-tab coordination
 - [dashboard.html](./dashboard.html): dashboard document shell
 - [dashboard.js](./dashboard.js): metrics mode, compare mode, Harvest mode, import/export, and purge behavior
 - [dashboard.css](./dashboard.css): dashboard styling
 - [theme.js](./theme.js): dashboard theme helpers
-- `tests/*.test.js`: regression and unit/integration coverage across dashboard, routing, Harvest, and Creator Tools logic
+- `tests/*.test.js`: regression and unit/integration coverage across dashboard, routing, Harvest, Creator Tools logic, and backup flows
 
 ## Notes
 
 - Gather mode works best in a dedicated window or long-lived tab if you want uninterrupted local collection.
 - Creator Tools is an extension-owned overlay surface mounted on `/creatortools`, not a server-backed Sora page.
 - After changing any injected script, always reload the unpacked extension and refresh the target Sora tab.
+- After changing backup-related background or content logic, reload the unpacked extension before trusting any long-running backup smoke test, because existing runs and service-worker state can survive normal page refreshes.
 
 ## Contributing
 

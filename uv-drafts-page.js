@@ -1077,6 +1077,20 @@
   const UV_DRAFTS_PENDING_ENDPOINT = 'https://sora.chatgpt.com/backend/nf/pending/v2';
   const UV_DRAFTS_PENDING_POLL_MS = 5000;
   const UV_DRAFTS_PENDING_MAX_FAILURES = 8;
+  const UV_BACKUP_SCOPES_KEY = 'SORA_UV_BACKUP_SCOPES_V1';
+  const UV_BACKUP_REQUEST_TIMEOUT_MS = 30000;
+  let uvBackupPendingRequests = new Map();
+  let uvBackupRequestSeq = 0;
+  let uvBackupBridgeInstalled = false;
+  let uvDraftsBackupUi = null;
+  let capturedBackupHeaders = {};
+  let uvDraftsBackupState = {
+    scopes: null,
+    run: null,
+    busy: false,
+    exporting: false,
+    lastMessage: '',
+  };
 
   const UV_DRAFTS_COMPOSER_KEY = 'SORA_UV_DRAFTS_COMPOSER_V1';
   const UV_PENDING_COMPOSE_KEY = 'SORA_UV_PENDING_COMPOSE_V1';
@@ -1085,6 +1099,7 @@
   const UV_PENDING_CREATE_BATCH_KEY = 'SORA_UV_PENDING_CREATE_BATCH_V1';
 
   const uvDraftsLogic = window.SoraUVDraftsLogic || null;
+  const uvBackupLogic = window.SoraUVBackupLogic || null;
 
   function readJSONStorage(key) {
     try {
@@ -1105,6 +1120,243 @@
       localStorage.removeItem(key);
     } catch {}
   }
+
+  function getDefaultBackupScopes() {
+    const fallback = { ownDrafts: true, ownPosts: true, castInPosts: true, castInDrafts: true };
+    const source = uvBackupLogic?.DEFAULT_BACKUP_SCOPES;
+    if (!source || typeof source !== 'object') return { ...fallback };
+    return {
+      ownDrafts: source.ownDrafts !== false,
+      ownPosts: source.ownPosts !== false,
+      castInPosts: source.castInPosts !== false,
+      castInDrafts: source.castInDrafts !== false,
+    };
+  }
+
+  function normalizeBackupScopesState(raw) {
+    if (uvBackupLogic?.normalizeBackupScopes) return uvBackupLogic.normalizeBackupScopes(raw);
+    const base = getDefaultBackupScopes();
+    const source = raw && typeof raw === 'object' ? raw : {};
+    return {
+      ownDrafts: source.ownDrafts !== false && base.ownDrafts !== false,
+      ownPosts: source.ownPosts !== false && base.ownPosts !== false,
+      castInPosts: source.castInPosts !== false && base.castInPosts !== false,
+      castInDrafts: source.castInDrafts !== false && base.castInDrafts !== false,
+    };
+  }
+
+  function loadBackupScopes() {
+    return normalizeBackupScopesState(readJSONStorage(UV_BACKUP_SCOPES_KEY));
+  }
+
+  function persistBackupScopes() {
+    writeJSONStorage(UV_BACKUP_SCOPES_KEY, normalizeBackupScopesState(uvDraftsBackupState.scopes));
+  }
+
+  function normalizeBackupRunForUi(run) {
+    if (!run || typeof run !== 'object') return null;
+    return {
+      id: String(run.id || '').trim(),
+      status: String(run.status || '').trim().toLowerCase() || 'idle',
+      scopes: normalizeBackupScopesState(run.scopes),
+      counts: {
+        discovered: Number(run?.counts?.discovered) || 0,
+        queued: Number(run?.counts?.queued) || 0,
+        downloading: Number(run?.counts?.downloading) || 0,
+        done: Number(run?.counts?.done) || 0,
+        skipped: Number(run?.counts?.skipped) || 0,
+        failed: Number(run?.counts?.failed) || 0,
+      },
+      bucket_counts: {
+        ownDrafts: Number(run?.bucket_counts?.ownDrafts) || 0,
+        ownPosts: Number(run?.bucket_counts?.ownPosts) || 0,
+        castInPosts: Number(run?.bucket_counts?.castInPosts) || 0,
+        castInDrafts: Number(run?.bucket_counts?.castInDrafts) || 0,
+      },
+      current_user: {
+        handle: String(run?.current_user?.handle || '').trim(),
+        id: String(run?.current_user?.id || '').trim(),
+      },
+      run_stamp: String(run.run_stamp || '').trim(),
+      active_item_key: String(run.active_item_key || '').trim(),
+      created_at: Number(run.created_at) || 0,
+      updated_at: Number(run.updated_at) || 0,
+      started_at: Number(run.started_at) || 0,
+      completed_at: Number(run.completed_at) || 0,
+      paused_at: Number(run.paused_at) || 0,
+      cancelled_at: Number(run.cancelled_at) || 0,
+      last_error: String(run.last_error || '').trim(),
+      summary_text: String(run.summary_text || '').trim(),
+    };
+  }
+
+  function downloadTextFile(filename, text, mimeType) {
+    const blob = new Blob([String(text || '')], { type: mimeType || 'text/plain;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || `download-${Date.now()}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => {
+      try { URL.revokeObjectURL(url); } catch {}
+    }, 1000);
+  }
+
+  function nextBackupRequestId() {
+    uvBackupRequestSeq += 1;
+    return `uv_backup_${Date.now()}_${uvBackupRequestSeq}`;
+  }
+
+  function sanitizeRequestId(value) {
+    const next = typeof value === 'string' ? value.trim() : '';
+    if (!next || next.length > 80) return null;
+    if (!/^[A-Za-z0-9._:-]+$/.test(next)) return null;
+    return next;
+  }
+
+  function sanitizeBackupPageFetchPath(pathname) {
+    const next = typeof pathname === 'string' ? pathname.trim() : '';
+    if (!next || !next.startsWith('/backend/')) return null;
+    if (/[\s\\]/.test(next)) return null;
+    return next;
+  }
+
+  function buildBackupPageFetchUrl(pathname, params = {}) {
+    const url = new URL(pathname, location.origin);
+    if (params && typeof params === 'object' && !Array.isArray(params)) {
+      for (const [key, value] of Object.entries(params)) {
+        if (value == null || value === '') continue;
+        url.searchParams.set(String(key), String(value));
+      }
+    }
+    return url.toString();
+  }
+
+  function postBackupPageFetchResponse(req, response) {
+    try {
+      window.postMessage(
+        { __sora_uv__: true, type: 'backup_page_fetch_response', req, response: response || null },
+        location.origin
+      );
+    } catch {}
+  }
+
+  async function handleBackupPageFetchBridgeRequest(message) {
+    const req = sanitizeRequestId(message?.req);
+    const payload = message?.payload && typeof message.payload === 'object' ? message.payload : {};
+    const pathname = sanitizeBackupPageFetchPath(payload.pathname);
+    if (!req || !pathname) {
+      postBackupPageFetchResponse(req || '', { ok: false, status: 0, error: 'invalid_backup_page_fetch' });
+      return;
+    }
+    try {
+      const response = await fetch(buildBackupPageFetchUrl(pathname, payload.params), {
+        method: 'GET',
+        credentials: 'include',
+        headers: payload.headers && typeof payload.headers === 'object' ? payload.headers : {},
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {}
+      postBackupPageFetchResponse(req, {
+        ok: response.ok,
+        status: Number(response.status) || 0,
+        json,
+        error: response.ok ? '' : (typeof text === 'string' ? text.slice(0, 512) : ''),
+      });
+    } catch (err) {
+      postBackupPageFetchResponse(req, {
+        ok: false,
+        status: 0,
+        error: String(err?.message || err || 'backup_page_fetch_failed').slice(0, 512),
+      });
+    }
+  }
+
+  function applyBackupRunUpdate(run, message = '') {
+    uvDraftsBackupState.run = normalizeBackupRunForUi(run);
+    if (message) uvDraftsBackupState.lastMessage = String(message);
+    renderUVDraftsBackupPanel();
+  }
+
+  function installBackupBridge() {
+    if (uvBackupBridgeInstalled) return;
+    uvBackupBridgeInstalled = true;
+    window.addEventListener('message', (ev) => {
+      if (ev?.source !== window) return;
+      const d = ev?.data;
+      if (!d || d.__sora_uv__ !== true) return;
+      if (d.type === 'backup_page_fetch_request') {
+        handleBackupPageFetchBridgeRequest(d).catch((err) => {
+          postBackupPageFetchResponse(sanitizeRequestId(d.req) || '', {
+            ok: false,
+            status: 0,
+            error: String(err?.message || err || 'backup_page_fetch_bridge_failed').slice(0, 512),
+          });
+        });
+        return;
+      }
+      if (d.type === 'backup_response') {
+        const req = String(d.req || '').trim();
+        const pending = uvBackupPendingRequests.get(req);
+        if (!pending) return;
+        uvBackupPendingRequests.delete(req);
+        clearTimeout(pending.timerId);
+        if (d.hadRuntimeError) {
+          pending.reject(new Error('backup_runtime_error'));
+          return;
+        }
+        pending.resolve(d.response || null);
+        return;
+      }
+      if (d.type !== 'backup_run_event') return;
+      const run = normalizeBackupRunForUi(d.event?.run);
+      if (!run) return;
+      applyBackupRunUpdate(run);
+    });
+  }
+
+  function requestBackupAction(action, payload = {}) {
+    installBackupBridge();
+    return new Promise((resolve, reject) => {
+      const req = nextBackupRequestId();
+      const timerId = setTimeout(() => {
+        uvBackupPendingRequests.delete(req);
+        reject(new Error(`backup_request_timeout:${action}`));
+      }, UV_BACKUP_REQUEST_TIMEOUT_MS);
+      uvBackupPendingRequests.set(req, { resolve, reject, timerId });
+      try {
+        window.postMessage(
+          { __sora_uv__: true, type: 'backup_request', req, action, payload },
+          location.origin
+        );
+      } catch (err) {
+        clearTimeout(timerId);
+        uvBackupPendingRequests.delete(req);
+        reject(err);
+      }
+    });
+  }
+
+  async function refreshBackupStatus() {
+    try {
+      const response = await requestBackupAction('backup_status_request', {});
+      if (response?.ok && response.run) {
+        applyBackupRunUpdate(response.run);
+      } else if (response?.ok) {
+        applyBackupRunUpdate(null);
+      }
+    } catch (err) {
+      uvDraftsBackupState.lastMessage = 'Backup status unavailable right now.';
+      renderUVDraftsBackupPanel();
+    }
+  }
+
+  uvDraftsBackupState.scopes = loadBackupScopes();
 
   function loadPersistedSyncUiState() {
     const raw = readJSONStorage(UV_DRAFTS_SYNC_PROGRESS_KEY);
@@ -3035,6 +3287,277 @@
     }
   }
 
+  function isBackupRunTerminal(run) {
+    const status = String(run?.status || '').toLowerCase();
+    return status === 'completed' || status === 'cancelled' || status === 'failed';
+  }
+
+  function isBackupRunActive(run) {
+    return !!(run?.id && !isBackupRunTerminal(run));
+  }
+
+  function formatBackupScopeLabel(key) {
+    if (key === 'ownDrafts') return 'Own drafts';
+    if (key === 'ownPosts') return 'Own posts';
+    if (key === 'castInPosts') return 'Cast-in posts';
+    if (key === 'castInDrafts') return 'Drafts featuring me';
+    return key;
+  }
+
+  function formatBackupRunMeta(run) {
+    if (!run || !run.id) return 'No backup run yet.';
+    const bits = [];
+    if (run.run_stamp) bits.push(run.run_stamp.replace(/_/g, ' '));
+    if (run.current_user?.handle) bits.push(`@${run.current_user.handle}`);
+    else if (run.current_user?.id) bits.push(`user ${run.current_user.id}`);
+    return bits.length ? bits.join(' • ') : `Run ${run.id}`;
+  }
+
+  function renderUVDraftsBackupPanel() {
+    if (!uvDraftsBackupUi) return;
+    const run = uvDraftsBackupState.run;
+    const busy = uvDraftsBackupState.busy === true;
+    const exporting = uvDraftsBackupState.exporting === true;
+    const status = String(run?.status || '').toLowerCase();
+    const panelState = uvBackupLogic?.buildBackupPanelState
+      ? uvBackupLogic.buildBackupPanelState(run, { busy, exporting, hasAuth: !!capturedAuthToken })
+      : {
+        active: isBackupRunActive(run),
+        showPause: status === 'running',
+        showResume: status === 'paused',
+        showCancel: isBackupRunActive(run) || status === 'paused',
+        canStart: !isBackupRunActive(run) && !busy && !!capturedAuthToken,
+        canRefresh: !busy,
+        canExport: !!run?.id && !exporting,
+      };
+    const summary = run?.summary_text || uvDraftsBackupState.lastMessage || 'Resumable bulk export for your Sora media.';
+
+    for (const [key, input] of Object.entries(uvDraftsBackupUi.scopeInputs || {})) {
+      input.checked = uvDraftsBackupState.scopes?.[key] !== false;
+      input.disabled = panelState.active || busy;
+    }
+
+    if (uvDraftsBackupUi.metaEl) uvDraftsBackupUi.metaEl.textContent = formatBackupRunMeta(run);
+    if (uvDraftsBackupUi.summaryEl) {
+      uvDraftsBackupUi.summaryEl.textContent = summary;
+      uvDraftsBackupUi.summaryEl.dataset.tone =
+        status === 'running' || status === 'discovering'
+          ? 'syncing'
+          : (status === 'failed' ? 'error' : '');
+    }
+
+    const counts = run?.counts || { discovered: 0, queued: 0, downloading: 0, done: 0, failed: 0, skipped: 0 };
+    if (uvDraftsBackupUi.countsEl) {
+      uvDraftsBackupUi.countsEl.textContent =
+        `Accepted ${counts.discovered || 0} • Queued ${counts.queued || 0} • Downloading ${counts.downloading || 0} • Done ${counts.done || 0} • Failed ${counts.failed || 0} • Skipped ${counts.skipped || 0}`;
+    }
+
+    const bucketCounts = run?.bucket_counts || {};
+    if (uvDraftsBackupUi.bucketEl) {
+      uvDraftsBackupUi.bucketEl.textContent = [
+        `${formatBackupScopeLabel('ownDrafts')}: ${Number(bucketCounts.ownDrafts) || 0}`,
+        `${formatBackupScopeLabel('ownPosts')}: ${Number(bucketCounts.ownPosts) || 0}`,
+        `${formatBackupScopeLabel('castInPosts')}: ${Number(bucketCounts.castInPosts) || 0}`,
+        `${formatBackupScopeLabel('castInDrafts')}: ${Number(bucketCounts.castInDrafts) || 0}`,
+      ].join(' • ');
+    }
+
+    if (uvDraftsBackupUi.startBtn) uvDraftsBackupUi.startBtn.disabled = !panelState.canStart;
+    if (uvDraftsBackupUi.pauseBtn) {
+      uvDraftsBackupUi.pauseBtn.hidden = !panelState.showPause;
+      uvDraftsBackupUi.pauseBtn.disabled = busy;
+    }
+    if (uvDraftsBackupUi.resumeBtn) {
+      uvDraftsBackupUi.resumeBtn.hidden = !panelState.showResume;
+      uvDraftsBackupUi.resumeBtn.disabled = busy;
+    }
+    if (uvDraftsBackupUi.cancelBtn) {
+      uvDraftsBackupUi.cancelBtn.hidden = !panelState.showCancel;
+      uvDraftsBackupUi.cancelBtn.disabled = busy;
+    }
+    if (uvDraftsBackupUi.refreshBtn) uvDraftsBackupUi.refreshBtn.disabled = !panelState.canRefresh;
+    if (uvDraftsBackupUi.exportManifestBtn) uvDraftsBackupUi.exportManifestBtn.disabled = !panelState.canExport;
+    if (uvDraftsBackupUi.exportSummaryBtn) uvDraftsBackupUi.exportSummaryBtn.disabled = !panelState.canExport;
+    if (uvDraftsBackupUi.exportFailuresBtn) uvDraftsBackupUi.exportFailuresBtn.disabled = !panelState.canExport;
+  }
+
+  async function exportBackupArtifact(format) {
+    if (!uvDraftsBackupState.run?.id) return;
+    uvDraftsBackupState.exporting = true;
+    renderUVDraftsBackupPanel();
+    try {
+      const response = await requestBackupAction('backup_manifest_request', {
+        runId: uvDraftsBackupState.run.id,
+        format,
+      });
+      if (!response?.ok) {
+        uvDraftsBackupState.lastMessage = response?.error ? `Export failed: ${response.error}` : 'Export failed.';
+      } else {
+        downloadTextFile(response.filename, response.text || '', response.mimeType);
+        uvDraftsBackupState.lastMessage = `Exported ${format}.`;
+      }
+    } catch {
+      uvDraftsBackupState.lastMessage = 'Export failed.';
+    } finally {
+      uvDraftsBackupState.exporting = false;
+      renderUVDraftsBackupPanel();
+    }
+  }
+
+  function buildUVDraftsBackupPanel(hostEl) {
+    if (!hostEl) return;
+    hostEl.innerHTML = `
+      <div class="uvd-backup-head">
+        <h3>Backup</h3>
+        <p>Bulk backup with resumable downloads and manifest export.</p>
+      </div>
+      <div class="uvd-backup-meta" data-uvd-backup-meta="1"></div>
+      <div class="uvd-backup-scopes">
+        <label><input type="checkbox" data-uvd-backup-scope="ownDrafts" /> <span>Own drafts</span></label>
+        <label><input type="checkbox" data-uvd-backup-scope="ownPosts" /> <span>Own posts</span></label>
+        <label><input type="checkbox" data-uvd-backup-scope="castInPosts" /> <span>Cast-in posts</span></label>
+        <label><input type="checkbox" data-uvd-backup-scope="castInDrafts" /> <span>Drafts featuring me</span></label>
+      </div>
+      <div class="uvd-backup-actions">
+        <button type="button" data-uvd-backup-start="1">Start Backup</button>
+        <button type="button" data-uvd-backup-pause="1" hidden>Pause</button>
+        <button type="button" data-uvd-backup-resume="1" hidden>Resume</button>
+        <button type="button" data-uvd-backup-cancel="1" hidden>Cancel</button>
+        <button type="button" data-uvd-backup-refresh="1">Refresh</button>
+      </div>
+      <div class="uvd-backup-summary" data-uvd-backup-summary="1"></div>
+      <div class="uvd-backup-counts" data-uvd-backup-counts="1"></div>
+      <div class="uvd-backup-buckets" data-uvd-backup-buckets="1"></div>
+      <div class="uvd-backup-export">
+        <button type="button" data-uvd-backup-export="manifest">Manifest</button>
+        <button type="button" data-uvd-backup-export="summary">Summary</button>
+        <button type="button" data-uvd-backup-export="failures">Failures</button>
+      </div>
+    `;
+
+    const scopeInputs = {};
+    hostEl.querySelectorAll('[data-uvd-backup-scope]').forEach((input) => {
+      const key = String(input.getAttribute('data-uvd-backup-scope') || '');
+      scopeInputs[key] = input;
+      input.addEventListener('change', () => {
+        uvDraftsBackupState.scopes = normalizeBackupScopesState({
+          ...uvDraftsBackupState.scopes,
+          [key]: input.checked,
+        });
+        persistBackupScopes();
+        renderUVDraftsBackupPanel();
+      });
+    });
+
+    const startBtn = hostEl.querySelector('[data-uvd-backup-start="1"]');
+    const pauseBtn = hostEl.querySelector('[data-uvd-backup-pause="1"]');
+    const resumeBtn = hostEl.querySelector('[data-uvd-backup-resume="1"]');
+    const cancelBtn = hostEl.querySelector('[data-uvd-backup-cancel="1"]');
+    const refreshBtn = hostEl.querySelector('[data-uvd-backup-refresh="1"]');
+    const exportManifestBtn = hostEl.querySelector('[data-uvd-backup-export="manifest"]');
+    const exportSummaryBtn = hostEl.querySelector('[data-uvd-backup-export="summary"]');
+    const exportFailuresBtn = hostEl.querySelector('[data-uvd-backup-export="failures"]');
+
+    startBtn?.addEventListener('click', async () => {
+      if (!capturedAuthToken) {
+        uvDraftsBackupState.lastMessage = 'A fresh Sora auth token is required before backup can start.';
+        renderUVDraftsBackupPanel();
+        return;
+      }
+      uvDraftsBackupState.busy = true;
+      uvDraftsBackupState.lastMessage = '';
+      renderUVDraftsBackupPanel();
+      try {
+        const response = await requestBackupAction('backup_start', {
+          scopes: uvDraftsBackupState.scopes,
+          headers: { ...(capturedBackupHeaders || {}), Authorization: capturedAuthToken },
+        });
+        if (!response?.ok) uvDraftsBackupState.lastMessage = response?.error ? `Start failed: ${response.error}` : 'Backup start failed.';
+        else if (response.run) applyBackupRunUpdate(response.run, 'Backup started.');
+      } catch {
+        uvDraftsBackupState.lastMessage = 'Backup start failed.';
+      } finally {
+        uvDraftsBackupState.busy = false;
+        renderUVDraftsBackupPanel();
+      }
+    });
+
+    pauseBtn?.addEventListener('click', async () => {
+      if (!uvDraftsBackupState.run?.id) return;
+      uvDraftsBackupState.busy = true;
+      renderUVDraftsBackupPanel();
+      try {
+        const response = await requestBackupAction('backup_pause', { runId: uvDraftsBackupState.run.id });
+        if (response?.ok && response.run) applyBackupRunUpdate(response.run, 'Backup paused.');
+      } catch {
+        uvDraftsBackupState.lastMessage = 'Pause failed.';
+      } finally {
+        uvDraftsBackupState.busy = false;
+        renderUVDraftsBackupPanel();
+      }
+    });
+
+    resumeBtn?.addEventListener('click', async () => {
+      if (!uvDraftsBackupState.run?.id) return;
+      uvDraftsBackupState.busy = true;
+      renderUVDraftsBackupPanel();
+      try {
+        const response = await requestBackupAction('backup_resume', {
+          runId: uvDraftsBackupState.run.id,
+          headers: { ...(capturedBackupHeaders || {}), Authorization: capturedAuthToken || '' },
+        });
+        if (response?.ok && response.run) applyBackupRunUpdate(response.run, 'Backup resumed.');
+      } catch {
+        uvDraftsBackupState.lastMessage = 'Resume failed.';
+      } finally {
+        uvDraftsBackupState.busy = false;
+        renderUVDraftsBackupPanel();
+      }
+    });
+
+    cancelBtn?.addEventListener('click', async () => {
+      if (!uvDraftsBackupState.run?.id) return;
+      uvDraftsBackupState.busy = true;
+      renderUVDraftsBackupPanel();
+      try {
+        const response = await requestBackupAction('backup_cancel', { runId: uvDraftsBackupState.run.id });
+        if (response?.ok && response.run) applyBackupRunUpdate(response.run, 'Backup cancelled.');
+      } catch {
+        uvDraftsBackupState.lastMessage = 'Cancel failed.';
+      } finally {
+        uvDraftsBackupState.busy = false;
+        renderUVDraftsBackupPanel();
+      }
+    });
+
+    refreshBtn?.addEventListener('click', () => {
+      refreshBackupStatus().catch(() => {});
+    });
+    exportManifestBtn?.addEventListener('click', () => exportBackupArtifact('manifest'));
+    exportSummaryBtn?.addEventListener('click', () => exportBackupArtifact('summary'));
+    exportFailuresBtn?.addEventListener('click', () => exportBackupArtifact('failures'));
+
+    uvDraftsBackupUi = {
+      hostEl,
+      scopeInputs,
+      startBtn,
+      pauseBtn,
+      resumeBtn,
+      cancelBtn,
+      refreshBtn,
+      exportManifestBtn,
+      exportSummaryBtn,
+      exportFailuresBtn,
+      metaEl: hostEl.querySelector('[data-uvd-backup-meta="1"]'),
+      summaryEl: hostEl.querySelector('[data-uvd-backup-summary="1"]'),
+      countsEl: hostEl.querySelector('[data-uvd-backup-counts="1"]'),
+      bucketEl: hostEl.querySelector('[data-uvd-backup-buckets="1"]'),
+    };
+
+    renderUVDraftsBackupPanel();
+    refreshBackupStatus().catch(() => {});
+  }
+
   function buildUVDraftsComposer() {
     if (uvDraftsComposerFirstFrame?.object_url) {
       try { URL.revokeObjectURL(uvDraftsComposerFirstFrame.object_url); } catch {}
@@ -3079,6 +3602,7 @@
           </div>
         </div>
       </div>
+      <div class="uvd-backup-card" data-uvd-backup-panel="1"></div>
       <div class="uvd-dropzone" data-uvd-dropzone="1">
         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:.45"><rect x="2" y="2" width="20" height="20" rx="2"/><polygon points="10,8 16,12 10,16"/></svg>
         <strong>Drop Source Video</strong>
@@ -3192,6 +3716,7 @@
     const jsonlRemoveBtn = composer.querySelector('[data-uvd-jsonl-remove="1"]');
     const jsonlReviewBtn = composer.querySelector('[data-uvd-jsonl-review="1"]');
     const jsonlResumeBtn = composer.querySelector('[data-uvd-jsonl-resume="1"]');
+    const backupPanelHostEl = composer.querySelector('[data-uvd-backup-panel="1"]');
 
     const syncGensFieldLimits = () => {
       if (!gensEl) return;
@@ -3447,6 +3972,7 @@
     syncGensFieldLimits();
     persistUVDraftsComposerState();
     persistComposerGensCount(uvDraftsComposerState.gensCount);
+    buildUVDraftsBackupPanel(backupPanelHostEl);
 
     [promptEl, modelEl, durationEl, gensEl, orientationEl, resolutionEl, styleEl, seedEl].filter(Boolean).forEach((el) => {
       el.addEventListener('input', syncStateFromFields);
@@ -5491,6 +6017,19 @@
       .uvd-jsonl-batch-actions button { border: 1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); border-radius: 9px; min-height: 34px; padding: 0 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
       .uvd-jsonl-batch-actions button:hover:not(:disabled) { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
       .uvd-jsonl-batch-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+      .uvd-backup-card { margin-top: 12px; border: 1px solid var(--uvd-border); border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02)); padding: 12px; display: grid; gap: 10px; }
+      .uvd-backup-head h3 { margin: 0; font-size: 24px; line-height: 1; color: var(--uvd-text); font-weight: 700; }
+      .uvd-backup-head p { margin: 6px 0 0; color: var(--uvd-subtext); font-size: 12px; line-height: 1.35; }
+      .uvd-backup-meta, .uvd-backup-summary, .uvd-backup-counts, .uvd-backup-buckets { color: var(--uvd-subtext); font-size: 12px; line-height: 1.4; }
+      .uvd-backup-summary[data-tone="syncing"] { color: #70b2ff; }
+      .uvd-backup-summary[data-tone="error"] { color: var(--uvd-error); }
+      .uvd-backup-scopes { display: grid; gap: 7px; }
+      .uvd-backup-scopes label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--uvd-text); }
+      .uvd-backup-scopes input { accent-color: #8de3ab; }
+      .uvd-backup-actions, .uvd-backup-export { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .uvd-backup-actions button, .uvd-backup-export button { border: 1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); border-radius: 9px; min-height: 34px; padding: 0 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
+      .uvd-backup-actions button:hover:not(:disabled), .uvd-backup-export button:hover:not(:disabled) { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
+      .uvd-backup-actions button:disabled, .uvd-backup-export button:disabled { opacity: 0.45; cursor: not-allowed; }
       .uvd-jsonl-review-summary { margin-top: 12px; display: grid; gap: 6px; color: var(--uvd-subtext); font-size: 13px; line-height: 1.35; }
       .uvd-jsonl-review-list { margin-top: 12px; border: 1px solid var(--uvd-border); border-radius: 12px; padding: 8px; max-height: 320px; overflow: auto; display: grid; gap: 6px; background: var(--uvd-surface); }
       .uvd-jsonl-review-item { border: 1px solid var(--uvd-border); border-radius: 8px; padding: 8px; color: var(--uvd-text); font-size: 12px; line-height: 1.35; background: rgba(0,0,0,0.12); }
@@ -5917,22 +6456,40 @@
       uvDraftsPageEl.style.display = 'none';
     }
   }
-    function setCapturedAuthToken(token) {
-      const nextToken = typeof token === 'string' && token ? token : null;
-      const gainedToken = !capturedAuthToken && !!nextToken;
-      capturedAuthToken = nextToken;
-      if (!gainedToken) return;
 
-      fetchComposerModels();
-      fetchComposerStyles();
+  function setCapturedBackupHeaders(headers) {
+    const source = headers && typeof headers === 'object' ? headers : {};
+    const next = {};
+    const auth = typeof source.Authorization === 'string' && source.Authorization ? source.Authorization.trim() : '';
+    const device = typeof source['OAI-Device-Id'] === 'string' && source['OAI-Device-Id'] ? source['OAI-Device-Id'].trim() : '';
+    const language = typeof source['OAI-Language'] === 'string' && source['OAI-Language'] ? source['OAI-Language'].trim() : '';
+    if (auth) next.Authorization = auth;
+    if (device) next['OAI-Device-Id'] = device;
+    if (language) next['OAI-Language'] = language;
+    capturedBackupHeaders = next;
+    renderUVDraftsBackupPanel();
+  }
 
-      if (uvDraftsMarkAllState?.active) {
-        resumePersistedMarkAllProgress({ queue: true });
-      }
-      if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none' && uvDraftsSyncUiState.syncing) {
-        initUVDraftsPage();
-      }
+  function setCapturedAuthToken(token) {
+    const nextToken = typeof token === 'string' && token ? token : null;
+    const gainedToken = !capturedAuthToken && !!nextToken;
+    capturedAuthToken = nextToken;
+    setCapturedBackupHeaders({ ...(capturedBackupHeaders || {}), Authorization: nextToken || '' });
+    if (!gainedToken) return;
+
+    fetchComposerModels();
+    fetchComposerStyles();
+
+    if (uvDraftsMarkAllState?.active) {
+      resumePersistedMarkAllProgress({ queue: true });
     }
+    if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none' && uvDraftsSyncUiState.syncing) {
+      initUVDraftsPage();
+    }
+    if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') {
+      refreshBackupStatus().catch(() => {});
+    }
+  }
 
     function setModelOverride(value) {
       modelOverride = typeof value === 'string' && value ? value : null;
@@ -5961,6 +6518,7 @@
       clearPendingCreateBatchState,
       applyComposerOverridesToCreateBody,
       setCapturedAuthToken,
+      setCapturedBackupHeaders,
       setModelOverride,
       getModelOverride,
     };

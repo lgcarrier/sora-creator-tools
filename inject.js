@@ -140,6 +140,15 @@
     } catch {}
   }
 
+  function getCapturedBackupHeaders() {
+    const headers = {};
+    if (capturedAuthToken) headers.Authorization = capturedAuthToken;
+    if (harvestHeaderBank.authorization) headers.Authorization = harvestHeaderBank.authorization;
+    if (harvestHeaderBank.oaiDeviceId) headers['OAI-Device-Id'] = harvestHeaderBank.oaiDeviceId;
+    if (harvestHeaderBank.oaiLanguage) headers['OAI-Language'] = harvestHeaderBank.oaiLanguage;
+    return headers;
+  }
+
   function ensureUVDraftsPageModule() {
     if (uvDraftsPage) return uvDraftsPage;
     const factory = window.SoraUVDraftsPageModule;
@@ -152,6 +161,7 @@
     uvDraftsPage = factory({ defaultFps: SORA_DEFAULT_FPS });
     try {
       uvDraftsPage.setCapturedAuthToken?.(capturedAuthToken);
+      uvDraftsPage.setCapturedBackupHeaders?.(getCapturedBackupHeaders());
       uvDraftsPage.setModelOverride?.(modelOverride);
     } catch {}
     return uvDraftsPage;
@@ -7125,6 +7135,9 @@ async function renderAnalyzeTable(force = false) {
     if (typeof device === 'string' && device.trim()) harvestHeaderBank.oaiDeviceId = device.trim();
     if (typeof language === 'string' && language.trim()) harvestHeaderBank.oaiLanguage = language.trim();
     harvestHeaderBank.updatedAt = Date.now();
+    try {
+      ensureUVDraftsPageModule()?.setCapturedBackupHeaders?.(getCapturedBackupHeaders());
+    } catch {}
   }
 
   function captureHarvestTemplateFromRequest(input, init) {
