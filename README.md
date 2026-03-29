@@ -255,6 +255,75 @@ Creator Tools is the extension-owned advanced drafts workflow. It is loaded lazi
   - export `manifest.jsonl`, `summary.json`, and `failures.jsonl` for any run
   - reconnect to the latest run after a page refresh using the background-owned backup database
 
+#### Bulk YouTube upload helper
+
+- This repo also includes a standalone Node CLI for batch-uploading locally backed-up Sora videos to a single YouTube channel.
+- Install the helper dependencies once with `npm install`.
+- In Google Cloud:
+  - create or reuse a project
+  - enable the **YouTube Data API v3**
+  - create an **OAuth client ID** for a desktop app
+  - download the client JSON to a local path outside the repo if you prefer
+- Start with a dry run so you can verify file discovery and the generated YouTube payloads without making any API calls:
+
+```bash
+npm run youtube:upload -- \
+  --manifest "/Users/you/Downloads/Sora Backup/2026-03-25_12-38-28/sora_backup_manifest_2026-03-25_12-38-28.jsonl" \
+  --oauth-client "/Users/you/Downloads/client_secret.json" \
+  --dry-run
+```
+
+- On the first live run, the script opens the browser for OAuth consent and stores the refresh token at `~/.config/sora-creator-tools/youtube-token.json`.
+- The uploader requests both the upload scope and a read-only YouTube scope so it can verify `--channel-handle` safely before uploading.
+- If you manage multiple YouTube channels, use a separate `--token` path per channel so each token stays bound to a specific YouTube identity.
+- If you previously authorized an older version of the script with upload-only scope, the next live run will prompt again and overwrite that token file with the broader scope set.
+- Upload results are appended to `~/.config/sora-creator-tools/youtube-upload-state.jsonl`.
+- That JSONL file is the uploader log: each entry records the Sora item identity, the resolved channel, timestamps, and the YouTube video URL/ID when an upload succeeds.
+- Reruns use that log to skip items that were already uploaded to the same YouTube channel, even if they come from a later manifest export with a different backup run ID.
+- If a run recorded failures and you want those failed items included again after fixing the cause, rerun with `--retry-failures`.
+- The uploader accepts manifest `filename` values that are already absolute paths and also supports relative backup paths.
+- The uploader infers the download root from the manifest path when the manifest lives under `.../Sora Backup/<run-stamp>/`; otherwise pass `--download-root`.
+- For live uploads, pass `--channel-handle @YourHandle` to abort unless the authenticated token matches that channel.
+- Metadata mapping:
+  - title uses `title`, then `prompt`, then the video filename
+  - description includes the prompt plus owner, cast, timestamps, and Sora links when present
+  - title and description replace YouTube-forbidden `<` and `>` characters before upload and keep description text within YouTube's documented byte limit
+  - tags are derived from `cast_names`, `owner_handle`, and `sora`
+- Useful live-run example:
+
+```bash
+npm run youtube:upload -- \
+  --manifest "/Users/you/Downloads/Sora Backup/2026-03-25_12-38-28/sora_backup_manifest_2026-03-25_12-38-28.jsonl" \
+  --oauth-client "/Users/you/Downloads/client_secret.json" \
+  --token "/Users/you/.config/sora-creator-tools/youtube-token-aidaredevils.json" \
+  --channel-handle "@AIDaredevils" \
+  --privacy private \
+  --category 22 \
+  --notify-subscribers false \
+  --made-for-kids false
+```
+
+- Google currently notes that uploads from unverified API projects created after July 28, 2020 are restricted to `private` visibility until the project passes audit, even if you request `unlisted` or `public`.
+
+#### Manifest-to-movie-list helper
+
+- This repo also includes a small Node CLI that converts a `sora_backup_manifest_*.jsonl` export into a `sora_movies.txt` file.
+- The output file contains one `post_permalink` URL per line in manifest order.
+- By default the script writes `sora_movies.txt` into the same directory as the manifest. Use `--output` to choose a different path.
+
+```bash
+npm run movies:export -- \
+  --manifest "/Users/you/Downloads/Sora Backup/2026-03-25_12-38-28/sora_backup_manifest_2026-03-25_12-38-28.jsonl"
+```
+
+- Optional custom output path:
+
+```bash
+npm run movies:export -- \
+  --manifest "/Users/you/Downloads/Sora Backup/2026-03-25_12-38-28/sora_backup_manifest_2026-03-25_12-38-28.jsonl" \
+  --output "/Users/you/Desktop/sora_movies.txt"
+```
+
 #### Scheduling
 
 - Scheduled posts are persisted in IndexedDB.

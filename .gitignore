@@ -4,3 +4,4 @@
 .examples/
 .claude/
 /dist/
+/node_modules/

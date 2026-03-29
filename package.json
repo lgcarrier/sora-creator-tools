@@ -1,0 +1,20 @@
+{
+  "name": "sora-creator-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension utilities and standalone helpers for Sora Creator Tools.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "for f in *.js scripts/*.js tests/*.js; do node --check \"$f\"; done",
+    "movies:export": "node scripts/manifest-to-sora-movies.js",
+    "youtube:upload": "node scripts/youtube-bulk-upload.js"
+  },
+  "dependencies": {
+    "@google-cloud/local-auth": "^3.0.1",
+    "google-auth-library": "^10.6.2",
+    "googleapis": "^171.4.0"
+  }
+}

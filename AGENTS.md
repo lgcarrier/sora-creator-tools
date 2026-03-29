@@ -15,13 +15,15 @@
 ## Commands
 
 - Install dependencies (tooling only): `node --version && npm --version`
+- Install uploader dependencies: `npm install`
 - Start development environment:
   - `open -a "Google Chrome" "chrome://extensions"`
   - In Chrome, enable Developer mode and Load unpacked from `/sora-creator-tools`
 - Build production artifact (release zip): `rm -f release.zip && zip -r release.zip manifest.json *.js *.html *.css icons imagery -x "*.DS_Store"`
 - Run tests: `node --test tests/*.test.js`
-- Run JavaScript syntax checks: `for f in *.js tests/*.js; do node --check "$f"; done`
+- Run JavaScript syntax checks: `for f in *.js scripts/*.js tests/*.js; do node --check "$f"; done`
 - Run whitespace/error check before commit: `git diff --check`
+- Run the YouTube bulk uploader: `npm run youtube:upload -- --manifest /path/to/sora_backup_manifest.jsonl --oauth-client /path/to/client_secret.json --dry-run`
 
 ## Workflow Rules
 
