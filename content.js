@@ -18,6 +18,7 @@
   const MAX_HARVEST_BATCH_ITEMS = 250;
   const MAX_HARVEST_CAST_NAMES = 32;
   const MAX_BACKUP_FETCH_PARAMS = 20;
+  const MAX_BACKUP_BASELINE_KEYS = 100000;
   const BACKUP_PAGE_FETCH_TIMEOUT_MS = 30000;
   const BACKUP_ACTIONS = new Set([
     'backup_start',
@@ -318,6 +319,38 @@
     };
   }
 
+  function sanitizeBackupComparisonKey(value) {
+    const key = sanitizeString(value, 256);
+    if (!key) return null;
+    if (!/^[A-Za-z0-9_.-]+:[A-Za-z0-9:_./-]+$/.test(key)) return null;
+    return key;
+  }
+
+  function sanitizeBackupBaselineManifest(raw) {
+    const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+    if (!source) return null;
+    const keys = [];
+    const seen = new Set();
+    const inputKeys = Array.isArray(source.keys) ? source.keys : [];
+    for (const entry of inputKeys) {
+      if (keys.length >= MAX_BACKUP_BASELINE_KEYS) break;
+      const key = sanitizeBackupComparisonKey(entry);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      keys.push(key);
+    }
+    const filename = sanitizeString(source.filename, 512) || '';
+    const totalRows = sanitizeNumber(source.total_rows, 0, 100000000) ?? 0;
+    const backedUpRows = sanitizeNumber(source.backed_up_rows, 0, 100000000) ?? 0;
+    if (!filename && !keys.length && totalRows <= 0 && backedUpRows <= 0) return null;
+    return {
+      filename,
+      total_rows: totalRows,
+      backed_up_rows: backedUpRows,
+      keys,
+    };
+  }
+
   function sanitizeBackupPayload(action, raw) {
     const payload = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const runId = sanitizeIdToken(payload.runId, MAX_ID_LEN);
@@ -325,6 +358,7 @@
       return {
         scopes: sanitizeBackupScopes(payload.scopes),
         headers: sanitizeBackupHeaders(payload.headers) || {},
+        baseline_manifest: sanitizeBackupBaselineManifest(payload.baseline_manifest),
       };
     }
     if (action === 'backup_manifest_request') {

@@ -1090,6 +1090,7 @@
     busy: false,
     exporting: false,
     lastMessage: '',
+    baseline_manifest: null,
   };
 
   const UV_DRAFTS_COMPOSER_KEY = 'SORA_UV_DRAFTS_COMPOSER_V1';
@@ -1153,6 +1154,133 @@
     writeJSONStorage(UV_BACKUP_SCOPES_KEY, normalizeBackupScopesState(uvDraftsBackupState.scopes));
   }
 
+  function normalizeBackupBaselineManifestForUi(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const filename = String(raw.filename || '').trim();
+    const totalRows = Number(raw.total_rows) || 0;
+    const backedUpRows = Number(raw.backed_up_rows) || 0;
+    const matchedRows = Number(raw.matched_rows) || 0;
+    const invalidRows = Number(raw.invalid_rows) || 0;
+    const keys = Array.isArray(raw.keys)
+      ? raw.keys.map((value) => String(value || '').trim()).filter(Boolean)
+      : [];
+    if (!filename && totalRows <= 0 && backedUpRows <= 0 && matchedRows <= 0 && invalidRows <= 0 && !keys.length) {
+      return null;
+    }
+    return {
+      filename,
+      total_rows: totalRows,
+      backed_up_rows: backedUpRows,
+      matched_rows: matchedRows,
+      invalid_rows: invalidRows,
+      keys,
+    };
+  }
+
+  function buildBackupComparisonKeyForUi(kind, id) {
+    if (typeof uvBackupLogic?.buildBackupComparisonKey === 'function') {
+      return uvBackupLogic.buildBackupComparisonKey(kind, id) || '';
+    }
+    const normalizedKind = String(kind || '').trim().toLowerCase();
+    const normalizedId = String(id || '').trim();
+    return normalizedKind && normalizedId ? `${normalizedKind}:${normalizedId}` : '';
+  }
+
+  function getBackupComparisonKeyFromItemKeyForUi(itemKey, runId = '') {
+    if (typeof uvBackupLogic?.buildBackupComparisonKeyFromItemKey === 'function') {
+      return uvBackupLogic.buildBackupComparisonKeyFromItemKey(itemKey, runId) || '';
+    }
+    const normalizedItemKey = String(itemKey || '').trim();
+    const normalizedRunId = String(runId || '').trim();
+    if (normalizedRunId && normalizedItemKey.startsWith(`${normalizedRunId}:`)) {
+      const tail = normalizedItemKey.slice(normalizedRunId.length + 1);
+      const splitAt = tail.indexOf(':');
+      if (splitAt > 0) return buildBackupComparisonKeyForUi(tail.slice(0, splitAt), tail.slice(splitAt + 1));
+    }
+    const firstSep = normalizedItemKey.indexOf(':');
+    if (firstSep < 0) return '';
+    const secondSep = normalizedItemKey.indexOf(':', firstSep + 1);
+    if (secondSep < 0) return '';
+    return buildBackupComparisonKeyForUi(
+      normalizedItemKey.slice(firstSep + 1, secondSep),
+      normalizedItemKey.slice(secondSep + 1)
+    );
+  }
+
+  function getBackupManifestComparisonKeyForUi(row) {
+    if (typeof uvBackupLogic?.getBackupManifestComparisonKey === 'function') {
+      return uvBackupLogic.getBackupManifestComparisonKey(row) || '';
+    }
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return '';
+    return (
+      buildBackupComparisonKeyForUi(row.kind, row.id) ||
+      getBackupComparisonKeyFromItemKeyForUi(row.item_key, row.run_id) ||
+      ''
+    );
+  }
+
+  function doesBackupManifestRowCountAsBackedUpForUi(row) {
+    if (typeof uvBackupLogic?.doesBackupManifestRowCountAsBackedUp === 'function') {
+      return uvBackupLogic.doesBackupManifestRowCountAsBackedUp(row) === true;
+    }
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+    const status = String(row.status || '').trim().toLowerCase();
+    if (!status) return true;
+    if (status === 'done') return true;
+    return status === 'skipped' && String(row.skip_reason || '').trim().toLowerCase() === 'already_backed_up';
+  }
+
+  function parseBackupManifestTextForUi(text, filename = '') {
+    if (typeof uvBackupLogic?.parseBackupManifestJsonl === 'function') {
+      return normalizeBackupBaselineManifestForUi(
+        uvBackupLogic.parseBackupManifestJsonl(text, { filename })
+      );
+    }
+    const result = {
+      filename: String(filename || '').trim(),
+      total_rows: 0,
+      backed_up_rows: 0,
+      invalid_rows: 0,
+      keys: [],
+    };
+    const seenKeys = new Set();
+    const lines = String(text || '').split(/\r?\n/);
+    for (const line of lines) {
+      const rawLine = String(line || '').trim();
+      if (!rawLine) continue;
+      result.total_rows += 1;
+      let row = null;
+      try {
+        row = JSON.parse(rawLine);
+      } catch {
+        result.invalid_rows += 1;
+        continue;
+      }
+      const key = getBackupManifestComparisonKeyForUi(row);
+      if (!key) {
+        result.invalid_rows += 1;
+        continue;
+      }
+      if (!doesBackupManifestRowCountAsBackedUpForUi(row)) continue;
+      result.backed_up_rows += 1;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+      result.keys.push(key);
+    }
+    return normalizeBackupBaselineManifestForUi(result);
+  }
+
+  function buildBackupBaselineManifestPayload(raw) {
+    const manifest = normalizeBackupBaselineManifestForUi(raw);
+    if (!manifest) return null;
+    return {
+      filename: manifest.filename || '',
+      total_rows: manifest.total_rows || 0,
+      backed_up_rows: manifest.backed_up_rows || 0,
+      keys: Array.isArray(manifest.keys) ? manifest.keys.slice() : [],
+    };
+  }
+
   function normalizeBackupRunForUi(run) {
     if (!run || typeof run !== 'object') return null;
     return {
@@ -1187,6 +1315,7 @@
       cancelled_at: Number(run.cancelled_at) || 0,
       last_error: String(run.last_error || '').trim(),
       summary_text: String(run.summary_text || '').trim(),
+      baseline_manifest: normalizeBackupBaselineManifestForUi(run.baseline_manifest),
     };
   }
 
@@ -3313,6 +3442,33 @@
     return bits.length ? bits.join(' • ') : `Run ${run.id}`;
   }
 
+  function formatBackupCountLabel(count, singular, plural) {
+    const numeric = Number(count) || 0;
+    return `${numeric} ${numeric === 1 ? singular : (plural || `${singular}s`)}`;
+  }
+
+  function formatBackupBaselineSummary(selection, run) {
+    const selected = normalizeBackupBaselineManifestForUi(selection);
+    if (selected) {
+      const bits = [
+        `Next backup: ${selected.filename || 'manifest.jsonl'}`,
+        formatBackupCountLabel(selected.backed_up_rows, 'backed-up row'),
+      ];
+      if (selected.invalid_rows > 0) bits.push(`${selected.invalid_rows} invalid ignored`);
+      return bits.join(' • ');
+    }
+    const baseline = normalizeBackupBaselineManifestForUi(run?.baseline_manifest);
+    if (baseline) {
+      const bits = [
+        `This run used ${baseline.filename || 'a previous manifest'}`,
+        formatBackupCountLabel(baseline.backed_up_rows, 'baseline row'),
+      ];
+      if (baseline.matched_rows > 0) bits.push(`${baseline.matched_rows} matched`);
+      return bits.join(' • ');
+    }
+    return 'No previous manifest selected.';
+  }
+
   function renderUVDraftsBackupPanel() {
     if (!uvDraftsBackupUi) return;
     const run = uvDraftsBackupState.run;
@@ -3335,6 +3491,17 @@
     for (const [key, input] of Object.entries(uvDraftsBackupUi.scopeInputs || {})) {
       input.checked = uvDraftsBackupState.scopes?.[key] !== false;
       input.disabled = panelState.active || busy;
+    }
+
+    if (uvDraftsBackupUi.baselineSummaryEl) {
+      uvDraftsBackupUi.baselineSummaryEl.textContent = formatBackupBaselineSummary(
+        uvDraftsBackupState.baseline_manifest,
+        run
+      );
+    }
+    if (uvDraftsBackupUi.baselineSelectBtn) uvDraftsBackupUi.baselineSelectBtn.disabled = panelState.active || busy;
+    if (uvDraftsBackupUi.baselineClearBtn) {
+      uvDraftsBackupUi.baselineClearBtn.disabled = panelState.active || busy || !uvDraftsBackupState.baseline_manifest;
     }
 
     if (uvDraftsBackupUi.metaEl) uvDraftsBackupUi.metaEl.textContent = formatBackupRunMeta(run);
@@ -3418,6 +3585,14 @@
         <label><input type="checkbox" data-uvd-backup-scope="castInPosts" /> <span>Cast-in posts</span></label>
         <label><input type="checkbox" data-uvd-backup-scope="castInDrafts" /> <span>Drafts featuring me</span></label>
       </div>
+      <div class="uvd-backup-baseline">
+        <div class="uvd-backup-baseline-actions">
+          <button type="button" data-uvd-backup-baseline-select="1">Previous Manifest</button>
+          <button type="button" data-uvd-backup-baseline-clear="1">Clear</button>
+        </div>
+        <input type="file" accept=".jsonl,application/x-ndjson,text/plain" data-uvd-backup-baseline-input="1" hidden />
+        <div class="uvd-backup-baseline-summary" data-uvd-backup-baseline-summary="1"></div>
+      </div>
       <div class="uvd-backup-actions">
         <button type="button" data-uvd-backup-start="1">Start Backup</button>
         <button type="button" data-uvd-backup-pause="1" hidden>Pause</button>
@@ -3457,6 +3632,9 @@
     const exportManifestBtn = hostEl.querySelector('[data-uvd-backup-export="manifest"]');
     const exportSummaryBtn = hostEl.querySelector('[data-uvd-backup-export="summary"]');
     const exportFailuresBtn = hostEl.querySelector('[data-uvd-backup-export="failures"]');
+    const baselineSelectBtn = hostEl.querySelector('[data-uvd-backup-baseline-select="1"]');
+    const baselineClearBtn = hostEl.querySelector('[data-uvd-backup-baseline-clear="1"]');
+    const baselineInputEl = hostEl.querySelector('[data-uvd-backup-baseline-input="1"]');
 
     startBtn?.addEventListener('click', async () => {
       if (!capturedAuthToken) {
@@ -3471,9 +3649,13 @@
         const response = await requestBackupAction('backup_start', {
           scopes: uvDraftsBackupState.scopes,
           headers: { ...(capturedBackupHeaders || {}), Authorization: capturedAuthToken },
+          baseline_manifest: buildBackupBaselineManifestPayload(uvDraftsBackupState.baseline_manifest),
         });
         if (!response?.ok) uvDraftsBackupState.lastMessage = response?.error ? `Start failed: ${response.error}` : 'Backup start failed.';
-        else if (response.run) applyBackupRunUpdate(response.run, 'Backup started.');
+        else if (response.run) {
+          uvDraftsBackupState.baseline_manifest = null;
+          applyBackupRunUpdate(response.run, 'Backup started.');
+        }
       } catch {
         uvDraftsBackupState.lastMessage = 'Backup start failed.';
       } finally {
@@ -3533,6 +3715,34 @@
     refreshBtn?.addEventListener('click', () => {
       refreshBackupStatus().catch(() => {});
     });
+    baselineSelectBtn?.addEventListener('click', () => baselineInputEl?.click());
+    baselineClearBtn?.addEventListener('click', () => {
+      uvDraftsBackupState.baseline_manifest = null;
+      renderUVDraftsBackupPanel();
+    });
+    baselineInputEl?.addEventListener('change', async () => {
+      const file = baselineInputEl.files && baselineInputEl.files[0];
+      baselineInputEl.value = '';
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = parseBackupManifestTextForUi(text, file.name || '');
+        if (!parsed || !Array.isArray(parsed.keys) || parsed.keys.length <= 0 || parsed.backed_up_rows <= 0) {
+          uvDraftsBackupState.baseline_manifest = null;
+          uvDraftsBackupState.lastMessage = parsed?.invalid_rows
+            ? 'No previously backed-up items found in that manifest.'
+            : 'Selected manifest did not include any backed-up items.';
+        } else {
+          uvDraftsBackupState.baseline_manifest = parsed;
+          uvDraftsBackupState.lastMessage = '';
+        }
+      } catch (err) {
+        console.error('[Creator Tools] Backup manifest upload failed:', err);
+        uvDraftsBackupState.baseline_manifest = null;
+        uvDraftsBackupState.lastMessage = 'Failed to read previous manifest.';
+      }
+      renderUVDraftsBackupPanel();
+    });
     exportManifestBtn?.addEventListener('click', () => exportBackupArtifact('manifest'));
     exportSummaryBtn?.addEventListener('click', () => exportBackupArtifact('summary'));
     exportFailuresBtn?.addEventListener('click', () => exportBackupArtifact('failures'));
@@ -3548,7 +3758,11 @@
       exportManifestBtn,
       exportSummaryBtn,
       exportFailuresBtn,
+      baselineSelectBtn,
+      baselineClearBtn,
+      baselineInputEl,
       metaEl: hostEl.querySelector('[data-uvd-backup-meta="1"]'),
+      baselineSummaryEl: hostEl.querySelector('[data-uvd-backup-baseline-summary="1"]'),
       summaryEl: hostEl.querySelector('[data-uvd-backup-summary="1"]'),
       countsEl: hostEl.querySelector('[data-uvd-backup-counts="1"]'),
       bucketEl: hostEl.querySelector('[data-uvd-backup-buckets="1"]'),
@@ -6026,10 +6240,13 @@
       .uvd-backup-scopes { display: grid; gap: 7px; }
       .uvd-backup-scopes label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--uvd-text); }
       .uvd-backup-scopes input { accent-color: #8de3ab; }
+      .uvd-backup-baseline { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--uvd-border); border-radius: 10px; background: rgba(255,255,255,0.02); }
+      .uvd-backup-baseline-actions { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .uvd-backup-baseline-summary { color: var(--uvd-subtext); font-size: 12px; line-height: 1.4; }
       .uvd-backup-actions, .uvd-backup-export { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .uvd-backup-actions button, .uvd-backup-export button { border: 1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); border-radius: 9px; min-height: 34px; padding: 0 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
-      .uvd-backup-actions button:hover:not(:disabled), .uvd-backup-export button:hover:not(:disabled) { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
-      .uvd-backup-actions button:disabled, .uvd-backup-export button:disabled { opacity: 0.45; cursor: not-allowed; }
+      .uvd-backup-actions button, .uvd-backup-export button, .uvd-backup-baseline-actions button { border: 1px solid var(--uvd-border); background: var(--uvd-surface); color: var(--uvd-text); border-radius: 9px; min-height: 34px; padding: 0 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
+      .uvd-backup-actions button:hover:not(:disabled), .uvd-backup-export button:hover:not(:disabled), .uvd-backup-baseline-actions button:hover:not(:disabled) { background: var(--uvd-surface-hover); border-color: var(--uvd-border-strong); }
+      .uvd-backup-actions button:disabled, .uvd-backup-export button:disabled, .uvd-backup-baseline-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
       .uvd-jsonl-review-summary { margin-top: 12px; display: grid; gap: 6px; color: var(--uvd-subtext); font-size: 13px; line-height: 1.35; }
       .uvd-jsonl-review-list { margin-top: 12px; border: 1px solid var(--uvd-border); border-radius: 12px; padding: 8px; max-height: 320px; overflow: auto; display: grid; gap: 6px; background: var(--uvd-surface); }
       .uvd-jsonl-review-item { border: 1px solid var(--uvd-border); border-radius: 8px; padding: 8px; color: var(--uvd-text); font-size: 12px; line-height: 1.35; background: rgba(0,0,0,0.12); }

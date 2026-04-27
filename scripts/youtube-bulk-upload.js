@@ -58,7 +58,7 @@ function printUsage() {
     '  --state <path>                Default: ~/.config/sora-creator-tools/youtube-upload-state.jsonl',
     '  --token <path>                Default: ~/.config/sora-creator-tools/youtube-token.json',
     '  --limit <n>                   Process at most n upload candidates',
-    '  --retry-failures              Retry items marked as failed in the state file',
+    '  --retry-failures              Force retry items marked as failed even when fresh rows still exist',
     '  --dry-run                     Build payloads and verify files without uploading',
     '  --help                        Show this help message',
   ].join('\n'));
@@ -547,6 +547,10 @@ function shouldSkipItem(itemKey, uploadKey, stateStore, retryFailures) {
   return { skip: false, reason: '' };
 }
 
+function isFailedStateRecord(record) {
+  return normalizeInlineText(record?.status).toLowerCase() === 'failed';
+}
+
 function isRetryableUploadError(error) {
   const status = Number(error?.code || error?.status || error?.response?.status || 0);
   if (status === 429 || (status >= 500 && status < 600)) return true;
@@ -568,29 +572,14 @@ async function loadOAuthClientConfig(oauthClientPath) {
   return client;
 }
 
-async function getAuthenticatedClient(oauthClientPath, tokenPath) {
-  const { OAuth2Client } = require('google-auth-library');
-  const clientConfig = await loadOAuthClientConfig(oauthClientPath);
-  const redirectUri = Array.isArray(clientConfig.redirect_uris) && clientConfig.redirect_uris.length
-    ? clientConfig.redirect_uris[0]
-    : 'http://127.0.0.1';
-  const client = new OAuth2Client(clientConfig.client_id, clientConfig.client_secret, redirectUri);
+function isInvalidGrantError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  const responseError = String(error?.response?.data?.error || '').toLowerCase();
+  return responseError === 'invalid_grant' || message.includes('invalid_grant');
+}
 
-  try {
-    const tokenText = await fsp.readFile(tokenPath, 'utf8');
-    const storedCredentials = JSON.parse(tokenText);
-    if (tokenHasRequiredScopes(storedCredentials)) {
-      client.setCredentials(storedCredentials);
-      return client;
-    }
-    console.log(
-      `Stored token at ${tokenPath} is missing required scopes (${REQUIRED_AUTH_SCOPES.join(', ')}). Reauthorizing.`
-    );
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-
-  const { authenticate } = require('@google-cloud/local-auth');
+async function authenticateAndStoreClient(oauthClientPath, tokenPath, client, authenticate, io = { log: console.log }) {
+  io.log(`Opening Google OAuth consent to refresh credentials for ${tokenPath}`);
   const authenticated = await authenticate({
     keyfilePath: oauthClientPath,
     scopes: REQUIRED_AUTH_SCOPES,
@@ -604,6 +593,44 @@ async function getAuthenticatedClient(oauthClientPath, tokenPath) {
   await ensureParentDir(tokenPath);
   await fsp.writeFile(tokenPath, JSON.stringify(authenticated.credentials, null, 2), 'utf8');
   return client;
+}
+
+async function validateStoredClient(client) {
+  await client.getAccessToken();
+  return client;
+}
+
+async function getAuthenticatedClient(oauthClientPath, tokenPath, deps = {}) {
+  const { OAuth2Client = require('google-auth-library').OAuth2Client } = deps;
+  const authenticate = deps.authenticate || require('@google-cloud/local-auth').authenticate;
+  const io = deps.io || { log: console.log };
+  const clientConfig = await loadOAuthClientConfig(oauthClientPath);
+  const redirectUri = Array.isArray(clientConfig.redirect_uris) && clientConfig.redirect_uris.length
+    ? clientConfig.redirect_uris[0]
+    : 'http://127.0.0.1';
+  const client = new OAuth2Client(clientConfig.client_id, clientConfig.client_secret, redirectUri);
+
+  try {
+    const tokenText = await fsp.readFile(tokenPath, 'utf8');
+    const storedCredentials = JSON.parse(tokenText);
+    if (tokenHasRequiredScopes(storedCredentials)) {
+      client.setCredentials(storedCredentials);
+      try {
+        return await validateStoredClient(client);
+      } catch (error) {
+        if (!isInvalidGrantError(error)) throw error;
+        io.log(`Stored token at ${tokenPath} is expired or revoked (invalid_grant). Reauthorizing.`);
+      }
+    } else {
+      io.log(
+        `Stored token at ${tokenPath} is missing required scopes (${REQUIRED_AUTH_SCOPES.join(', ')}). Reauthorizing.`
+      );
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  return authenticateAndStoreClient(oauthClientPath, tokenPath, client, authenticate, io);
 }
 
 function createYouTubeService(authClient) {
@@ -672,39 +699,27 @@ async function uploadOneVideo(youtube, item, filePath, options) {
 async function processManifestItems(items, options, io, youtube = null) {
   const stateStore = options.dryRun ? { byItemKey: new Map(), byUploadKey: new Map() } : await loadStateStore(options.statePath);
   const results = [];
+  const deferredFailureRetries = [];
   let attempted = 0;
+  let sawFreshCandidate = false;
 
-  for (let index = 0; index < items.length; index += 1) {
-    const item = items[index];
-    const itemKey = buildItemKey(item, index);
-    item.item_key = itemKey;
-    let filePath = '';
+  async function processCandidate(item, itemKey, filePath, uploadKey) {
+    if (options.limit && attempted >= options.limit) return { reachedLimit: true };
 
     try {
-      filePath = resolveVideoPath(item, options.downloadRoot);
       await fsp.access(filePath, fs.constants.R_OK);
     } catch (error) {
       const message = `Missing video file for ${itemKey}: ${error.message}`;
       io.error(message);
-      results.push({ item_key: itemKey, status: 'failed', error: message });
+      results.push({ item_key: itemKey, upload_key: uploadKey, status: 'failed', error: message });
       if (!options.dryRun) {
         const record = buildStateRecord(item, filePath, options, 'failed', { error: message });
         await appendStateRecord(options.statePath, record);
         stateStore.byItemKey.set(itemKey, record);
         if (record.upload_key) stateStore.byUploadKey.set(record.upload_key, record);
       }
-      continue;
+      return { reachedLimit: false };
     }
-
-    const uploadKey = buildUploadKey(item, filePath, options.channelNamespace || '');
-
-    const skip = shouldSkipItem(itemKey, uploadKey, stateStore, options.retryFailures);
-    if (skip.skip) {
-      io.log(`Skipping ${uploadKey}: ${skip.reason}`);
-      results.push({ item_key: itemKey, upload_key: uploadKey, status: 'skipped', reason: skip.reason });
-      continue;
-    }
-    if (options.limit && attempted >= options.limit) break;
 
     attempted += 1;
 
@@ -712,10 +727,9 @@ async function processManifestItems(items, options, io, youtube = null) {
       const preview = buildDryRunRecord(item, filePath, options);
       io.log(JSON.stringify(preview));
       results.push({ item_key: itemKey, status: 'dry_run', preview });
-      continue;
+      return { reachedLimit: false };
     }
 
-    let uploaded = false;
     for (let attempt = 1; attempt <= DEFAULT_RETRY_LIMIT; attempt += 1) {
       try {
         io.log(`Uploading ${uploadKey} (${attempt}/${DEFAULT_RETRY_LIMIT}) from ${filePath}`);
@@ -741,8 +755,7 @@ async function processManifestItems(items, options, io, youtube = null) {
           `Uploaded ${uploadKey}: "${record.title}" from ${filePath}` +
           `${record.youtube_url ? ` -> ${record.youtube_url}` : (record.youtube_video_id ? ` -> ${record.youtube_video_id}` : '')}`
         );
-        uploaded = true;
-        break;
+        return { reachedLimit: false };
       } catch (error) {
         const retryable = isRetryableUploadError(error);
         const message = String(error?.message || error);
@@ -757,11 +770,83 @@ async function processManifestItems(items, options, io, youtube = null) {
         if (record.upload_key) stateStore.byUploadKey.set(record.upload_key, record);
         results.push({ item_key: itemKey, upload_key: uploadKey, status: 'failed', error: message });
         io.error(`Failed ${uploadKey}: ${message}`);
-        break;
+        return { reachedLimit: false };
       }
     }
 
-    if (!uploaded) continue;
+    return { reachedLimit: false };
+  }
+
+  function flushDeferredFailureSkips() {
+    for (const deferred of deferredFailureRetries.splice(0)) {
+      io.log(`Skipping ${deferred.uploadKey}: ${deferred.reason}`);
+      results.push({
+        item_key: deferred.itemKey,
+        upload_key: deferred.uploadKey,
+        status: 'skipped',
+        reason: deferred.reason,
+      });
+    }
+  }
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const itemKey = buildItemKey(item, index);
+    item.item_key = itemKey;
+    let filePath = '';
+
+    try {
+      filePath = resolveVideoPath(item, options.downloadRoot);
+    } catch (error) {
+      const message = `Missing video file for ${itemKey}: ${error.message}`;
+      io.error(message);
+      results.push({ item_key: itemKey, status: 'failed', error: message });
+      if (!options.dryRun) {
+        const record = buildStateRecord(item, filePath, options, 'failed', { error: message });
+        await appendStateRecord(options.statePath, record);
+        stateStore.byItemKey.set(itemKey, record);
+        if (record.upload_key) stateStore.byUploadKey.set(record.upload_key, record);
+      }
+      continue;
+    }
+
+    const uploadKey = buildUploadKey(item, filePath, options.channelNamespace || '');
+
+    const skip = shouldSkipItem(itemKey, uploadKey, stateStore, options.retryFailures);
+    if (skip.skip) {
+      if (!options.retryFailures && isFailedStateRecord(skip.previous) && !sawFreshCandidate) {
+        deferredFailureRetries.push({
+          item,
+          itemKey,
+          filePath,
+          uploadKey,
+          reason: skip.reason,
+        });
+        continue;
+      }
+      io.log(`Skipping ${uploadKey}: ${skip.reason}`);
+      results.push({ item_key: itemKey, upload_key: uploadKey, status: 'skipped', reason: skip.reason });
+      continue;
+    }
+
+    sawFreshCandidate = true;
+    if (deferredFailureRetries.length) flushDeferredFailureSkips();
+
+    const candidateResult = await processCandidate(item, itemKey, filePath, uploadKey);
+    if (candidateResult.reachedLimit) break;
+  }
+
+  if (!options.retryFailures && !sawFreshCandidate && deferredFailureRetries.length) {
+    io.log(
+      `No new upload candidates found; retrying ${deferredFailureRetries.length} previously failed ` +
+      `item${deferredFailureRetries.length === 1 ? '' : 's'}.`
+    );
+    for (const deferred of deferredFailureRetries) {
+      const candidateResult = await processCandidate(deferred.item, deferred.itemKey, deferred.filePath, deferred.uploadKey);
+      if (candidateResult.reachedLimit) break;
+    }
+  } else if (deferredFailureRetries.length) {
+    flushDeferredFailureSkips();
   }
 
   return results;
@@ -806,7 +891,7 @@ async function main(
 
   let youtube = null;
   if (!options.dryRun) {
-    const authClient = await getAuthClient(options.oauthClientPath, options.tokenPath);
+    const authClient = await getAuthClient(options.oauthClientPath, options.tokenPath, { io });
     youtube = buildYouTubeService(authClient);
     if (options.channelHandle) {
       const verifiedChannel = await verifyAuthorizedChannel(youtube, options.channelHandle, io);
@@ -843,7 +928,9 @@ module.exports = {
   defaultTokenPath,
   describePriorUpload,
   ensureAuthorizedChannel,
+  getAuthenticatedClient,
   inferDownloadRootFromManifest,
+  isInvalidGrantError,
   loadManifestItems,
   main,
   normalizeChannelHandle,

@@ -27,6 +27,7 @@ function buildBackupHarness() {
     MAX_ID_LEN: 128,
     MAX_URL_LEN: 2048,
     MAX_BACKUP_FETCH_PARAMS: 20,
+    MAX_BACKUP_BASELINE_KEYS: 100000,
   };
   vm.createContext(context);
   vm.runInContext(
@@ -87,6 +88,35 @@ test('sanitizeBackupPayload keeps only supported headers and scope booleans', ()
     Authorization: 'Bearer token',
     'OAI-Device-Id': 'device_123',
     'OAI-Language': 'en-US',
+  });
+});
+
+test('sanitizeBackupPayload preserves a deduped baseline manifest for incremental backups', () => {
+  const { sanitizeBackupPayload } = buildBackupHarness();
+  const out = sanitizeBackupPayload('backup_start', {
+    scopes: { ownDrafts: true },
+    headers: { Authorization: 'Bearer token' },
+    baseline_manifest: {
+      filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl',
+      total_rows: 42,
+      backed_up_rows: 40,
+      keys: [
+        'published:post_123',
+        'published:post_123',
+        'draft:draft_456',
+        'not valid!',
+      ],
+    },
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(out.baseline_manifest)), {
+    filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl',
+    total_rows: 42,
+    backed_up_rows: 40,
+    keys: [
+      'published:post_123',
+      'draft:draft_456',
+    ],
   });
 });
 

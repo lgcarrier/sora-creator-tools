@@ -11,7 +11,9 @@ const {
   buildUploadPayload,
   describePriorUpload,
   ensureAuthorizedChannel,
+  getAuthenticatedClient,
   inferDownloadRootFromManifest,
+  isInvalidGrantError,
   main,
   normalizeChannelHandle,
   parseGrantedScopes,
@@ -96,6 +98,14 @@ test('parseGrantedScopes and tokenHasRequiredScopes recognize the upload plus re
     }),
     false
   );
+});
+
+test('isInvalidGrantError recognizes invalid_grant responses', () => {
+  const err = new Error('Request failed');
+  err.response = { data: { error: 'invalid_grant' } };
+  assert.equal(isInvalidGrantError(err), true);
+  assert.equal(isInvalidGrantError(new Error('invalid_grant')), true);
+  assert.equal(isInvalidGrantError(new Error('network timeout')), false);
 });
 
 test('resolveVideoPath joins manifest filenames under the download root', () => {
@@ -279,6 +289,86 @@ test('ensureAuthorizedChannel succeeds when the requested handle matches an owne
   assert.deepEqual(calls[0], { part: 'id,snippet', forHandle: '@AIDaredevils', maxResults: 1 });
   assert.deepEqual(calls[1], { part: 'id,snippet', mine: true, maxResults: 50 });
   assert.match(logs[0], /Verified YouTube channel @AIDaredevils/);
+});
+
+test('getAuthenticatedClient reauthorizes when the stored token refresh fails with invalid_grant', async () => {
+  const tempRoot = createTempDir('sora-youtube-auth-');
+  const oauthClientPath = path.join(tempRoot, 'client_secret.json');
+  const tokenPath = path.join(tempRoot, 'token.json');
+  const logs = [];
+  const authenticateCalls = [];
+
+  class FakeOAuth2Client {
+    constructor(clientId, clientSecret, redirectUri) {
+      this.clientId = clientId;
+      this.clientSecret = clientSecret;
+      this.redirectUri = redirectUri;
+      this.credentials = null;
+    }
+
+    setCredentials(credentials) {
+      this.credentials = credentials;
+    }
+
+    async getAccessToken() {
+      if (this.credentials?.refresh_token === 'stale-refresh-token') {
+        const err = new Error('invalid_grant');
+        err.response = { data: { error: 'invalid_grant' } };
+        throw err;
+      }
+      return { token: this.credentials?.access_token || 'fresh-access-token' };
+    }
+  }
+
+  try {
+    fs.writeFileSync(
+      oauthClientPath,
+      JSON.stringify({
+        installed: {
+          client_id: 'client-id',
+          client_secret: 'client-secret',
+          redirect_uris: ['http://127.0.0.1'],
+        },
+      }),
+      'utf8'
+    );
+    fs.writeFileSync(
+      tokenPath,
+      JSON.stringify({
+        access_token: 'stale-access-token',
+        refresh_token: 'stale-refresh-token',
+        scope: 'https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.upload',
+      }),
+      'utf8'
+    );
+
+    const client = await getAuthenticatedClient(oauthClientPath, tokenPath, {
+      OAuth2Client: FakeOAuth2Client,
+      authenticate: async (options) => {
+        authenticateCalls.push(options);
+        return {
+          credentials: {
+            access_token: 'fresh-access-token',
+            refresh_token: 'fresh-refresh-token',
+            scope: 'https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.upload',
+          },
+        };
+      },
+      io: {
+        log: (line) => logs.push(String(line)),
+      },
+    });
+
+    assert.equal(client.credentials.refresh_token, 'fresh-refresh-token');
+    assert.equal(authenticateCalls.length, 1);
+    assert.match(logs.join('\n'), /invalid_grant/);
+    assert.match(logs.join('\n'), /Opening Google OAuth consent/);
+
+    const saved = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
+    assert.equal(saved.refresh_token, 'fresh-refresh-token');
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test('ensureAuthorizedChannel throws when the token does not match the requested handle', async () => {
@@ -555,6 +645,244 @@ test('main skips a previously uploaded item on later runs using the stable uploa
     assert.match(logs.join('\n'), /already uploaded/);
     assert.match(logs.join('\n'), /video123/);
     assert.match(logs.join('\n'), /Upload log written to/);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('main retries previously failed items automatically when no fresh candidates remain', async () => {
+  const tempRoot = createTempDir('sora-youtube-upload-fallback-');
+  const runDir = path.join(tempRoot, 'Sora Backup', '2026-03-26_12-00-00');
+  const ownPostsDir = path.join(runDir, 'ownPosts');
+  const manifestPath = path.join(runDir, 'sora_backup_manifest_2026-03-26_12-00-00.jsonl');
+  const statePath = path.join(tempRoot, 'state.jsonl');
+  const tokenPath = path.join(tempRoot, 'token.json');
+  const uploadedVideoPath = path.join(ownPostsDir, 'post_uploaded.mp4');
+  const failedVideoPath = path.join(ownPostsDir, 'post_failed.mp4');
+  const logs = [];
+  let uploadCalls = 0;
+
+  try {
+    fs.mkdirSync(ownPostsDir, { recursive: true });
+    fs.writeFileSync(uploadedVideoPath, 'demo-uploaded');
+    fs.writeFileSync(failedVideoPath, 'demo-failed');
+    fs.writeFileSync(
+      manifestPath,
+      [
+        {
+          item_key: 'backup_run_new:published:post_uploaded',
+          run_id: 'backup_run_new',
+          kind: 'published',
+          id: 'post_uploaded',
+          filename: uploadedVideoPath,
+          title: 'Already There',
+        },
+        {
+          item_key: 'backup_run_new:published:post_failed',
+          run_id: 'backup_run_new',
+          kind: 'published',
+          id: 'post_failed',
+          filename: failedVideoPath,
+          title: 'Retry Me',
+        },
+      ].map((row) => JSON.stringify(row)).join('\n') + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      statePath,
+      [
+        {
+          version: 1,
+          item_key: 'backup_run_old:published:post_uploaded',
+          upload_key: 'channel:UC123::published:post_uploaded',
+          id: 'post_uploaded',
+          kind: 'published',
+          file_path: '/tmp/old/post_uploaded.mp4',
+          title: 'Already There',
+          channel_namespace: 'channel:UC123',
+          channel_id: 'UC123',
+          channel_handle: '@AIDaredevils',
+          status: 'uploaded',
+          updated_at: '2026-03-26T10:00:00.000Z',
+          youtube_video_id: 'videoUploaded',
+          youtube_url: 'https://www.youtube.com/watch?v=videoUploaded',
+        },
+        {
+          version: 1,
+          item_key: 'backup_run_old:published:post_failed',
+          upload_key: 'channel:UC123::published:post_failed',
+          id: 'post_failed',
+          kind: 'published',
+          file_path: '/tmp/old/post_failed.mp4',
+          title: 'Retry Me',
+          channel_namespace: 'channel:UC123',
+          channel_id: 'UC123',
+          channel_handle: '@AIDaredevils',
+          status: 'failed',
+          updated_at: '2026-03-26T10:05:00.000Z',
+          error: 'network timeout',
+        },
+      ].map((row) => JSON.stringify(row)).join('\n') + '\n',
+      'utf8'
+    );
+
+    const youtube = {
+      channels: {
+        list: async (params) => {
+          if (params.forHandle) {
+            return { data: { items: [{ id: 'UC123', snippet: { title: 'AI Daredevils', customUrl: '@AIDaredevils' } }] } };
+          }
+          return { data: { items: [{ id: 'UC123', snippet: { title: 'AI Daredevils', customUrl: '@AIDaredevils' } }] } };
+        },
+      },
+      videos: {
+        insert: async () => {
+          uploadCalls += 1;
+          return { data: { id: 'retriedVideo123' } };
+        },
+      },
+    };
+
+    const out = await main(
+      [
+        '--manifest',
+        manifestPath,
+        '--oauth-client',
+        path.join(tempRoot, 'client_secret.json'),
+        '--token',
+        tokenPath,
+        '--state',
+        statePath,
+        '--channel-handle',
+        '@AIDaredevils',
+      ],
+      {
+        log: (line) => logs.push(String(line)),
+        error: () => {},
+      },
+      {
+        getAuthenticatedClient: async () => ({ access_token: 'fake' }),
+        createYouTubeService: () => youtube,
+      }
+    );
+
+    assert.equal(out.ok, true);
+    assert.equal(out.summary.skipped, 1);
+    assert.equal(out.summary.uploaded, 1);
+    assert.equal(uploadCalls, 1);
+    assert.match(logs.join('\n'), /No new upload candidates found; retrying 1 previously failed item/);
+    assert.match(logs.join('\n'), /already uploaded/);
+    assert.match(logs.join('\n'), /retriedVideo123/);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('main keeps previously failed items skipped while fresh candidates still exist', async () => {
+  const tempRoot = createTempDir('sora-youtube-upload-fresh-first-');
+  const runDir = path.join(tempRoot, 'Sora Backup', '2026-03-26_12-00-00');
+  const ownPostsDir = path.join(runDir, 'ownPosts');
+  const manifestPath = path.join(runDir, 'sora_backup_manifest_2026-03-26_12-00-00.jsonl');
+  const statePath = path.join(tempRoot, 'state.jsonl');
+  const tokenPath = path.join(tempRoot, 'token.json');
+  const freshVideoPath = path.join(ownPostsDir, 'post_fresh.mp4');
+  const failedVideoPath = path.join(ownPostsDir, 'post_failed.mp4');
+  const logs = [];
+  let uploadCalls = 0;
+
+  try {
+    fs.mkdirSync(ownPostsDir, { recursive: true });
+    fs.writeFileSync(freshVideoPath, 'demo-fresh');
+    fs.writeFileSync(failedVideoPath, 'demo-failed');
+    fs.writeFileSync(
+      manifestPath,
+      [
+        {
+          item_key: 'backup_run_new:published:post_failed',
+          run_id: 'backup_run_new',
+          kind: 'published',
+          id: 'post_failed',
+          filename: failedVideoPath,
+          title: 'Retry Me Later',
+        },
+        {
+          item_key: 'backup_run_new:published:post_fresh',
+          run_id: 'backup_run_new',
+          kind: 'published',
+          id: 'post_fresh',
+          filename: freshVideoPath,
+          title: 'Brand New',
+        },
+      ].map((row) => JSON.stringify(row)).join('\n') + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      statePath,
+      `${JSON.stringify({
+        version: 1,
+        item_key: 'backup_run_old:published:post_failed',
+        upload_key: 'channel:UC123::published:post_failed',
+        id: 'post_failed',
+        kind: 'published',
+        file_path: '/tmp/old/post_failed.mp4',
+        title: 'Retry Me Later',
+        channel_namespace: 'channel:UC123',
+        channel_id: 'UC123',
+        channel_handle: '@AIDaredevils',
+        status: 'failed',
+        updated_at: '2026-03-26T10:05:00.000Z',
+        error: 'network timeout',
+      })}\n`,
+      'utf8'
+    );
+
+    const youtube = {
+      channels: {
+        list: async (params) => {
+          if (params.forHandle) {
+            return { data: { items: [{ id: 'UC123', snippet: { title: 'AI Daredevils', customUrl: '@AIDaredevils' } }] } };
+          }
+          return { data: { items: [{ id: 'UC123', snippet: { title: 'AI Daredevils', customUrl: '@AIDaredevils' } }] } };
+        },
+      },
+      videos: {
+        insert: async () => {
+          uploadCalls += 1;
+          return { data: { id: 'freshVideo123' } };
+        },
+      },
+    };
+
+    const out = await main(
+      [
+        '--manifest',
+        manifestPath,
+        '--oauth-client',
+        path.join(tempRoot, 'client_secret.json'),
+        '--token',
+        tokenPath,
+        '--state',
+        statePath,
+        '--channel-handle',
+        '@AIDaredevils',
+      ],
+      {
+        log: (line) => logs.push(String(line)),
+        error: () => {},
+      },
+      {
+        getAuthenticatedClient: async () => ({ access_token: 'fake' }),
+        createYouTubeService: () => youtube,
+      }
+    );
+
+    assert.equal(out.ok, true);
+    assert.equal(out.summary.skipped, 1);
+    assert.equal(out.summary.uploaded, 1);
+    assert.equal(uploadCalls, 1);
+    assert.doesNotMatch(logs.join('\n'), /No new upload candidates found/);
+    assert.match(logs.join('\n'), /previous failure recorded/);
+    assert.match(logs.join('\n'), /freshVideo123/);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

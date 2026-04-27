@@ -277,10 +277,12 @@ npm run youtube:upload -- \
 - The uploader requests both the upload scope and a read-only YouTube scope so it can verify `--channel-handle` safely before uploading.
 - If you manage multiple YouTube channels, use a separate `--token` path per channel so each token stays bound to a specific YouTube identity.
 - If you previously authorized an older version of the script with upload-only scope, the next live run will prompt again and overwrite that token file with the broader scope set.
+- If Google returns `invalid_grant` for the saved token, the uploader now reopens OAuth consent and replaces that token file automatically.
 - Upload results are appended to `~/.config/sora-creator-tools/youtube-upload-state.jsonl`.
 - That JSONL file is the uploader log: each entry records the Sora item identity, the resolved channel, timestamps, and the YouTube video URL/ID when an upload succeeds.
 - Reruns use that log to skip items that were already uploaded to the same YouTube channel, even if they come from a later manifest export with a different backup run ID.
-- If a run recorded failures and you want those failed items included again after fixing the cause, rerun with `--retry-failures`.
+- If a rerun has no fresh upload candidates, the uploader now falls back to retrying items previously recorded as `failed`.
+- Pass `--retry-failures` to force those failed items back into the queue even when fresh manifest rows still exist.
 - The uploader accepts manifest `filename` values that are already absolute paths and also supports relative backup paths.
 - The uploader infers the download root from the manifest path when the manifest lives under `.../Sora Backup/<run-stamp>/`; otherwise pass `--download-root`.
 - For live uploads, pass `--channel-handle @YourHandle` to abort unless the authenticated token matches that channel.
@@ -308,7 +310,8 @@ npm run youtube:upload -- \
 #### Manifest-to-movie-list helper
 
 - This repo also includes a small Node CLI that converts a `sora_backup_manifest_*.jsonl` export into a `sora_movies.txt` file.
-- The output file contains one `post_permalink` URL per line in manifest order.
+- The output file contains one `post_permalink` URL per downloaded manifest row in manifest order.
+- For status-aware manifests, only rows with `status: "done"` are exported; legacy rows without a `status` field are treated as downloaded.
 - By default the script writes `sora_movies.txt` into the same directory as the manifest. Use `--output` to choose a different path.
 
 ```bash

@@ -47,6 +47,7 @@ const BACKUP_DOWNLOAD_FOLDER = 'Sora Backup';
 const BACKUP_FETCH_MAX_ATTEMPTS = 4;
 const BACKUP_FETCH_RETRY_BASE_MS = 1500;
 const BACKUP_FETCH_RETRY_MAX_MS = 15000;
+const MAX_BACKUP_BASELINE_KEYS = 100000;
 
 const backupLogic = globalThis.SoraUVBackupLogic || {};
 const {
@@ -56,6 +57,11 @@ const {
   buildBackupRunId = () => `backup_${Date.now()}`,
   buildBackupRunStamp = () => new Date().toISOString().replace(/[:.]/g, '-'),
   makeBackupItemKey = (runId, kind, id) => `${runId}:${kind}:${id}`,
+  buildBackupComparisonKey = (kind, id) => {
+    const normalizedKind = String(kind || '').trim().toLowerCase();
+    const normalizedId = String(id || '').trim();
+    return normalizedKind && normalizedId ? `${normalizedKind}:${normalizedId}` : '';
+  },
   normalizeCurrentUser = (value) => value || { handle: '', id: '' },
   extractOwnerIdentity = (value) => value || { handle: '', id: '' },
   sameOwnerIdentity = () => false,
@@ -489,6 +495,54 @@ function sanitizeBackupHeadersForRequest(value) {
   return out;
 }
 
+function sanitizeBackupComparisonKey(value) {
+  const key = sanitizeString(value, 256);
+  if (!key) return null;
+  if (!/^[A-Za-z0-9_.-]+:[A-Za-z0-9:_./-]+$/.test(key)) return null;
+  return key;
+}
+
+function sanitizeBackupBaselineManifestForRequest(value) {
+  const raw = isPlainObject(value) ? value : null;
+  if (!raw) return null;
+  const keys = [];
+  const seen = new Set();
+  const sourceKeys = Array.isArray(raw.keys) ? raw.keys : [];
+  for (const entry of sourceKeys) {
+    if (keys.length >= MAX_BACKUP_BASELINE_KEYS) break;
+    const key = sanitizeBackupComparisonKey(entry);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    keys.push(key);
+  }
+  const filename = sanitizeString(raw.filename, 512) || '';
+  const totalRows = sanitizeNumber(raw.total_rows, 0, 100000000) ?? 0;
+  const backedUpRows = sanitizeNumber(raw.backed_up_rows, 0, 100000000) ?? 0;
+  if (!filename && !keys.length && totalRows <= 0 && backedUpRows <= 0) return null;
+  return {
+    filename,
+    total_rows: totalRows,
+    backed_up_rows: backedUpRows,
+    keys,
+  };
+}
+
+function cloneBackupBaselineManifestSummary(value) {
+  const raw = isPlainObject(value) ? value : null;
+  if (!raw) return null;
+  const filename = sanitizeString(raw.filename, 512) || '';
+  const totalRows = sanitizeNumber(raw.total_rows, 0, 100000000) ?? 0;
+  const backedUpRows = sanitizeNumber(raw.backed_up_rows, 0, 100000000) ?? 0;
+  const matchedRows = sanitizeNumber(raw.matched_rows, 0, 100000000) ?? 0;
+  if (!filename && totalRows <= 0 && backedUpRows <= 0 && matchedRows <= 0) return null;
+  return {
+    filename,
+    total_rows: totalRows,
+    backed_up_rows: backedUpRows,
+    matched_rows: matchedRows,
+  };
+}
+
 function sanitizeBackupPayload(action, payload) {
   const raw = isPlainObject(payload) ? payload : {};
   const runId = sanitizeIdToken(raw.runId);
@@ -496,6 +550,7 @@ function sanitizeBackupPayload(action, payload) {
     return {
       scopes: normalizeBackupScopes(raw.scopes),
       headers: sanitizeBackupHeadersForRequest(raw.headers),
+      baseline_manifest: sanitizeBackupBaselineManifestForRequest(raw.baseline_manifest),
     };
   }
   if (action === 'backup_manifest_request') {
@@ -1407,6 +1462,7 @@ function summarizeBackupRunForClient(run) {
     active_item_key: sanitizeString(run.active_item_key, 256) || '',
     last_error: sanitizeString(run.last_error, 1024) || '',
     summary_text: sanitizeString(run.summary_text, 1024) || '',
+    baseline_manifest: cloneBackupBaselineManifestSummary(run.baseline_manifest),
   };
 }
 
@@ -1528,6 +1584,9 @@ async function saveBackupRun(run, eventType = 'status') {
       bucket_counts: cloneBackupBucketCounts(run.bucket_counts),
       updated_at: Date.now(),
     };
+    const baselineManifest = cloneBackupBaselineManifestSummary(next.baseline_manifest);
+    if (baselineManifest) next.baseline_manifest = baselineManifest;
+    else delete next.baseline_manifest;
 
     if (!hasIncomingInterrupt && (effectiveInterrupt === 'paused' || effectiveInterrupt === 'cancelled')) {
       next.status = effectiveInterrupt;
@@ -1785,6 +1844,67 @@ function buildBackupPermalink(kind, id) {
     : `${BACKUP_ORIGIN}/p/${encodeURIComponent(id)}`;
 }
 
+function createBackupBaselineLookup(baselineManifest) {
+  const out = new Set();
+  const source = Array.isArray(baselineManifest?.keys) ? baselineManifest.keys : [];
+  for (const entry of source) {
+    const key = sanitizeBackupComparisonKey(entry);
+    if (key) out.add(key);
+  }
+  return out;
+}
+
+function maybeMarkBackupItemAlreadyBackedUp(run, item, baselineLookup) {
+  if (!item || !(baselineLookup instanceof Set) || !baselineLookup.size) return item;
+  const comparisonKey = buildBackupComparisonKey(item.kind, item.id);
+  if (!comparisonKey || !baselineLookup.has(comparisonKey)) return item;
+  const summary = cloneBackupBaselineManifestSummary(run?.baseline_manifest) || {
+    filename: '',
+    total_rows: 0,
+    backed_up_rows: 0,
+    matched_rows: 0,
+  };
+  summary.matched_rows = (Number(summary.matched_rows) || 0) + 1;
+  run.baseline_manifest = summary;
+  return {
+    ...item,
+    status: 'skipped',
+    skip_reason: 'already_backed_up',
+  };
+}
+
+function shouldStopBucketDiscoveryAfterItem(bucket, item, baselineLookup) {
+  if (!bucket?.stop_on_baseline_match) return false;
+  if (!(baselineLookup instanceof Set) || !baselineLookup.size) return false;
+  return normalizeItemStatus(item?.status) === 'skipped' &&
+    String(item?.skip_reason || '').trim().toLowerCase() === 'already_backed_up';
+}
+
+function formatBackupDiscoveryProgressSummary(bucketKey, page, run) {
+  const matched = Number(run?.baseline_manifest?.matched_rows) || 0;
+  return matched > 0
+    ? `Discovering ${bucketKey}: page ${page}, accepted ${run?.counts?.discovered || 0}, already backed up ${matched}`
+    : `Discovering ${bucketKey}: page ${page}, accepted ${run?.counts?.discovered || 0}`;
+}
+
+function formatBackupDiscoveryCompleteSummary(run) {
+  const queued = Number(run?.counts?.queued) || 0;
+  const matched = Number(run?.baseline_manifest?.matched_rows) || 0;
+  if (queued > 0) {
+    return matched > 0
+      ? `Discovery complete. ${queued} files queued. ${matched} already backed up.`
+      : `Discovery complete. ${queued} files queued.`;
+  }
+  if (matched > 0) return `Discovery complete. ${matched} already backed up. Nothing new to download.`;
+  return 'Discovery complete. No downloadable media found.';
+}
+
+function formatBackupCompletionSummary(run) {
+  const base = `Backup complete. ${run?.counts?.done || 0} downloaded, ${run?.counts?.failed || 0} failed, ${run?.counts?.skipped || 0} skipped.`;
+  const matched = Number(run?.baseline_manifest?.matched_rows) || 0;
+  return matched > 0 ? `${base} ${matched} already backed up.` : base;
+}
+
 function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
   const id = getBackupItemId(kind, detail) || getBackupItemId(kind, listItem);
   if (!id) return null;
@@ -1833,6 +1953,7 @@ function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
     filename: buildBackupFilename(run, bucket, id, mediaExt),
     url_refreshed_at: media?.url ? Date.now() : 0,
     last_error: '',
+    skip_reason: '',
   };
 }
 
@@ -1848,9 +1969,9 @@ function shouldFetchDiscoveryDetail(bucket, owner) {
   return false;
 }
 
-function createBackupRunRecord(scopes, headers, pageTabId = 0) {
+function createBackupRunRecord(scopes, headers, pageTabId = 0, baselineManifest = null) {
   const createdAt = Date.now();
-  return {
+  const run = {
     id: buildBackupRunId(createdAt),
     status: 'discovering',
     interrupt_status: '',
@@ -1872,6 +1993,9 @@ function createBackupRunRecord(scopes, headers, pageTabId = 0) {
     last_error: '',
     summary_text: 'Starting discovery…',
   };
+  const baselineSummary = cloneBackupBaselineManifestSummary(baselineManifest);
+  if (baselineSummary) run.baseline_manifest = baselineSummary;
+  return run;
 }
 
 async function resolveCurrentBackupUser(run, cachedOwnPostsPage = null) {
@@ -1958,6 +2082,7 @@ async function saveBackupDiscoveryProgress(run, eventType = 'status') {
       bucket_counts: cloneBackupBucketCounts(run.bucket_counts),
       current_user: normalizeCurrentUser(run.current_user),
       completed_at: Number(run.completed_at) || 0,
+      baseline_manifest: cloneBackupBaselineManifestSummary(run.baseline_manifest),
       last_error: sanitizeString(run.last_error, 1024) || '',
       summary_text: sanitizeString(run.summary_text, 1024) || '',
     };
@@ -1968,14 +2093,14 @@ async function saveBackupDiscoveryProgress(run, eventType = 'status') {
 function getSelectedBackupBuckets(scopes) {
   const normalized = normalizeBackupScopes(scopes);
   const buckets = [];
-  if (normalized.ownDrafts) buckets.push({ key: 'ownDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: BACKUP_DEFAULT_DRAFT_LIMIT });
-  if (normalized.ownPosts) buckets.push({ key: 'ownPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: BACKUP_DEFAULT_FEED_LIMIT, extraParams: { cut: 'nf2' } });
-  if (normalized.castInPosts) buckets.push({ key: 'castInPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: BACKUP_DEFAULT_FEED_LIMIT, extraParams: { cut: 'appearances' } });
-  if (normalized.castInDrafts) buckets.push({ key: 'castInDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/cameos', limit: BACKUP_DEFAULT_DRAFT_LIMIT });
+  if (normalized.ownDrafts) buckets.push({ key: 'ownDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: BACKUP_DEFAULT_DRAFT_LIMIT, stop_on_baseline_match: true });
+  if (normalized.ownPosts) buckets.push({ key: 'ownPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: BACKUP_DEFAULT_FEED_LIMIT, extraParams: { cut: 'nf2' }, stop_on_baseline_match: true });
+  if (normalized.castInPosts) buckets.push({ key: 'castInPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: BACKUP_DEFAULT_FEED_LIMIT, extraParams: { cut: 'appearances' }, stop_on_baseline_match: true });
+  if (normalized.castInDrafts) buckets.push({ key: 'castInDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/cameos', limit: BACKUP_DEFAULT_DRAFT_LIMIT, stop_on_baseline_match: true });
   return buckets;
 }
 
-async function discoverBackupRun(run) {
+async function discoverBackupRun(run, baselineLookup = null) {
   const buckets = getSelectedBackupBuckets(run.scopes);
   const seenKeys = new Set();
   let order = 0;
@@ -1988,6 +2113,7 @@ async function discoverBackupRun(run) {
     if (shouldInterruptBackupDiscovery(run)) return run;
     let cursor = null;
     let page = 0;
+    let stopBucketDiscovery = false;
     do {
       if (isBackupRunInterrupted(run.id)) return (await backupDbGet(BACKUP_RUNS_STORE, run.id)) || run;
       const latest = await backupDbGet(BACKUP_RUNS_STORE, run.id);
@@ -2019,28 +2145,31 @@ async function discoverBackupRun(run) {
         if ((bucket.key === 'castInPosts' || bucket.key === 'castInDrafts') && shouldExcludeAppearanceOwner(owner, run.current_user)) {
           continue;
         }
-        const backupItem = buildBackupManifestItem(run, bucket.key, bucket.kind, item, detail, order);
+        let backupItem = buildBackupManifestItem(run, bucket.key, bucket.kind, item, detail, order);
         if (!backupItem) continue;
+        backupItem = maybeMarkBackupItemAlreadyBackedUp(run, backupItem, baselineLookup);
         await backupDbPut(BACKUP_ITEMS_STORE, backupItem);
         run.counts.discovered += 1;
         run.bucket_counts[bucket.key] = (Number(run.bucket_counts[bucket.key]) || 0) + 1;
         run.counts = applyBackupStatusTransition(run.counts, null, backupItem.status);
         order += 1;
         if (backupItem.status === 'skipped' && backupItem.last_error) run.last_error = backupItem.last_error;
+        if (shouldStopBucketDiscoveryAfterItem(bucket, backupItem, baselineLookup)) {
+          stopBucketDiscovery = true;
+          break;
+        }
       }
       page += 1;
-      run.summary_text = `Discovering ${bucket.key}: page ${page}, accepted ${run.counts.discovered}`;
+      run.summary_text = formatBackupDiscoveryProgressSummary(bucket.key, page, run);
       run = await saveBackupDiscoveryProgress(run, 'status');
       if (shouldInterruptBackupDiscovery(run)) return run;
       const nextCursor = extractCursorFromPayload(json);
-      cursor = nextCursor && items.length ? nextCursor : null;
+      cursor = !stopBucketDiscovery && nextCursor && items.length ? nextCursor : null;
     } while (cursor);
   }
 
   run.status = run.counts.queued > 0 ? 'running' : 'completed';
-  run.summary_text = run.counts.queued > 0
-    ? `Discovery complete. ${run.counts.queued} files queued.`
-    : 'Discovery complete. No downloadable media found.';
+  run.summary_text = formatBackupDiscoveryCompleteSummary(run);
   if (run.status === 'completed') run.completed_at = Date.now();
   return saveBackupDiscoveryProgress(run, 'status');
 }
@@ -2100,7 +2229,7 @@ async function finalizeBackupRunIfIdle(runId) {
   run.completed_at = Date.now();
   run.active_download_id = 0;
   run.active_item_key = '';
-  run.summary_text = `Backup complete. ${run.counts.done} downloaded, ${run.counts.failed} failed, ${run.counts.skipped} skipped.`;
+  run.summary_text = formatBackupCompletionSummary(run);
   return saveBackupRun(run, 'status');
 }
 
@@ -2170,13 +2299,15 @@ async function handleBackupStart(payload, pageTabId = 0) {
   if (latest && !isTerminalRunStatus(latest.status)) {
     return { ok: false, error: 'backup_run_in_progress', run: summarizeBackupRunForClient(latest) };
   }
-  const run = createBackupRunRecord(payload?.scopes || DEFAULT_BACKUP_SCOPES, payload?.headers || {}, pageTabId);
+  const baselineManifest = sanitizeBackupBaselineManifestForRequest(payload?.baseline_manifest);
+  const baselineLookup = createBackupBaselineLookup(baselineManifest);
+  const run = createBackupRunRecord(payload?.scopes || DEFAULT_BACKUP_SCOPES, payload?.headers || {}, pageTabId, baselineManifest);
   markBackupRunInterrupted(run.id, '');
   await backupDbPut(BACKUP_RUNS_STORE, run);
   await broadcastBackupRunEvent({ type: 'status', run: summarizeBackupRunForClient(run) });
   (async () => {
     try {
-      const discoveredRun = await discoverBackupRun(run);
+      const discoveredRun = await discoverBackupRun(run, baselineLookup);
       if (normalizeRunStatus(discoveredRun?.status) === 'running') {
         queueBackupRunProcessing(discoveredRun.id);
       }
@@ -2274,6 +2405,7 @@ function buildBackupManifestLine(item) {
     media_ext: item.media_ext || '',
     filename: item.filename || '',
     status: item.status || '',
+    skip_reason: item.skip_reason || '',
     attempts: Number(item.attempts) || 0,
     url_refreshed_at: Number(item.url_refreshed_at) || 0,
     last_error: item.last_error || '',
@@ -2297,7 +2429,12 @@ async function handleBackupManifestRequest(payload) {
     };
   }
   if (format === 'failures') {
-    const failures = items.filter((item) => normalizeItemStatus(item.status) === 'failed' || normalizeItemStatus(item.status) === 'skipped');
+    const failures = items.filter((item) => {
+      const status = normalizeItemStatus(item.status);
+      if (status === 'failed') return true;
+      if (status !== 'skipped') return false;
+      return String(item?.skip_reason || '').trim().toLowerCase() !== 'already_backed_up';
+    });
     return {
       ok: true,
       filename: `sora_backup_failures_${run.run_stamp}.jsonl`,

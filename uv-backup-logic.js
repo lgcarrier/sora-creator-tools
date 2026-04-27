@@ -108,6 +108,86 @@
     return `${normalizeString(runId)}:${normalizeString(kind)}:${normalizeString(id)}`;
   }
 
+  function buildBackupComparisonKey(kind, id) {
+    const normalizedKind = normalizeLower(kind);
+    const normalizedId = normalizeId(id);
+    if (!normalizedKind || !normalizedId) return '';
+    return `${normalizedKind}:${normalizedId}`;
+  }
+
+  function buildBackupComparisonKeyFromItemKey(itemKey, runId = '') {
+    const normalizedItemKey = normalizeString(itemKey);
+    if (!normalizedItemKey) return '';
+    const normalizedRunId = normalizeString(runId);
+    if (normalizedRunId && normalizedItemKey.startsWith(`${normalizedRunId}:`)) {
+      const tail = normalizedItemKey.slice(normalizedRunId.length + 1);
+      const splitAt = tail.indexOf(':');
+      if (splitAt > 0) return buildBackupComparisonKey(tail.slice(0, splitAt), tail.slice(splitAt + 1));
+    }
+    const firstSep = normalizedItemKey.indexOf(':');
+    if (firstSep < 0) return '';
+    const secondSep = normalizedItemKey.indexOf(':', firstSep + 1);
+    if (secondSep < 0) return '';
+    return buildBackupComparisonKey(
+      normalizedItemKey.slice(firstSep + 1, secondSep),
+      normalizedItemKey.slice(secondSep + 1)
+    );
+  }
+
+  function getBackupManifestComparisonKey(row) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return '';
+    return (
+      buildBackupComparisonKey(row.kind, row.id) ||
+      buildBackupComparisonKeyFromItemKey(row.item_key, row.run_id) ||
+      ''
+    );
+  }
+
+  function doesBackupManifestRowCountAsBackedUp(row) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+    const status = normalizeLower(row.status);
+    if (!status) return true;
+    if (status === 'done') return true;
+    return status === 'skipped' && normalizeLower(row.skip_reason) === 'already_backed_up';
+  }
+
+  function parseBackupManifestJsonl(text, options = {}) {
+    const filename = normalizeString(options.filename) || '';
+    const result = {
+      filename,
+      total_rows: 0,
+      backed_up_rows: 0,
+      invalid_rows: 0,
+      keys: [],
+    };
+    const seenKeys = new Set();
+    const source = typeof text === 'string' ? text : '';
+    const lines = source.split(/\r?\n/);
+    for (const line of lines) {
+      const rawLine = normalizeString(line);
+      if (!rawLine) continue;
+      result.total_rows += 1;
+      let row = null;
+      try {
+        row = JSON.parse(rawLine);
+      } catch {
+        result.invalid_rows += 1;
+        continue;
+      }
+      const key = getBackupManifestComparisonKey(row);
+      if (!key) {
+        result.invalid_rows += 1;
+        continue;
+      }
+      if (!doesBackupManifestRowCountAsBackedUp(row)) continue;
+      result.backed_up_rows += 1;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+      result.keys.push(key);
+    }
+    return result;
+  }
+
   function normalizeOwnerIdentity(raw) {
     if (!raw || typeof raw !== 'object') return { handle: '', id: '' };
     const handle = normalizeString(
@@ -465,6 +545,11 @@
     buildBackupRunId,
     buildBackupRunStamp,
     makeBackupItemKey,
+    buildBackupComparisonKey,
+    buildBackupComparisonKeyFromItemKey,
+    getBackupManifestComparisonKey,
+    doesBackupManifestRowCountAsBackedUp,
+    parseBackupManifestJsonl,
     normalizeOwnerIdentity,
     extractOwnerIdentity,
     normalizeCurrentUser,

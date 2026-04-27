@@ -2,6 +2,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  buildBackupComparisonKey,
+  getBackupManifestComparisonKey,
+  doesBackupManifestRowCountAsBackedUp,
+  parseBackupManifestJsonl,
   pickDraftMediaSource,
   pickPublishedMediaSource,
   shouldExcludeAppearanceOwner,
@@ -44,6 +48,58 @@ test('pickPublishedMediaSource prefers raw video-like attachment URLs over previ
   assert.ok(out);
   assert.equal(out.url, 'https://videos.openai.com/demo/raw?sig=1');
   assert.equal(out.variant, 'unknown_fallback');
+});
+
+test('buildBackupComparisonKey normalizes kind and id into a stable comparison key', () => {
+  assert.equal(buildBackupComparisonKey('Published', 'post_123'), 'published:post_123');
+  assert.equal(buildBackupComparisonKey('', 'post_123'), '');
+});
+
+test('getBackupManifestComparisonKey falls back to item_key when kind and id are missing', () => {
+  assert.equal(
+    getBackupManifestComparisonKey({
+      run_id: 'backup_run_1',
+      item_key: 'backup_run_1:published:post_123',
+    }),
+    'published:post_123'
+  );
+});
+
+test('doesBackupManifestRowCountAsBackedUp accepts done, missing status, and chained already_backed_up rows', () => {
+  assert.equal(doesBackupManifestRowCountAsBackedUp({ status: 'done' }), true);
+  assert.equal(doesBackupManifestRowCountAsBackedUp({}), true);
+  assert.equal(doesBackupManifestRowCountAsBackedUp({ status: 'skipped', skip_reason: 'already_backed_up' }), true);
+  assert.equal(doesBackupManifestRowCountAsBackedUp({ status: 'failed' }), false);
+  assert.equal(doesBackupManifestRowCountAsBackedUp({ status: 'skipped', skip_reason: 'network_error' }), false);
+});
+
+test('parseBackupManifestJsonl keeps only rows that count as already backed up', () => {
+  const parsed = parseBackupManifestJsonl(
+    [
+      JSON.stringify({ kind: 'published', id: 'post_done', status: 'done' }),
+      JSON.stringify({ kind: 'draft', id: 'draft_legacy' }),
+      JSON.stringify({
+        run_id: 'backup_run_2',
+        item_key: 'backup_run_2:published:post_chained',
+        status: 'skipped',
+        skip_reason: 'already_backed_up',
+      }),
+      JSON.stringify({ kind: 'published', id: 'post_failed', status: 'failed' }),
+      JSON.stringify({ kind: 'published', id: 'post_skipped_other', status: 'skipped', skip_reason: 'network_error' }),
+      '{"kind":"published"',
+    ].join('\n'),
+    { filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl' }
+  );
+
+  assert.equal(parsed.filename, 'sora_backup_manifest_2026-03-25_12-38-28.jsonl');
+  assert.equal(parsed.total_rows, 6);
+  assert.equal(parsed.backed_up_rows, 3);
+  assert.equal(parsed.invalid_rows, 1);
+  assert.deepEqual(parsed.keys, [
+    'published:post_done',
+    'draft:draft_legacy',
+    'published:post_chained',
+  ]);
 });
 
 test('shouldExcludeAppearanceOwner matches either user id or handle', () => {

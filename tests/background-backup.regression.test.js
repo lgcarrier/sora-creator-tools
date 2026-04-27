@@ -71,7 +71,7 @@ function buildManifestHarness(pickBackupMediaSourceImpl) {
   const snippet = extractSnippet(
     src,
     'function getBackupItemId(kind, item) {',
-    'function createBackupRunRecord(scopes, headers, pageTabId = 0) {',
+    'function createBackupRunRecord(scopes, headers, pageTabId = 0, baselineManifest = null) {',
     'background backup manifest snippet'
   );
 
@@ -171,6 +171,9 @@ function buildDiscoveryProgressHarness() {
       if (!trimmed) return null;
       return trimmed.length > maxLen ? trimmed.slice(0, maxLen) : trimmed;
     },
+    cloneBackupBaselineManifestSummary(value) {
+      return value ? JSON.parse(JSON.stringify(value)) : null;
+    },
     updateBackupRunStatus: async (_runId, updater, eventType = 'status') => {
       calls.push({ eventType, before: JSON.parse(JSON.stringify(storedRun || null)) });
       const next = typeof updater === 'function' ? updater({ ...(storedRun || {}) }) : { ...(storedRun || {}), ...(updater || {}) };
@@ -258,6 +261,9 @@ function buildPageTabSyncHarness() {
       if (!trimmed) return null;
       return trimmed.length > maxLen ? trimmed.slice(0, maxLen) : trimmed;
     },
+    cloneBackupBaselineManifestSummary(value) {
+      return value ? JSON.parse(JSON.stringify(value)) : null;
+    },
     Date,
     __setStoredRun(value) {
       storedRun = JSON.parse(JSON.stringify(value));
@@ -312,6 +318,305 @@ globalThis.__syncBackupRunPageTabId = syncBackupRunPageTabId;
   };
 }
 
+function buildIncrementalMatchHarness() {
+  const src = fs.readFileSync(BACKGROUND_PATH, 'utf8');
+  const snippet = extractSnippet(
+    src,
+    'function createBackupBaselineLookup(baselineManifest) {',
+    'function formatBackupDiscoveryProgressSummary(bucketKey, page, run) {',
+    'background backup incremental matching snippet'
+  );
+
+  const context = {
+    sanitizeString(value, maxLen = 4096) {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      return trimmed.length > maxLen ? trimmed.slice(0, maxLen) : trimmed;
+    },
+    normalizeItemStatus(value) {
+      return typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : 'queued';
+    },
+    sanitizeBackupComparisonKey(value) {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      return /^[A-Za-z0-9_.-]+:[A-Za-z0-9:_./-]+$/.test(trimmed) ? trimmed : null;
+    },
+    buildBackupComparisonKey(kind, id) {
+      const normalizedKind = String(kind || '').trim().toLowerCase();
+      const normalizedId = String(id || '').trim();
+      return normalizedKind && normalizedId ? `${normalizedKind}:${normalizedId}` : '';
+    },
+    cloneBackupBaselineManifestSummary(value) {
+      return value ? JSON.parse(JSON.stringify(value)) : null;
+    },
+  };
+
+  vm.createContext(context);
+  vm.runInContext(
+    `
+${snippet}
+globalThis.__createBackupBaselineLookup = createBackupBaselineLookup;
+globalThis.__maybeMarkBackupItemAlreadyBackedUp = maybeMarkBackupItemAlreadyBackedUp;
+globalThis.__shouldStopBucketDiscoveryAfterItem = shouldStopBucketDiscoveryAfterItem;
+`,
+    context,
+    { filename: 'background-backup-incremental-harness.js' }
+  );
+
+  return {
+    createBackupBaselineLookup: context.__createBackupBaselineLookup,
+    maybeMarkBackupItemAlreadyBackedUp: context.__maybeMarkBackupItemAlreadyBackedUp,
+    shouldStopBucketDiscoveryAfterItem: context.__shouldStopBucketDiscoveryAfterItem,
+  };
+}
+
+function buildDiscoverHarness(fetchPages) {
+  const src = fs.readFileSync(BACKGROUND_PATH, 'utf8');
+  const snippet = extractSnippet(
+    src,
+    'function getSelectedBackupBuckets(scopes) {',
+    'async function refreshBackupItemMedia(run, item) {',
+    'background backup discover snippet'
+  );
+
+  const writes = [];
+  const fetchCalls = [];
+  const pagesByKey = new Map(Object.entries(fetchPages || {}).map(([key, pages]) => [key, Array.isArray(pages) ? pages.slice() : []]));
+  const context = {
+    BACKUP_DEFAULT_FEED_LIMIT: 20,
+    BACKUP_DEFAULT_DRAFT_LIMIT: 50,
+    normalizeBackupScopes(value) {
+      const source = value && typeof value === 'object' ? value : {};
+      return {
+        ownDrafts: source.ownDrafts === true,
+        ownPosts: source.ownPosts === true,
+        castInPosts: source.castInPosts === true,
+        castInDrafts: source.castInDrafts === true,
+      };
+    },
+    isBackupRunInterrupted() {
+      return false;
+    },
+    backupDbGet: async () => null,
+    saveBackupDiscoveryProgress: async (run) => JSON.parse(JSON.stringify(run)),
+    shouldInterruptBackupDiscovery() {
+      return false;
+    },
+    backupFetchJson: async (_run, pathname, params = {}) => {
+      const key = `${pathname}::${params.cut || ''}`;
+      fetchCalls.push({ pathname, params: JSON.parse(JSON.stringify(params)) });
+      const queue = pagesByKey.get(key) || [];
+      if (!queue.length) return { items: [], next_cursor: null };
+      const next = queue.shift();
+      pagesByKey.set(key, queue);
+      return JSON.parse(JSON.stringify(next));
+    },
+    resolveCurrentBackupUser: async () => ({ handle: 'aidaredevils', id: 'user_123' }),
+    extractItemsFromPayload(payload) {
+      return Array.isArray(payload?.items) ? payload.items : [];
+    },
+    getBackupItemId(_kind, item) {
+      return typeof item?.id === 'string' ? item.id : '';
+    },
+    extractOwnerIdentity(item) {
+      return item?.owner || { handle: 'someone', id: 'user_999' };
+    },
+    shouldFetchDiscoveryDetail() {
+      return false;
+    },
+    fetchBackupDetail: async () => null,
+    shouldExcludeAppearanceOwner() {
+      return false;
+    },
+    buildBackupManifestItem(_run, bucketKey, kind, item, detail, order) {
+      return {
+        bucket: bucketKey,
+        kind,
+        id: (detail || item).id,
+        item_key: `run:${kind}:${(detail || item).id}`,
+        order,
+        status: 'queued',
+        skip_reason: '',
+        last_error: '',
+      };
+    },
+    maybeMarkBackupItemAlreadyBackedUp(run, item, baselineLookup) {
+      if (!(baselineLookup instanceof Set) || !baselineLookup.has(`${item.kind}:${item.id}`)) return item;
+      run.baseline_manifest = {
+        ...(run.baseline_manifest || { filename: '', total_rows: 0, backed_up_rows: 0, matched_rows: 0 }),
+        matched_rows: Number(run?.baseline_manifest?.matched_rows || 0) + 1,
+      };
+      return {
+        ...item,
+        status: 'skipped',
+        skip_reason: 'already_backed_up',
+      };
+    },
+    shouldStopBucketDiscoveryAfterItem(bucket, item, baselineLookup) {
+      return !!(bucket?.stop_on_baseline_match && baselineLookup instanceof Set && baselineLookup.size > 0 &&
+        item?.status === 'skipped' && item?.skip_reason === 'already_backed_up');
+    },
+    backupDbPut: async (_store, value) => {
+      writes.push(JSON.parse(JSON.stringify(value)));
+      return value;
+    },
+    applyBackupStatusTransition(counts, _fromStatus, toStatus) {
+      const next = JSON.parse(JSON.stringify(counts || {}));
+      const key = toStatus === 'downloading' ? 'downloading' : (toStatus || 'queued');
+      next[key] = (Number(next[key]) || 0) + 1;
+      return next;
+    },
+    extractCursorFromPayload(payload) {
+      return payload?.next_cursor || null;
+    },
+    formatBackupDiscoveryProgressSummary(bucketKey, page, run) {
+      const matched = Number(run?.baseline_manifest?.matched_rows) || 0;
+      return matched > 0
+        ? `Discovering ${bucketKey}: page ${page}, accepted ${run?.counts?.discovered || 0}, already backed up ${matched}`
+        : `Discovering ${bucketKey}: page ${page}, accepted ${run?.counts?.discovered || 0}`;
+    },
+    formatBackupDiscoveryCompleteSummary(run) {
+      return `Discovery complete. ${run?.counts?.queued || 0} files queued.`;
+    },
+    BACKUP_RUNS_STORE: 'runs',
+    BACKUP_ITEMS_STORE: 'items',
+  };
+
+  vm.createContext(context);
+  vm.runInContext(
+    `
+${snippet}
+globalThis.__discoverBackupRun = discoverBackupRun;
+`,
+    context,
+    { filename: 'background-backup-discover-harness.js' }
+  );
+
+  return {
+    discoverBackupRun: context.__discoverBackupRun,
+    writes,
+    fetchCalls,
+  };
+}
+
+function buildRunSummaryHarness() {
+  const src = fs.readFileSync(BACKGROUND_PATH, 'utf8');
+  const snippet = extractSnippet(
+    src,
+    'function cloneBackupBucketCounts(raw) {',
+    'async function sendBackupPageFetchToTab(tabId, payload) {',
+    'background backup summary snippet'
+  );
+
+  const context = {
+    isPlainObject(value) {
+      return !!value && typeof value === 'object' && !Array.isArray(value);
+    },
+    normalizeBackupScopes(value) {
+      const source = value && typeof value === 'object' ? value : {};
+      return {
+        ownDrafts: source.ownDrafts !== false,
+        ownPosts: source.ownPosts !== false,
+        castInPosts: source.castInPosts !== false,
+        castInDrafts: source.castInDrafts !== false,
+      };
+    },
+    cloneBackupCounts(counts) {
+      return JSON.parse(JSON.stringify(counts || {}));
+    },
+    normalizeRunStatus(value) {
+      return typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : 'idle';
+    },
+    normalizeCurrentUser(value) {
+      return value && typeof value === 'object'
+        ? { handle: String(value.handle || '').trim(), id: String(value.id || '').trim() }
+        : { handle: '', id: '' };
+    },
+    sanitizeString(value, maxLen = 4096) {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      return trimmed.length > maxLen ? trimmed.slice(0, maxLen) : trimmed;
+    },
+    cloneBackupBaselineManifestSummary(value) {
+      return value ? JSON.parse(JSON.stringify(value)) : null;
+    },
+  };
+
+  vm.createContext(context);
+  vm.runInContext(
+    `
+${snippet}
+globalThis.__summarizeBackupRunForClient = summarizeBackupRunForClient;
+`,
+    context,
+    { filename: 'background-backup-summary-harness.js' }
+  );
+
+  return {
+    summarizeBackupRunForClient: context.__summarizeBackupRunForClient,
+  };
+}
+
+function buildManifestExportHarness() {
+  const src = fs.readFileSync(BACKGROUND_PATH, 'utf8');
+  const snippet = extractSnippet(
+    src,
+    'function buildBackupManifestLine(item) {',
+    '/* ─── Message handlers ─── */',
+    'background backup export snippet'
+  );
+
+  let storedRun = null;
+  let storedItems = [];
+  const context = {
+    BACKUP_RUNS_STORE: 'runs',
+    sanitizeString(value, maxLen = 4096) {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      return trimmed.length > maxLen ? trimmed.slice(0, maxLen) : trimmed;
+    },
+    normalizeItemStatus(value) {
+      return typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : 'queued';
+    },
+    summarizeBackupRunForClient(run) {
+      return JSON.parse(JSON.stringify(run));
+    },
+    backupDbGet: async () => (storedRun ? JSON.parse(JSON.stringify(storedRun)) : null),
+    backupDbGetLatestRun: async () => (storedRun ? JSON.parse(JSON.stringify(storedRun)) : null),
+    backupDbGetRunItems: async () => storedItems.map((item) => JSON.parse(JSON.stringify(item))),
+    __setRun(value) {
+      storedRun = JSON.parse(JSON.stringify(value));
+    },
+    __setItems(value) {
+      storedItems = Array.isArray(value) ? value.map((item) => JSON.parse(JSON.stringify(item))) : [];
+    },
+  };
+
+  vm.createContext(context);
+  vm.runInContext(
+    `
+${snippet}
+globalThis.__handleBackupManifestRequest = handleBackupManifestRequest;
+`,
+    context,
+    { filename: 'background-backup-export-harness.js' }
+  );
+
+  return {
+    handleBackupManifestRequest: context.__handleBackupManifestRequest,
+    setRun(value) {
+      context.__setRun(value);
+    },
+    setItems(value) {
+      context.__setItems(value);
+    },
+  };
+}
+
 test('backupFetchJson retries a 429 response before succeeding', async () => {
   const calls = [];
   const { backupFetchJson, timers } = buildRetryHarness(async (run, pathname, params) => {
@@ -355,6 +660,117 @@ test('buildBackupManifestItem keeps accepted items queued even when discovery ha
   assert.equal(item.media_url, '');
   assert.equal(item.filename, 'Sora Backup/2026-03-25_04-33-30/ownPosts/post_123.mp4');
   assert.equal(item.last_error, '');
+});
+
+test('maybeMarkBackupItemAlreadyBackedUp skips baseline matches and increments matched rows', () => {
+  const harness = buildIncrementalMatchHarness();
+  const lookup = harness.createBackupBaselineLookup({
+    keys: ['published:post_123', 'published:post_123', 'draft:draft_456'],
+  });
+  const run = {
+    baseline_manifest: {
+      filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl',
+      total_rows: 42,
+      backed_up_rows: 40,
+      matched_rows: 0,
+    },
+  };
+
+  const matched = harness.maybeMarkBackupItemAlreadyBackedUp(
+    run,
+    { kind: 'published', id: 'post_123', status: 'queued', skip_reason: '' },
+    lookup
+  );
+  const untouched = harness.maybeMarkBackupItemAlreadyBackedUp(
+    run,
+    { kind: 'published', id: 'post_999', status: 'queued', skip_reason: '' },
+    lookup
+  );
+
+  assert.equal(lookup.size, 2);
+  assert.equal(matched.status, 'skipped');
+  assert.equal(matched.skip_reason, 'already_backed_up');
+  assert.equal(run.baseline_manifest.matched_rows, 1);
+  assert.equal(untouched.status, 'queued');
+  assert.equal(untouched.skip_reason, '');
+});
+
+test('shouldStopBucketDiscoveryAfterItem triggers only for baseline skip boundaries', () => {
+  const harness = buildIncrementalMatchHarness();
+  const lookup = harness.createBackupBaselineLookup({ keys: ['published:post_123'] });
+
+  assert.equal(
+    harness.shouldStopBucketDiscoveryAfterItem(
+      { stop_on_baseline_match: true },
+      { status: 'skipped', skip_reason: 'already_backed_up' },
+      lookup
+    ),
+    true
+  );
+  assert.equal(
+    harness.shouldStopBucketDiscoveryAfterItem(
+      { stop_on_baseline_match: true },
+      { status: 'skipped', skip_reason: 'network_error' },
+      lookup
+    ),
+    false
+  );
+  assert.equal(
+    harness.shouldStopBucketDiscoveryAfterItem(
+      { stop_on_baseline_match: false },
+      { status: 'skipped', skip_reason: 'already_backed_up' },
+      lookup
+    ),
+    false
+  );
+});
+
+test('discoverBackupRun stops paging a bucket after reaching the previous backup boundary', async () => {
+  const harness = buildDiscoverHarness({
+    '/backend/project_y/profile_feed/me::nf2': [
+      {
+        items: [
+          { id: 'post_new', owner: { handle: 'aidaredevils', id: 'user_123' } },
+          { id: 'post_old', owner: { handle: 'aidaredevils', id: 'user_123' } },
+        ],
+        next_cursor: 'cursor_page_2',
+      },
+      {
+        items: [
+          { id: 'post_older', owner: { handle: 'aidaredevils', id: 'user_123' } },
+        ],
+        next_cursor: null,
+      },
+    ],
+  });
+
+  const run = {
+    id: 'backup_run_boundary',
+    scopes: { ownDrafts: false, ownPosts: true, castInPosts: false, castInDrafts: false },
+    counts: { discovered: 0, queued: 0, downloading: 0, done: 0, skipped: 0, failed: 0 },
+    bucket_counts: { ownDrafts: 0, ownPosts: 0, castInPosts: 0, castInDrafts: 0 },
+    current_user: { handle: '', id: '' },
+    baseline_manifest: {
+      filename: 'previous.jsonl',
+      total_rows: 100,
+      backed_up_rows: 100,
+      matched_rows: 0,
+    },
+  };
+
+  const out = await harness.discoverBackupRun(run, new Set(['published:post_old']));
+
+  assert.equal(harness.fetchCalls.length, 1);
+  assert.equal(harness.writes.length, 2);
+  assert.equal(harness.writes[0].id, 'post_new');
+  assert.equal(harness.writes[0].status, 'queued');
+  assert.equal(harness.writes[1].id, 'post_old');
+  assert.equal(harness.writes[1].status, 'skipped');
+  assert.equal(harness.writes[1].skip_reason, 'already_backed_up');
+  assert.equal(out.counts.queued, 1);
+  assert.equal(out.counts.skipped, 1);
+  assert.equal(out.bucket_counts.ownPosts, 2);
+  assert.equal(out.baseline_manifest.matched_rows, 1);
 });
 
 test('saveBackupDiscoveryProgress preserves a cancelled run instead of overwriting it', async () => {
@@ -515,4 +931,99 @@ test('saveBackupRun honors a live cancel interrupt over a stale discovery save',
   assert.equal(out.interrupt_status, 'cancelled');
   assert.equal(out.summary_text, 'Backup cancelled.');
   assert.equal(harness.getStoredRun().status, 'cancelled');
+});
+
+test('summarizeBackupRunForClient keeps baseline manifest metadata for the UI and summary export', () => {
+  const harness = buildRunSummaryHarness();
+  const out = harness.summarizeBackupRunForClient({
+    id: 'backup_run_6',
+    status: 'completed',
+    scopes: { ownDrafts: true, ownPosts: true, castInPosts: false, castInDrafts: false },
+    counts: { discovered: 12, queued: 0, downloading: 0, done: 8, skipped: 4, failed: 0 },
+    bucket_counts: { ownDrafts: 4, ownPosts: 8, castInPosts: 0, castInDrafts: 0 },
+    current_user: { handle: 'aidaredevils', id: 'user_123' },
+    run_stamp: '2026-04-08_21-56-23',
+    baseline_manifest: {
+      filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl',
+      total_rows: 42,
+      backed_up_rows: 40,
+      matched_rows: 4,
+    },
+    summary_text: 'Backup complete.',
+  });
+
+  assert.deepEqual(out.baseline_manifest, {
+    filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl',
+    total_rows: 42,
+    backed_up_rows: 40,
+    matched_rows: 4,
+  });
+});
+
+test('handleBackupManifestRequest excludes already_backed_up skips from failures exports', async () => {
+  const harness = buildManifestExportHarness();
+  harness.setRun({
+    id: 'backup_run_7',
+    run_stamp: '2026-04-08_21-56-23',
+    baseline_manifest: {
+      filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl',
+      total_rows: 42,
+      backed_up_rows: 40,
+      matched_rows: 3,
+    },
+  });
+  harness.setItems([
+    {
+      item_key: 'backup_run_7:published:post_done',
+      run_id: 'backup_run_7',
+      bucket: 'ownPosts',
+      kind: 'published',
+      id: 'post_done',
+      status: 'done',
+      skip_reason: '',
+    },
+    {
+      item_key: 'backup_run_7:published:post_already',
+      run_id: 'backup_run_7',
+      bucket: 'ownPosts',
+      kind: 'published',
+      id: 'post_already',
+      status: 'skipped',
+      skip_reason: 'already_backed_up',
+    },
+    {
+      item_key: 'backup_run_7:published:post_skip_other',
+      run_id: 'backup_run_7',
+      bucket: 'ownPosts',
+      kind: 'published',
+      id: 'post_skip_other',
+      status: 'skipped',
+      skip_reason: 'network_error',
+    },
+    {
+      item_key: 'backup_run_7:published:post_failed',
+      run_id: 'backup_run_7',
+      bucket: 'ownPosts',
+      kind: 'published',
+      id: 'post_failed',
+      status: 'failed',
+      skip_reason: '',
+    },
+  ]);
+
+  const failures = await harness.handleBackupManifestRequest({ runId: 'backup_run_7', format: 'failures' });
+  const summary = await harness.handleBackupManifestRequest({ runId: 'backup_run_7', format: 'summary' });
+
+  assert.equal(failures.ok, true);
+  assert.match(failures.text, /post_skip_other/);
+  assert.match(failures.text, /post_failed/);
+  assert.doesNotMatch(failures.text, /post_already/);
+
+  const parsedSummary = JSON.parse(summary.text);
+  assert.deepEqual(parsedSummary.run.baseline_manifest, {
+    filename: 'sora_backup_manifest_2026-03-25_12-38-28.jsonl',
+    total_rows: 42,
+    backed_up_rows: 40,
+    matched_rows: 3,
+  });
 });

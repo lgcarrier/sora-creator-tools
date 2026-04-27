@@ -67,8 +67,19 @@ function normalizePermalink(value) {
   return String(value || '').trim();
 }
 
+function normalizeStatus(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isDownloadedManifestRow(item) {
+  if (!item || typeof item !== 'object') return false;
+  if (!Object.prototype.hasOwnProperty.call(item, 'status')) return true;
+  return normalizeStatus(item.status) === 'done';
+}
+
 function extractPostPermalinks(items) {
   return (Array.isArray(items) ? items : [])
+    .filter(isDownloadedManifestRow)
     .map((item) => normalizePermalink(item?.post_permalink))
     .filter(Boolean);
 }
@@ -84,11 +95,11 @@ async function main(argv = process.argv.slice(2), io = { log: console.log }) {
   const items = parseManifestText(manifestText, options.manifestPath);
   const urls = extractPostPermalinks(items);
   if (!urls.length) {
-    throw new Error(`No post_permalink values found in ${options.manifestPath}`);
+    throw new Error(`No downloaded post_permalink values found in ${options.manifestPath}`);
   }
 
   await fsp.writeFile(options.outputPath, `${urls.join('\n')}\n`, 'utf8');
-  io.log(`Wrote ${urls.length} URLs to ${options.outputPath}`);
+  io.log(`Wrote ${urls.length} downloaded URLs to ${options.outputPath} from ${items.length} manifest rows`);
 
   return {
     ok: true,
@@ -102,8 +113,10 @@ async function main(argv = process.argv.slice(2), io = { log: console.log }) {
 module.exports = {
   defaultOutputPath,
   extractPostPermalinks,
+  isDownloadedManifestRow,
   main,
   normalizePermalink,
+  normalizeStatus,
   parseArgs,
 };
 
